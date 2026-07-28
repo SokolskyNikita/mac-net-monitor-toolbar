@@ -1,0 +1,4 @@
+build/
+NetMenu.app/
+*.swp
+.DS_Store

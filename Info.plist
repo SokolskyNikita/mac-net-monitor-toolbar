@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key><string>me.sokolsky.netmenu</string>
+    <key>CFBundleName</key><string>NetMenu</string>
+    <key>CFBundleExecutable</key><string>NetMenu</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>LSUIElement</key><true/>
+    <key>NSLocationUsageDescription</key><string>Reads the current Wi-Fi network name and access point (SSID/BSSID) to tag network statistics.</string>
+    <key>NSLocalNetworkUsageDescription</key><string>Pings your router to separate Wi-Fi latency from internet latency.</string>
+</dict>
+</plist>
