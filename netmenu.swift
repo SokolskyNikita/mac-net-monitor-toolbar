@@ -11,20 +11,60 @@ import CoreWLAN
 import CoreLocation
 
 let icmpTargets = ["1.1.1.1", "8.8.8.8"]
-let tlsFallback = (host: "one.one.one.one", port: UInt16(443))
+// IP literal — avoid DNS in the fallback timing path (was inflating ~RTT×3).
+let tcpFallback = (host: "1.1.1.1", port: UInt16(443))
 let probeInterval: TimeInterval = 3
 let fallbackInterval: TimeInterval = 30
 let staleAfter: TimeInterval = 60
 let sampleInterval: TimeInterval = 1
 let identityInterval: TimeInterval = 15
 let logInterval: TimeInterval = 60
+let displayLatWindow = 5
 
-func runProc(_ path: String, _ args: [String]) -> String? {
-    let p = Process(); p.executableURL = URL(fileURLWithPath: path); p.arguments = args
-    let o = Pipe(), e = Pipe(); p.standardOutput = o; p.standardError = e
-    do { try p.run() } catch { return nil }
-    p.waitUntilExit()
-    return String(data: o.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)
+/// Run a helper with a wall-clock timeout; drain pipes on side queues so large stdout can't deadlock.
+func runProc(_ path: String, _ args: [String], timeout: TimeInterval = 10) -> String? {
+    guard FileManager.default.isExecutableFile(atPath: path) else { return nil }
+    return autoreleasepool { () -> String? in
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: path)
+        p.arguments = args
+        let outPipe = Pipe(), errPipe = Pipe()
+        p.standardOutput = outPipe; p.standardError = errPipe
+        do { try p.run() } catch { return nil }
+
+        final class Box: @unchecked Sendable { var data = Data(); let lock = NSLock() }
+        let box = Box()
+        let group = DispatchGroup()
+        group.enter()
+        DispatchQueue.global(qos: .utility).async {
+            let d = outPipe.fileHandleForReading.readDataToEndOfFile()
+            box.lock.lock(); box.data.append(d); box.lock.unlock()
+            group.leave()
+        }
+        group.enter()
+        DispatchQueue.global(qos: .utility).async {
+            _ = errPipe.fileHandleForReading.readDataToEndOfFile()
+            group.leave()
+        }
+
+        let t0 = Date()
+        while p.isRunning, Date().timeIntervalSince(t0) < timeout {
+            Thread.sleep(forTimeInterval: 0.03)
+        }
+        if p.isRunning {
+            p.terminate()
+            let killAt = Date().addingTimeInterval(1.5)
+            while p.isRunning, Date() < killAt { Thread.sleep(forTimeInterval: 0.03) }
+        }
+        _ = group.wait(timeout: .now() + 2)
+        box.lock.lock(); let data = box.data; box.lock.unlock()
+        return String(data: data, encoding: .utf8)
+    }
+}
+
+func finiteNonNeg(_ x: Double, max: Double = 600_000) -> Double? {
+    guard x.isFinite, x >= 0, x <= max else { return nil }
+    return x
 }
 
 func fmtRate(_ bps: Double) -> String {
@@ -73,19 +113,25 @@ func deltaRates(old: Counters, new: Counters, dt: TimeInterval) -> (down: Double
 
 struct PingResult { var ms: Double?; var rejected: Bool; var failed: Bool }
 
+private let timeRe = try? NSRegularExpression(pattern: #"time=([0-9.]+)"#)
+private let ttlRe = try? NSRegularExpression(pattern: #"ttl=([0-9]+)"#)
+private let ssidRe = try? NSRegularExpression(pattern: #"^\s*SSID : (.+)$"#, options: .anchorsMatchLines)
+
 func pingHost(_ host: String, timeoutMs: String, honesty: Bool) -> PingResult {
-    guard let out = runProc("/sbin/ping", ["-c", "1", "-W", timeoutMs, "-s", "16", host]) else {
+    // ping -W is ms; give the process a little headroom past that.
+    let procTimeout = max(2.0, ((Double(timeoutMs) ?? 1000) / 1000.0) + 1.5)
+    guard let out = runProc("/sbin/ping", ["-c", "1", "-W", timeoutMs, "-s", "16", host], timeout: procTimeout),
+          let timeRe else {
         return PingResult(ms: nil, rejected: false, failed: true)
     }
-    let timeRe = try! NSRegularExpression(pattern: #"time=([0-9.]+)"#)
-    let ttlRe = try! NSRegularExpression(pattern: #"ttl=([0-9]+)"#)
     let range = NSRange(out.startIndex..., in: out)
     guard let tm = timeRe.firstMatch(in: out, range: range), let tr = Range(tm.range(at: 1), in: out),
-          let ms = Double(out[tr]) else {
+          let raw = Double(out[tr]), let ms = finiteNonNeg(raw) else {
         return PingResult(ms: nil, rejected: false, failed: true)
     }
     if !honesty { return PingResult(ms: ms, rejected: false, failed: false) }
-    guard let ttlm = ttlRe.firstMatch(in: out, range: range), let tlr = Range(ttlm.range(at: 1), in: out),
+    guard let ttlRe,
+          let ttlm = ttlRe.firstMatch(in: out, range: range), let tlr = Range(ttlm.range(at: 1), in: out),
           let ttl = Int(out[tlr]) else {
         return PingResult(ms: nil, rejected: false, failed: true)
     }
@@ -94,17 +140,33 @@ func pingHost(_ host: String, timeoutMs: String, honesty: Bool) -> PingResult {
     return PingResult(ms: ms, rejected: false, failed: false)
 }
 
-func tlsProbe() -> Double? {
-    let conn = NWConnection(host: .init(tlsFallback.host), port: .init(rawValue: tlsFallback.port)!, using: .tls)
-    let sem = DispatchSemaphore(value: 0); var ok = false; let t0 = Date()
+/// TCP connect RTT approximation (1× RTT). Prefer over TLS handshake, which is ~2–3× RTT + DNS.
+func tcpProbe() -> Double? {
+    guard let port = NWEndpoint.Port(rawValue: tcpFallback.port) else { return nil }
+    let conn = NWConnection(host: .init(tcpFallback.host), port: port, using: .tcp)
+    let sem = DispatchSemaphore(value: 0)
+    let state = NSLock()
+    var ok = false
+    var finished = false
+    let t0 = Date()
     conn.stateUpdateHandler = { s in
-        if case .ready = s { ok = true; sem.signal() }
-        if case .failed = s { sem.signal() }
+        state.lock()
+        defer { state.unlock() }
+        guard !finished else { return }
+        switch s {
+        case .ready:
+            ok = true; finished = true; sem.signal()
+        case .failed, .cancelled:
+            finished = true; sem.signal()
+        default: break
+        }
     }
-    conn.start(queue: .global())
+    conn.start(queue: .global(qos: .utility))
     _ = sem.wait(timeout: .now() + 4)
     conn.cancel()
-    return ok ? Date().timeIntervalSince(t0) * 1000 : nil
+    state.lock(); let success = ok; state.unlock()
+    guard success, let ms = finiteNonNeg(Date().timeIntervalSince(t0) * 1000) else { return nil }
+    return ms
 }
 
 struct WanProbe {
@@ -121,12 +183,13 @@ func probeWAN(forceTLS: Bool, lastTLS: inout Date?, gateway: String?, doGW: Bool
         else if let m = r.ms { honest.append(m) }
     }
     var ms: Double?, src: String?
-    if let m = honest.max() { ms = m; src = "icmp" }
+    // Best honest RTT — max() biased the menu bar to Wi‑Fi wakeup / worse-path spikes.
+    if let m = honest.min() { ms = m; src = "icmp" }
     else {
         let due = forceTLS || lastTLS.map { Date().timeIntervalSince($0) >= fallbackInterval } ?? true
         if due {
             total += 1
-            if let t = tlsProbe() { ms = t; src = "tls"; lastTLS = Date() }
+            if let t = tcpProbe() { ms = t; src = "tcp"; lastTLS = Date() }
             else { failed += 1; lastTLS = Date() }
         }
     }
@@ -175,15 +238,16 @@ func hardwarePorts() -> [String: String] {
 }
 
 func ssidIpconfig(_ iface: String) -> String? {
-    guard let out = runProc("/usr/sbin/ipconfig", ["getsummary", iface]) else { return nil }
-    let re = try! NSRegularExpression(pattern: #"^\s*SSID : (.+)$"#, options: .anchorsMatchLines)
+    guard let out = runProc("/usr/sbin/ipconfig", ["getsummary", iface], timeout: 5),
+          let re = ssidRe else { return nil }
     let range = NSRange(out.startIndex..., in: out)
     guard let m = re.firstMatch(in: out, range: range), let r = Range(m.range(at: 1), in: out) else { return nil }
     return String(out[r])
 }
 
 func ssidProfiler(_ iface: String) -> String? {
-    guard let out = runProc("/usr/sbin/system_profiler", ["SPAirPortDataType", "-json"]),
+    // system_profiler can be huge/slow — timeout + async pipe drain in runProc avoids hangs.
+    guard let out = runProc("/usr/sbin/system_profiler", ["SPAirPortDataType", "-json"], timeout: 12),
           let data = out.data(using: .utf8),
           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
           let arr = json["SPAirPortDataType"] as? [[String: Any]], let root = arr.first,
@@ -192,6 +256,23 @@ func ssidProfiler(_ iface: String) -> String? {
         if let net = i["spairport_current_network_information"] as? [String: Any], let n = net["_name"] as? String { return n }
     }
     return nil
+}
+
+/// CoreWLAN is touchy off-main; hop to main briefly for CW* reads only.
+func wifiDetails(iface: String) -> (ssid: String?, bssid: String?, rssi: Int?, noise: Int?, txRate: Double?, channel: Int?) {
+    var result: (String?, String?, Int?, Int?, Double?, Int?) = (nil, nil, nil, nil, nil, nil)
+    let work = {
+        guard let cw = CWWiFiClient.shared().interface(withName: iface) else { return }
+        result.0 = cw.ssid()
+        result.1 = cw.bssid()
+        let r = cw.rssiValue(); if r != 0 { result.2 = r }
+        let n = cw.noiseMeasurement(); if n != 0 { result.3 = n }
+        let tr = cw.transmitRate(); if tr > 0 { result.4 = tr }
+        result.5 = cw.wlanChannel()?.channelNumber
+    }
+    if Thread.isMainThread { work() }
+    else { DispatchQueue.main.sync(execute: work) }
+    return result
 }
 
 func resolveIdentity() -> Identity {
@@ -212,16 +293,13 @@ func resolveIdentity() -> Identity {
         return nil
     }()
     if let wif = wifiIf {
-        let cw = CWWiFiClient.shared().interface(withName: wif)
-        let ssid = cw?.ssid() ?? ssidIpconfig(wif) ?? ssidProfiler(wif)
+        let w = wifiDetails(iface: wif)
+        let ssid = w.ssid ?? ssidIpconfig(wif) ?? ssidProfiler(wif)
         if let ssid { network = ssid }
         else { network = type == "wifi" ? "Wi-Fi" : "VPN" }
-        bssid = cw?.bssid()
-        if type == "wifi", let cw {
-            let r = cw.rssiValue(); if r != 0 { rssi = r }
-            let n = cw.noiseMeasurement(); if n != 0 { noise = n }
-            let tr = cw.transmitRate(); if tr > 0 { txRate = tr }
-            channel = cw.wlanChannel()?.channelNumber
+        bssid = w.bssid
+        if type == "wifi" {
+            rssi = w.rssi; noise = w.noise; txRate = w.txRate; channel = w.channel
         }
     } else if type == "wifi" {
         network = "Wi-Fi"
@@ -273,15 +351,20 @@ func jsonLine(_ obj: [String: Any]) -> String? {
 }
 
 class AppDelegate: NSObject, NSApplicationDelegate {
-    var statusItem: NSStatusItem!
-    var peakItem: NSMenuItem!
-    var speedItem: NSMenuItem!
+    var statusItem: NSStatusItem?
+    var peakItem: NSMenuItem?
+    var speedItem: NSMenuItem?
     var locationManager: CLLocationManager?
     let session = URLSession(configuration: .default)
+    let statsLock = NSLock()
+    let identityLock = NSLock()
     var prev: Counters = Counters(); var prevAt = Date()
     var peakDown = 0.0, peakUp = 0.0, lastDown = 0.0, lastUp = 0.0
     var lastLatMs: Double?; var lastLatSrc: String?; var lastLatAt: Date?
+    var recentLats: [Double] = []
     var identity = Identity(iface: nil, type: "offline", network: nil, bssid: nil, router: nil, rssi: nil, noise: nil, txRate: nil, channel: nil)
+    /// Snapshot for probe queue — avoids DispatchQueue.main.sync (deadlock risk).
+    var identityForProbe = Identity(iface: nil, type: "offline", network: nil, bssid: nil, router: nil, rssi: nil, noise: nil, txRate: nil, channel: nil)
     var winStart = Date()
     var winLats: [Double] = []; var winLatSrc: String?
     var winGW: [Double] = []; var winRejected = 0; var winFailed = 0; var winTotal = 0
@@ -289,35 +372,40 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var winDownPeak = 0.0, winUpPeak = 0.0
     var probeQ = DispatchQueue(label: "netmenu.probe", qos: .utility)
     var idQ = DispatchQueue(label: "netmenu.id", qos: .utility)
+    static let maxWinSamples = 120
 
     var statsURL: URL {
-        let b = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let d = b.appendingPathComponent("NetMenu", isDirectory: true)
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support")
+        let d = base.appendingPathComponent("NetMenu", isDirectory: true)
         try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
         return d.appendingPathComponent("stats.jsonl")
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        signal(SIGPIPE, SIG_IGN)
         // Draw into a fixed-size template image with 3 column anchors — status-item titles reflow/trim text.
-        statusItem = NSStatusBar.system.statusItem(withLength: Self.statusWidth)
-        statusItem.button?.imagePosition = .imageOnly
+        let item = NSStatusBar.system.statusItem(withLength: Self.statusWidth)
+        item.button?.imagePosition = .imageOnly
+        statusItem = item
         paintStatus(lat: "✕", down: "0B", up: "0B")
         let menu = NSMenu()
-        peakItem = NSMenuItem(title: "Peak this session: —", action: nil, keyEquivalent: "")
-        peakItem.isEnabled = false; menu.addItem(peakItem)
-        speedItem = NSMenuItem(title: "No speed test run yet", action: nil, keyEquivalent: "")
-        speedItem.isEnabled = false; menu.addItem(speedItem)
+        let peak = NSMenuItem(title: "Peak this session: —", action: nil, keyEquivalent: "")
+        peak.isEnabled = false; menu.addItem(peak); peakItem = peak
+        let speed = NSMenuItem(title: "No speed test run yet", action: nil, keyEquivalent: "")
+        speed.isEnabled = false; menu.addItem(speed); speedItem = speed
         let st = NSMenuItem(title: "Run speed test (uses ~7 MB)", action: #selector(runSpeedTest), keyEquivalent: "")
         st.target = self; menu.addItem(st)
         let rev = NSMenuItem(title: "Reveal stats file", action: #selector(revealStats), keyEquivalent: "")
         rev.target = self; menu.addItem(rev)
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
-        statusItem.menu = menu
+        item.menu = menu
 
-        locationManager = CLLocationManager()
-        if locationManager!.authorizationStatus == .notDetermined {
-            locationManager!.requestWhenInUseAuthorization()
+        let lm = CLLocationManager()
+        locationManager = lm
+        if lm.authorizationStatus == .notDetermined {
+            lm.requestWhenInUseAuthorization()
         }
 
         prev = readCounters(); prevAt = Date(); winStart = Date()
@@ -333,6 +421,29 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    func setIdentity(_ new: Identity) {
+        identity = new
+        identityLock.lock(); identityForProbe = new; identityLock.unlock()
+    }
+
+    func snapshotIdentity() -> Identity {
+        identityLock.lock(); defer { identityLock.unlock() }
+        return identityForProbe
+    }
+
+    func appendStatsLine(_ line: String) {
+        guard let data = (line + "\n").data(using: .utf8) else { return }
+        statsLock.lock(); defer { statsLock.unlock() }
+        let url = statsURL
+        if let h = try? FileHandle(forWritingTo: url) {
+            defer { try? h.close() }
+            _ = try? h.seekToEnd()
+            _ = try? h.write(contentsOf: data)
+        } else {
+            try? data.write(to: url)
+        }
+    }
+
     func refreshIdentity() {
         let new = resolveIdentity()
         DispatchQueue.main.async { [weak self] in
@@ -340,10 +451,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             if !new.sameNetwork(as: self.identity) {
                 self.flushLog()
                 self.resetWindow()
-                self.identity = new
-            } else {
-                self.identity = new
+                self.recentLats = []
+                self.lastLatMs = nil; self.lastLatSrc = nil; self.lastLatAt = nil
             }
+            self.setIdentity(new)
         }
     }
 
@@ -353,6 +464,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         winDownSum = 0; winUpSum = 0; winTicks = 0; winDownPeak = 0; winUpPeak = 0
     }
 
+    func noteLatency(_ ms: Double, src: String?) {
+        guard let ms = finiteNonNeg(ms) else { return }
+        lastLatMs = ms; lastLatSrc = src; lastLatAt = Date()
+        recentLats.append(ms)
+        if recentLats.count > displayLatWindow { recentLats.removeFirst(recentLats.count - displayLatWindow) }
+        winLats.append(ms); winLatSrc = src
+        if winLats.count > Self.maxWinSamples { winLats.removeFirst(winLats.count - Self.maxWinSamples) }
+    }
+
     func tick() {
         let now = Date(); let dt = now.timeIntervalSince(prevAt)
         let cur = readCounters()
@@ -360,13 +480,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             prev = cur; prevAt = now; resetWindow(); return
         }
         let (down, up) = deltaRates(old: prev, new: cur, dt: dt)
-        prev = cur; prevAt = now; lastDown = down; lastUp = up
-        if down > peakDown { peakDown = down }
-        if up > peakUp { peakUp = up }
-        winDownSum += down; winUpSum += up; winTicks += 1
-        if down > winDownPeak { winDownPeak = down }
-        if up > winUpPeak { winUpPeak = up }
-        updateTitle(); peakItem.title = "Peak this session: \(fmtRate(peakDown))↓ / \(fmtRate(peakUp))↑"
+        prev = cur; prevAt = now
+        lastDown = finiteNonNeg(down, max: 1e13) ?? 0
+        lastUp = finiteNonNeg(up, max: 1e13) ?? 0
+        if lastDown > peakDown { peakDown = lastDown }
+        if lastUp > peakUp { peakUp = lastUp }
+        winDownSum += lastDown; winUpSum += lastUp; winTicks += 1
+        if lastDown > winDownPeak { winDownPeak = lastDown }
+        if lastUp > winUpPeak { winUpPeak = lastUp }
+        updateTitle()
+        peakItem?.title = "Peak this session: \(fmtRate(peakDown))↓ / \(fmtRate(peakUp))↑"
     }
 
     static let statusFont = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
@@ -386,6 +509,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     static let statusWidth: CGFloat = statusLayout.w
 
     func paintStatus(lat: String, down: String, up: String) {
+        guard let button = statusItem?.button else { return }
         let L = Self.statusLayout
         let img = NSImage(size: NSSize(width: L.w, height: 18), flipped: false) { _ in
             let attrs: [NSAttributedString.Key: Any] = [.font: Self.statusFont, .foregroundColor: NSColor.black]
@@ -401,14 +525,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return true
         }
         img.isTemplate = true
-        statusItem.button?.image = img
+        button.image = img
     }
 
     func updateTitle() {
         let lat: String
-        if let m = lastLatMs, let at = lastLatAt, Date().timeIntervalSince(at) <= staleAfter {
+        if let at = lastLatAt, Date().timeIntervalSince(at) <= staleAfter,
+           let m = finiteNonNeg(median(recentLats) ?? lastLatMs ?? .nan) {
             let n = Int(m.rounded())
-            lat = lastLatSrc == "tls" ? "~\(n)ms" : "\(n)ms"
+            // ~ marks non-ICMP approximation (TCP connect fallback)
+            lat = lastLatSrc == "icmp" ? "\(n)ms" : "~\(n)ms"
         } else { lat = "✕" }
         paintStatus(lat: lat, down: fmtRate(lastDown), up: fmtRate(lastUp))
     }
@@ -416,17 +542,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func probeLoop() {
         var tls: Date?
         while true {
-            let probeIdentity = DispatchQueue.main.sync { identity }
-            let r = probeWAN(forceTLS: false, lastTLS: &tls, gateway: probeIdentity.router, doGW: true)
-            DispatchQueue.main.async { [weak self] in
-                guard let self, self.identity.sameNetwork(as: probeIdentity) else { return }
-                self.winTotal += r.total; self.winRejected += r.rejected; self.winFailed += r.failed
-                if let m = r.ms {
-                    self.lastLatMs = m; self.lastLatSrc = r.src; self.lastLatAt = Date()
-                    self.winLats.append(m); self.winLatSrc = r.src
+            autoreleasepool {
+                let probeIdentity = snapshotIdentity()
+                let r = probeWAN(forceTLS: false, lastTLS: &tls, gateway: probeIdentity.router, doGW: true)
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.identity.sameNetwork(as: probeIdentity) else { return }
+                    self.winTotal += r.total; self.winRejected += r.rejected; self.winFailed += r.failed
+                    if let m = r.ms { self.noteLatency(m, src: r.src) }
+                    if let g = r.gwMs, let g = finiteNonNeg(g) {
+                        self.winGW.append(g)
+                        if self.winGW.count > Self.maxWinSamples {
+                            self.winGW.removeFirst(self.winGW.count - Self.maxWinSamples)
+                        }
+                    }
+                    self.updateTitle()
                 }
-                if let g = r.gwMs { self.winGW.append(g) }
-                self.updateTitle()
             }
             Thread.sleep(forTimeInterval: probeInterval)
         }
@@ -442,27 +572,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let obj = buildSampleJSON(id: identity, secs: secs, latMs: latMs, latMin: latMin, latMax: latMax,
                                   latSrc: winLatSrc, gwMs: median(winGW), loss: winLats.isEmpty ? 1.0 : loss,
                                   rejected: winRejected, down: down, up: up, downPeak: winDownPeak, upPeak: winUpPeak)
-        if let line = jsonLine(obj), let data = (line + "\n").data(using: .utf8) {
-            if let h = try? FileHandle(forWritingTo: statsURL) {
-                _ = try? h.seekToEnd(); _ = try? h.write(contentsOf: data); _ = try? h.close()
-            } else {
-                try? data.write(to: statsURL)
-            }
-        }
+        if let line = jsonLine(obj) { appendStatsLine(line) }
         resetWindow()
     }
 
     @objc func revealStats() {
-        _ = statsURL
-        NSWorkspace.shared.activateFileViewerSelecting([statsURL])
+        let url = statsURL
+        if !FileManager.default.fileExists(atPath: url.path) {
+            try? Data().write(to: url)
+        }
+        NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 
     @objc func runSpeedTest() {
-        guard speedItem.title != "Testing…" else { return }
-        speedItem.title = "Testing…"
+        guard speedItem?.title != "Testing…" else { return }
+        speedItem?.title = "Testing…"
         let sess = session, testIdentity = identity
-        func req(_ url: String, method: String = "GET", body: Data? = nil) -> URLRequest {
-            var r = URLRequest(url: URL(string: url)!); r.httpMethod = method
+        func req(_ url: String, method: String = "GET", body: Data? = nil) -> URLRequest? {
+            guard let u = URL(string: url) else { return nil }
+            var r = URLRequest(url: u); r.httpMethod = method
             r.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
             r.cachePolicy = .reloadIgnoringLocalCacheData; r.timeoutInterval = 15; r.httpBody = body
             return r
@@ -470,33 +598,40 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
             do {
-                let (warm, _) = try sess.synchronousData(req("https://speed.cloudflare.com/__down?bytes=1000000"))
+                guard let rWarm = req("https://speed.cloudflare.com/__down?bytes=1000000"),
+                      let rDown = req("https://speed.cloudflare.com/__down?bytes=4000000"),
+                      let rUp1 = req("https://speed.cloudflare.com/__up", method: "POST", body: Data(count: 500_000)),
+                      let rUp2 = req("https://speed.cloudflare.com/__up", method: "POST", body: Data(count: 1_500_000))
+                else { throw URLError(.badURL) }
+                let (warm, _) = try sess.synchronousData(rWarm)
                 guard warm.count == 1_000_000 else { throw URLError(.badServerResponse) }
                 let t0 = Date()
-                let (timed, _) = try sess.synchronousData(req("https://speed.cloudflare.com/__down?bytes=4000000"))
+                let (timed, _) = try sess.synchronousData(rDown)
                 guard timed.count == 4_000_000 else { throw URLError(.badServerResponse) }
-                let downMbps = 4_000_000.0 * 8 / Date().timeIntervalSince(t0) / 1e6
-                _ = try sess.synchronousData(req("https://speed.cloudflare.com/__up", method: "POST", body: Data(count: 500_000)))
+                let dtDown = max(Date().timeIntervalSince(t0), 0.001)
+                let downMbps = 4_000_000.0 * 8 / dtDown / 1e6
+                _ = try sess.synchronousData(rUp1)
                 let t1 = Date()
-                _ = try sess.synchronousData(req("https://speed.cloudflare.com/__up", method: "POST", body: Data(count: 1_500_000)))
-                let upMbps = 1_500_000.0 * 8 / Date().timeIntervalSince(t1) / 1e6
+                _ = try sess.synchronousData(rUp2)
+                let dtUp = max(Date().timeIntervalSince(t1), 0.001)
+                let upMbps = 1_500_000.0 * 8 / dtUp / 1e6
                 DispatchQueue.main.async {
-                    guard self.identity.sameNetwork(as: testIdentity) else { self.speedItem.title = "Test failed — click to retry"; return }
-                    self.speedItem.title = String(format: "Last test: %.0f↓ / %.0f↑ Mbps", downMbps, upMbps)
+                    guard self.identity.sameNetwork(as: testIdentity) else {
+                        self.speedItem?.title = "Test failed — click to retry"; return
+                    }
+                    let d = finiteNonNeg(downMbps, max: 1e6) ?? 0
+                    let u = finiteNonNeg(upMbps, max: 1e6) ?? 0
+                    self.speedItem?.title = String(format: "Last test: %.0f↓ / %.0f↑ Mbps", d, u)
                     let fmt = ISO8601DateFormatter(); fmt.formatOptions = [.withInternetDateTime]
                     let obj: [String: Any] = [
                         "ts": fmt.string(from: Date()), "event": "speedtest",
                         "type": testIdentity.type, "network": testIdentity.network as Any? ?? NSNull(),
-                        "down_mbps": Int(downMbps.rounded()), "up_mbps": Int(upMbps.rounded())
+                        "down_mbps": Int(d.rounded()), "up_mbps": Int(u.rounded())
                     ]
-                    if let line = jsonLine(obj), let data = (line + "\n").data(using: .utf8) {
-                        if let h = try? FileHandle(forWritingTo: self.statsURL) {
-                            _ = try? h.seekToEnd(); _ = try? h.write(contentsOf: data); _ = try? h.close()
-                        } else { try? data.write(to: self.statsURL) }
-                    }
+                    if let line = jsonLine(obj) { self.appendStatsLine(line) }
                 }
             } catch {
-                DispatchQueue.main.async { self.speedItem.title = "Test failed — click to retry" }
+                DispatchQueue.main.async { self.speedItem?.title = "Test failed — click to retry" }
             }
         }
     }
@@ -504,17 +639,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
 extension URLSession {
     func synchronousData(_ request: URLRequest) throws -> (Data, URLResponse) {
-        var result: Result<(Data, URLResponse), Error>!
+        var result: Result<(Data, URLResponse), Error>?
         let sem = DispatchSemaphore(value: 0)
-        dataTask(with: request) { data, resp, err in
+        let task = dataTask(with: request) { data, resp, err in
             if let err { result = .failure(err) }
             else if let data, let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) {
                 result = .success((data, http))
-            }
-            else { result = .failure(URLError(.unknown)) }
+            } else { result = .failure(URLError(.unknown)) }
             sem.signal()
-        }.resume()
-        sem.wait()
+        }
+        task.resume()
+        if sem.wait(timeout: .now() + request.timeoutInterval + 5) == .timedOut {
+            task.cancel()
+            throw URLError(.timedOut)
+        }
+        guard let result else { throw URLError(.unknown) }
         return try result.get()
     }
 }
@@ -526,8 +665,17 @@ if CommandLine.arguments.contains("--sample") {
     let r = probeWAN(forceTLS: true, lastTLS: &tls, gateway: nil, doGW: false)
     let id = resolveIdentitySample()
     let latStr = r.ms.map { String(format: "%.1f", $0) } ?? "nan"
-    let netJSON = String(data: try! JSONSerialization.data(withJSONObject: [id.network ?? "none"]), encoding: .utf8)!
-    print("latency_ms=\(latStr) down_Bps=\(UInt64(down.rounded())) up_Bps=\(UInt64(up.rounded())) type=\(id.type) network=\(netJSON.dropFirst().dropLast())")
+    let netName = id.network ?? "none"
+    let netJSON: String
+    if let data = try? JSONSerialization.data(withJSONObject: [netName]),
+       let s = String(data: data, encoding: .utf8) {
+        netJSON = String(s.dropFirst().dropLast())
+    } else {
+        netJSON = "\"\(netName)\""
+    }
+    let downI = UInt64(finiteNonNeg(down, max: 1e13)?.rounded() ?? 0)
+    let upI = UInt64(finiteNonNeg(up, max: 1e13)?.rounded() ?? 0)
+    print("latency_ms=\(latStr) down_Bps=\(downI) up_Bps=\(upI) type=\(id.type) network=\(netJSON)")
     let loss = r.total > 0 ? Double(r.failed + r.rejected) / Double(r.total) : 1.0
     let obj = buildSampleJSON(id: id, secs: 1, latMs: r.ms, latMin: r.ms, latMax: r.ms, latSrc: r.src,
                               gwMs: nil, loss: r.ms == nil ? 1.0 : loss, rejected: r.rejected,
