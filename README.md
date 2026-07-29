@@ -2,9 +2,7 @@
 
 macOS menu bar app that shows live **WAN latency**, **download**, and **upload** rates.
 
-```
-15ms   2K↓   1K↑
-```
+![NetMenu in the macOS menu bar showing latency and throughput](images/mac-net-monitor-screenshot.png)
 
 ## Features
 
