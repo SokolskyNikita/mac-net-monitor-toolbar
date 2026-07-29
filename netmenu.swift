@@ -17,6 +17,7 @@ let probeInterval: TimeInterval = 3
 let fallbackInterval: TimeInterval = 30
 let staleAfter: TimeInterval = 60
 let sampleInterval: TimeInterval = 1
+let rateDisplayInterval: TimeInterval = 5
 let identityInterval: TimeInterval = 15
 let logInterval: TimeInterval = 60
 let displayLatWindow = 5
@@ -360,6 +361,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     let identityLock = NSLock()
     var prev: Counters = Counters(); var prevAt = Date()
     var peakDown = 0.0, peakUp = 0.0, lastDown = 0.0, lastUp = 0.0
+    /// Menu-bar rates — refreshed every `rateDisplayInterval` (avg of 1s samples).
+    var displayDown = 0.0, displayUp = 0.0
+    var rateDispSumDown = 0.0, rateDispSumUp = 0.0, rateDispTicks = 0
+    var rateDispAt = Date()
     var lastLatMs: Double?; var lastLatSrc: String?; var lastLatAt: Date?
     var recentLats: [Double] = []
     var identity = Identity(iface: nil, type: "offline", network: nil, bssid: nil, router: nil, rssi: nil, noise: nil, txRate: nil, channel: nil)
@@ -477,7 +482,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let now = Date(); let dt = now.timeIntervalSince(prevAt)
         let cur = readCounters()
         if dt > 5 {
-            prev = cur; prevAt = now; resetWindow(); return
+            prev = cur; prevAt = now; resetWindow()
+            rateDispSumDown = 0; rateDispSumUp = 0; rateDispTicks = 0; rateDispAt = now
+            return
         }
         let (down, up) = deltaRates(old: prev, new: cur, dt: dt)
         prev = cur; prevAt = now
@@ -488,7 +495,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         winDownSum += lastDown; winUpSum += lastUp; winTicks += 1
         if lastDown > winDownPeak { winDownPeak = lastDown }
         if lastUp > winUpPeak { winUpPeak = lastUp }
-        updateTitle()
+
+        rateDispSumDown += lastDown; rateDispSumUp += lastUp; rateDispTicks += 1
+        if now.timeIntervalSince(rateDispAt) >= rateDisplayInterval, rateDispTicks > 0 {
+            displayDown = rateDispSumDown / Double(rateDispTicks)
+            displayUp = rateDispSumUp / Double(rateDispTicks)
+            rateDispSumDown = 0; rateDispSumUp = 0; rateDispTicks = 0
+            rateDispAt = now
+            updateTitle()
+        }
         peakItem?.title = "Peak this session: \(fmtRate(peakDown))↓ / \(fmtRate(peakUp))↑"
     }
 
@@ -536,7 +551,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // ~ marks non-ICMP approximation (TCP connect fallback)
             lat = lastLatSrc == "icmp" ? "\(n)ms" : "~\(n)ms"
         } else { lat = "✕" }
-        paintStatus(lat: lat, down: fmtRate(lastDown), up: fmtRate(lastUp))
+        paintStatus(lat: lat, down: fmtRate(displayDown), up: fmtRate(displayUp))
     }
 
     func probeLoop() {
