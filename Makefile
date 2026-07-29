@@ -3,8 +3,10 @@ SIGN_ID?=-
 
 .PHONY: build check app run clean
 
-build/NetMenu: netmenu.swift
-	mkdir -p build && swiftc $(SWIFT_FLAGS) netmenu.swift -o build/NetMenu
+SOURCES=constants.swift netmenu.swift main.swift
+
+build/NetMenu: $(SOURCES)
+	mkdir -p build && swiftc $(SWIFT_FLAGS) $(SOURCES) -o build/NetMenu
 
 build: build/NetMenu
 

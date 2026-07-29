@@ -10,9 +10,9 @@ import Network
 import CoreWLAN
 import CoreLocation
 
-let icmpTargets = ["1.1.1.1", "8.8.8.8"]
+let icmpTargets = [Host.cloudflareDNS, Host.googleDNS]
 // IP literal — avoid DNS in the fallback timing path (was inflating ~RTT×3).
-let tcpFallback = (host: "1.1.1.1", port: UInt16(443))
+let tcpFallback = (host: Host.cloudflareDNS, port: UInt16(443))
 let probeInterval: TimeInterval = 3
 let fallbackInterval: TimeInterval = 30
 let staleAfter: TimeInterval = 60
@@ -279,31 +279,31 @@ func wifiDetails(iface: String) -> (ssid: String?, bssid: String?, rssi: Int?, n
 func resolveIdentity() -> Identity {
     let (iface, router) = parseRoute()
     guard let iface else {
-        return Identity(iface: nil, type: "offline", network: nil, bssid: nil, router: nil, rssi: nil, noise: nil, txRate: nil, channel: nil)
+        return Identity(iface: nil, type: NetType.offline, network: nil, bssid: nil, router: nil, rssi: nil, noise: nil, txRate: nil, channel: nil)
     }
     let ports = hardwarePorts(); let port = ports[iface] ?? ""
-    var type = "ethernet", network: String? = port.isEmpty ? iface : port
+    var type = NetType.ethernet, network: String? = port.isEmpty ? iface : port
     var bssid: String?, rssi: Int?, noise: Int?, txRate: Double?, channel: Int?
     let isVPN = iface.hasPrefix("utun") || iface.hasPrefix("ipsec") || iface.hasPrefix("ppp")
-    if port == "Wi-Fi" || port == "AirPort" { type = "wifi" }
-    else if port.contains("iPhone") || port.contains("iPad") || port.contains("Bluetooth") { type = "tether" }
-    else if isVPN { type = "vpn"; network = "VPN" }
+    if port == PortName.wifi || port == PortName.airPort { type = NetType.wifi }
+    else if port.contains("iPhone") || port.contains("iPad") || port.contains("Bluetooth") { type = NetType.tether }
+    else if isVPN { type = NetType.vpn; network = PortName.vpn }
     let wifiIf: String? = {
-        if type == "wifi" { return iface }
-        if type == "vpn" { return ports.first(where: { $0.value == "Wi-Fi" || $0.value == "AirPort" })?.key }
+        if type == NetType.wifi { return iface }
+        if type == NetType.vpn { return ports.first(where: { $0.value == PortName.wifi || $0.value == PortName.airPort })?.key }
         return nil
     }()
     if let wif = wifiIf {
         let w = wifiDetails(iface: wif)
         let ssid = w.ssid ?? ssidIpconfig(wif) ?? ssidProfiler(wif)
         if let ssid { network = ssid }
-        else { network = type == "wifi" ? "Wi-Fi" : "VPN" }
+        else { network = type == NetType.wifi ? PortName.wifi : PortName.vpn }
         bssid = w.bssid
-        if type == "wifi" {
+        if type == NetType.wifi {
             rssi = w.rssi; noise = w.noise; txRate = w.txRate; channel = w.channel
         }
-    } else if type == "wifi" {
-        network = "Wi-Fi"
+    } else if type == NetType.wifi {
+        network = PortName.wifi
     }
     return Identity(iface: iface, type: type, network: network, bssid: bssid, router: router, rssi: rssi, noise: noise, txRate: txRate, channel: channel)
 }
@@ -312,20 +312,20 @@ func resolveIdentity() -> Identity {
 func resolveIdentitySample() -> Identity {
     let (iface, router) = parseRoute()
     guard let iface else {
-        return Identity(iface: nil, type: "offline", network: nil, bssid: nil, router: nil, rssi: nil, noise: nil, txRate: nil, channel: nil)
+        return Identity(iface: nil, type: NetType.offline, network: nil, bssid: nil, router: nil, rssi: nil, noise: nil, txRate: nil, channel: nil)
     }
     let ports = hardwarePorts(); let port = ports[iface] ?? ""
-    var type = "ethernet", network: String? = port.isEmpty ? iface : port
+    var type = NetType.ethernet, network: String? = port.isEmpty ? iface : port
     let isVPN = iface.hasPrefix("utun") || iface.hasPrefix("ipsec") || iface.hasPrefix("ppp")
-    if port == "Wi-Fi" || port == "AirPort" { type = "wifi" }
-    else if port.contains("iPhone") || port.contains("iPad") || port.contains("Bluetooth") { type = "tether"; network = port }
-    else if isVPN { type = "vpn"; network = "VPN" }
-    else { type = "ethernet"; network = port.isEmpty ? iface : port }
-    let wifiIf: String? = type == "wifi" ? iface : (type == "vpn" ? ports.first(where: { $0.value == "Wi-Fi" || $0.value == "AirPort" })?.key : nil)
+    if port == PortName.wifi || port == PortName.airPort { type = NetType.wifi }
+    else if port.contains("iPhone") || port.contains("iPad") || port.contains("Bluetooth") { type = NetType.tether; network = port }
+    else if isVPN { type = NetType.vpn; network = PortName.vpn }
+    else { type = NetType.ethernet; network = port.isEmpty ? iface : port }
+    let wifiIf: String? = type == NetType.wifi ? iface : (type == NetType.vpn ? ports.first(where: { $0.value == PortName.wifi || $0.value == PortName.airPort })?.key : nil)
     if let wif = wifiIf {
         if let s = ssidIpconfig(wif) { network = s }
         else if let s = ssidProfiler(wif) { network = s }
-        else { network = type == "vpn" ? "VPN" : "Wi-Fi" }
+        else { network = type == NetType.vpn ? PortName.vpn : PortName.wifi }
     }
     return Identity(iface: iface, type: type, network: network, bssid: nil, router: router, rssi: nil, noise: nil, txRate: nil, channel: nil)
 }
@@ -351,14 +351,47 @@ func jsonLine(_ obj: [String: Any]) -> String? {
     return s
 }
 
+enum SpeedTestError: Error {
+    case budgetExceeded
+    case tooSmall
+    case httpStatus(Int)
+}
+
+/// Hard cap so a run (and any tiny probe retry) cannot burn unbounded bandwidth.
+final class SpeedTestBudget {
+    let limit: Int64
+    private let lock = NSLock()
+    private(set) var used: Int64 = 0
+    init(limit: Int64) { self.limit = limit }
+    func charge(_ bytes: Int) throws {
+        guard bytes >= 0 else { return }
+        lock.lock(); defer { lock.unlock() }
+        let next = used + Int64(bytes)
+        if next > limit { throw SpeedTestError.budgetExceeded }
+        used = next
+    }
+}
+
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem?
     var peakItem: NSMenuItem?
     var speedItem: NSMenuItem?
     var locationManager: CLLocationManager?
-    let session = URLSession(configuration: .default)
+    /// Ephemeral, no connectivity-wait — fail fast; never auto-retry when the path returns.
+    let speedSession: URLSession = {
+        let c = URLSessionConfiguration.ephemeral
+        c.timeoutIntervalForRequest = 12
+        c.timeoutIntervalForResource = 25
+        c.waitsForConnectivity = false
+        c.requestCachePolicy = .reloadIgnoringLocalCacheData
+        c.urlCache = nil
+        c.httpMaximumConnectionsPerHost = 1
+        return URLSession(configuration: c)
+    }()
     let statsLock = NSLock()
     let identityLock = NSLock()
+    var speedTestRunning = false
+    var speedTestCooldownUntil = Date.distantPast
     var prev: Counters = Counters(); var prevAt = Date()
     var peakDown = 0.0, peakUp = 0.0, lastDown = 0.0, lastUp = 0.0
     /// Menu-bar rates — refreshed every `rateDisplayInterval` (avg of 1s samples).
@@ -367,9 +400,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var rateDispAt = Date()
     var lastLatMs: Double?; var lastLatSrc: String?; var lastLatAt: Date?
     var recentLats: [Double] = []
-    var identity = Identity(iface: nil, type: "offline", network: nil, bssid: nil, router: nil, rssi: nil, noise: nil, txRate: nil, channel: nil)
+    var identity = Identity(iface: nil, type: NetType.offline, network: nil, bssid: nil, router: nil, rssi: nil, noise: nil, txRate: nil, channel: nil)
     /// Snapshot for probe queue — avoids DispatchQueue.main.sync (deadlock risk).
-    var identityForProbe = Identity(iface: nil, type: "offline", network: nil, bssid: nil, router: nil, rssi: nil, noise: nil, txRate: nil, channel: nil)
+    var identityForProbe = Identity(iface: nil, type: NetType.offline, network: nil, bssid: nil, router: nil, rssi: nil, noise: nil, txRate: nil, channel: nil)
     var winStart = Date()
     var winLats: [Double] = []; var winLatSrc: String?
     var winGW: [Double] = []; var winRejected = 0; var winFailed = 0; var winTotal = 0
@@ -378,6 +411,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var probeQ = DispatchQueue(label: "netmenu.probe", qos: .utility)
     var idQ = DispatchQueue(label: "netmenu.id", qos: .utility)
     static let maxWinSamples = 120
+    static let speedBudgetBytes: Int64 = 8_000_000   // hard stop (~7 MB nominal + slack)
+    static let speedCooldown: TimeInterval = 60      // after any transfer attempt
+    static let speedProbeBytes = 32_768
+    static let speedWarmBytes = 1_000_000
+    static let speedDownBytes = 4_000_000
+    static let speedUpWarmBytes = 500_000
+    static let speedUpBytes = 1_500_000
+    static let speedMinTimedBytes = 250_000          // accept partial if usable
 
     var statsURL: URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
@@ -600,71 +641,142 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func runSpeedTest() {
-        guard speedItem?.title != "Testing…" else { return }
+        if speedTestRunning { return }
+        let now = Date()
+        if now < speedTestCooldownUntil {
+            let left = Int(ceil(speedTestCooldownUntil.timeIntervalSince(now)))
+            speedItem?.title = "Wait \(left)s before retesting"
+            return
+        }
+        speedTestRunning = true
         speedItem?.title = "Testing…"
-        let sess = session, testIdentity = identity
-        func req(_ url: String, method: String = "GET", body: Data? = nil) -> URLRequest? {
+        let sess = speedSession
+        let testIdentity = identity
+        let budget = SpeedTestBudget(limit: Self.speedBudgetBytes)
+
+        func req(_ url: String, method: String = HTTPMethod.get, body: Data? = nil, timeout: TimeInterval = 12) -> URLRequest? {
             guard let u = URL(string: url) else { return nil }
             var r = URLRequest(url: u); r.httpMethod = method
             r.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
-            r.cachePolicy = .reloadIgnoringLocalCacheData; r.timeoutInterval = 15; r.httpBody = body
+            r.cachePolicy = .reloadIgnoringLocalCacheData
+            r.timeoutInterval = timeout
+            r.httpBody = body
             return r
         }
+
+        /// One-shot transfer; charges budget for upload body + downloaded bytes. No retries.
+        func transfer(_ request: URLRequest, uploadBytes: Int = 0) throws -> Data {
+            try budget.charge(uploadBytes)
+            let data = try sess.synchronousData(request, maxBytes: Int(Self.speedBudgetBytes))
+            try budget.charge(data.count)
+            return data
+        }
+
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
+            var finishTitle = "Test failed — wait to retry"
+            var logObj: [String: Any]?
             do {
-                guard let rWarm = req("https://speed.cloudflare.com/__down?bytes=1000000"),
-                      let rDown = req("https://speed.cloudflare.com/__down?bytes=4000000"),
-                      let rUp1 = req("https://speed.cloudflare.com/__up", method: "POST", body: Data(count: 500_000)),
-                      let rUp2 = req("https://speed.cloudflare.com/__up", method: "POST", body: Data(count: 1_500_000))
-                else { throw URLError(.badURL) }
-                let (warm, _) = try sess.synchronousData(rWarm)
-                guard warm.count == 1_000_000 else { throw URLError(.badServerResponse) }
-                let t0 = Date()
-                let (timed, _) = try sess.synchronousData(rDown)
-                guard timed.count == 4_000_000 else { throw URLError(.badServerResponse) }
-                let dtDown = max(Date().timeIntervalSince(t0), 0.001)
-                let downMbps = 4_000_000.0 * 8 / dtDown / 1e6
-                _ = try sess.synchronousData(rUp1)
-                let t1 = Date()
-                _ = try sess.synchronousData(rUp2)
-                let dtUp = max(Date().timeIntervalSince(t1), 0.001)
-                let upMbps = 1_500_000.0 * 8 / dtUp / 1e6
-                DispatchQueue.main.async {
-                    guard self.identity.sameNetwork(as: testIdentity) else {
-                        self.speedItem?.title = "Test failed — click to retry"; return
+                // Tiny probe (at most one retry) before committing multi‑MB transfers.
+                let probeURL = URLPart.speedDownURL(bytes: Self.speedProbeBytes)
+                var probed = false
+                for attempt in 0..<2 {
+                    guard let r = req(probeURL, timeout: 8) else { throw URLError(.badURL) }
+                    do {
+                        let d = try transfer(r)
+                        guard d.count >= Self.speedProbeBytes / 2 else { throw SpeedTestError.tooSmall }
+                        probed = true
+                        break
+                    } catch let e as SpeedTestError {
+                        throw e // don't retry budget / hard failures
+                    } catch {
+                        if attempt == 0 { Thread.sleep(forTimeInterval: 0.4); continue }
+                        throw error
                     }
-                    let d = finiteNonNeg(downMbps, max: 1e6) ?? 0
-                    let u = finiteNonNeg(upMbps, max: 1e6) ?? 0
-                    self.speedItem?.title = String(format: "Last test: %.0f↓ / %.0f↑ Mbps", d, u)
-                    let fmt = ISO8601DateFormatter(); fmt.formatOptions = [.withInternetDateTime]
-                    let obj: [String: Any] = [
-                        "ts": fmt.string(from: Date()), "event": "speedtest",
-                        "type": testIdentity.type, "network": testIdentity.network as Any? ?? NSNull(),
-                        "down_mbps": Int(d.rounded()), "up_mbps": Int(u.rounded())
-                    ]
-                    if let line = jsonLine(obj) { self.appendStatsLine(line) }
                 }
+                guard probed else { throw URLError(.cannotConnectToHost) }
+
+                // Large phases: single attempt each — never retry MB-scale payloads.
+                guard let rWarm = req(URLPart.speedDownURL(bytes: Self.speedWarmBytes)),
+                      let rDown = req(URLPart.speedDownURL(bytes: Self.speedDownBytes)),
+                      let rUp1 = req(URLPart.speedUpURL, method: HTTPMethod.post,
+                                     body: Data(count: Self.speedUpWarmBytes)),
+                      let rUp2 = req(URLPart.speedUpURL, method: HTTPMethod.post,
+                                     body: Data(count: Self.speedUpBytes))
+                else { throw URLError(.badURL) }
+
+                let warm = try transfer(rWarm)
+                guard warm.count >= Self.speedMinTimedBytes else { throw SpeedTestError.tooSmall }
+
+                let t0 = Date()
+                let timed = try transfer(rDown)
+                guard timed.count >= Self.speedMinTimedBytes else { throw SpeedTestError.tooSmall }
+                let dtDown = max(Date().timeIntervalSince(t0), 0.001)
+                let downMbps = Double(timed.count) * 8 / dtDown / 1e6
+
+                _ = try transfer(rUp1, uploadBytes: Self.speedUpWarmBytes)
+                let t1 = Date()
+                _ = try transfer(rUp2, uploadBytes: Self.speedUpBytes)
+                let dtUp = max(Date().timeIntervalSince(t1), 0.001)
+                let upMbps = Double(Self.speedUpBytes) * 8 / dtUp / 1e6
+
+                let d = finiteNonNeg(downMbps, max: 1e6) ?? 0
+                let u = finiteNonNeg(upMbps, max: 1e6) ?? 0
+                finishTitle = String(format: "Last test: %.0f↓ / %.0f↑ Mbps", d, u)
+                let fmt = ISO8601DateFormatter(); fmt.formatOptions = [.withInternetDateTime]
+                logObj = [
+                    "ts": fmt.string(from: Date()), "event": "speedtest",
+                    "type": testIdentity.type, "network": testIdentity.network as Any? ?? NSNull(),
+                    "down_mbps": Int(d.rounded()), "up_mbps": Int(u.rounded()),
+                    "bytes_used": budget.used
+                ]
+            } catch SpeedTestError.budgetExceeded {
+                finishTitle = "Test aborted — budget cap"
             } catch {
-                DispatchQueue.main.async { self.speedItem?.title = "Test failed — click to retry" }
+                if budget.used > 0 {
+                    finishTitle = "Test failed — wait to retry"
+                } else {
+                    finishTitle = "Test failed — click to retry"
+                }
+            }
+
+            let usedBytes = budget.used
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.speedTestRunning = false
+                // Cooldown only if we actually moved data (or succeeded) — blocks click-storm retries.
+                if usedBytes > 0 || finishTitle.hasPrefix("Last test:") {
+                    self.speedTestCooldownUntil = Date().addingTimeInterval(Self.speedCooldown)
+                }
+                if finishTitle.hasPrefix("Last test:"), !self.identity.sameNetwork(as: testIdentity) {
+                    self.speedItem?.title = "Test failed — network changed"
+                } else {
+                    self.speedItem?.title = finishTitle
+                }
+                if let obj = logObj, let line = jsonLine(obj) { self.appendStatsLine(line) }
             }
         }
     }
 }
 
 extension URLSession {
-    func synchronousData(_ request: URLRequest) throws -> (Data, URLResponse) {
-        var result: Result<(Data, URLResponse), Error>?
+    /// Single-shot data task with hard wait timeout; cancels on expiry. No internal retries.
+    func synchronousData(_ request: URLRequest, maxBytes: Int = 16_000_000) throws -> Data {
+        var result: Result<Data, Error>?
         let sem = DispatchSemaphore(value: 0)
         let task = dataTask(with: request) { data, resp, err in
             if let err { result = .failure(err) }
-            else if let data, let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) {
-                result = .success((data, http))
+            else if let http = resp as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+                result = .failure(SpeedTestError.httpStatus(http.statusCode))
+            } else if let data {
+                if data.count > maxBytes { result = .failure(SpeedTestError.budgetExceeded) }
+                else { result = .success(data) }
             } else { result = .failure(URLError(.unknown)) }
             sem.signal()
         }
         task.resume()
-        if sem.wait(timeout: .now() + request.timeoutInterval + 5) == .timedOut {
+        let wait = request.timeoutInterval + 3
+        if sem.wait(timeout: .now() + wait) == .timedOut {
             task.cancel()
             throw URLError(.timedOut)
         }
@@ -672,35 +784,3 @@ extension URLSession {
         return try result.get()
     }
 }
-
-if CommandLine.arguments.contains("--sample") {
-    let c0 = readCounters(); Thread.sleep(forTimeInterval: 1); let c1 = readCounters()
-    let (down, up) = deltaRates(old: c0, new: c1, dt: 1)
-    var tls: Date? = nil
-    let r = probeWAN(forceTLS: true, lastTLS: &tls, gateway: nil, doGW: false)
-    let id = resolveIdentitySample()
-    let latStr = r.ms.map { String(format: "%.1f", $0) } ?? "nan"
-    let netName = id.network ?? "none"
-    let netJSON: String
-    if let data = try? JSONSerialization.data(withJSONObject: [netName]),
-       let s = String(data: data, encoding: .utf8) {
-        netJSON = String(s.dropFirst().dropLast())
-    } else {
-        netJSON = "\"\(netName)\""
-    }
-    let downI = UInt64(finiteNonNeg(down, max: 1e13)?.rounded() ?? 0)
-    let upI = UInt64(finiteNonNeg(up, max: 1e13)?.rounded() ?? 0)
-    print("latency_ms=\(latStr) down_Bps=\(downI) up_Bps=\(upI) type=\(id.type) network=\(netJSON)")
-    let loss = r.total > 0 ? Double(r.failed + r.rejected) / Double(r.total) : 1.0
-    let obj = buildSampleJSON(id: id, secs: 1, latMs: r.ms, latMin: r.ms, latMax: r.ms, latSrc: r.src,
-                              gwMs: nil, loss: r.ms == nil ? 1.0 : loss, rejected: r.rejected,
-                              down: down, up: up, downPeak: down, upPeak: up)
-    if let line = jsonLine(obj) { print(line) }
-    exit(0)
-}
-
-let delegate = AppDelegate()
-let app = NSApplication.shared
-app.delegate = delegate
-app.setActivationPolicy(.accessory)
-app.run()
