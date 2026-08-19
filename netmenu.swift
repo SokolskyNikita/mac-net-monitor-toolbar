@@ -11,10 +11,14 @@ import CoreWLAN
 import CoreLocation
 
 let icmpTargets = [Host.cloudflareDNS, Host.googleDNS]
-// IP literal — avoid DNS in the fallback timing path (was inflating ~RTT×3).
+// IP literal — avoid DNS in the TCP timing path.
 let tcpFallback = (host: Host.cloudflareDNS, port: UInt16(443))
+// Hostname — TLS needs SNI; used only when TCP connect is a local proxy SYN-ACK.
+let tlsFallback = (host: Host.cloudflare, port: UInt16(443))
 let probeInterval: TimeInterval = 3
 let fallbackInterval: TimeInterval = 30
+/// Inflight/sat RTT is often 600–1500ms; 1000ms censored real replies and fell through to TCP.
+let icmpTimeoutMs = "4000"
 let staleAfter: TimeInterval = 60
 let sampleInterval: TimeInterval = 1
 let rateDisplayInterval: TimeInterval = 5
@@ -37,13 +41,14 @@ func runProc(_ path: String, _ args: [String], timeout: TimeInterval = 10) -> St
         let box = Box()
         let group = DispatchGroup()
         group.enter()
-        DispatchQueue.global(qos: .utility).async {
+        // userInitiated — don't starve behind identity/system_profiler work on utility.
+        DispatchQueue.global(qos: .userInitiated).async {
             let d = outPipe.fileHandleForReading.readDataToEndOfFile()
             box.lock.lock(); box.data.append(d); box.lock.unlock()
             group.leave()
         }
         group.enter()
-        DispatchQueue.global(qos: .utility).async {
+        DispatchQueue.global(qos: .userInitiated).async {
             _ = errPipe.fileHandleForReading.readDataToEndOfFile()
             group.leave()
         }
@@ -112,39 +117,59 @@ func deltaRates(old: Counters, new: Counters, dt: TimeInterval) -> (down: Double
     return (Double(dr) / dt, Double(du) / dt)
 }
 
-struct PingResult { var ms: Double?; var rejected: Bool; var failed: Bool }
+struct PingResult { var ms: Double?; var hops: Int?; var rejected: Bool; var failed: Bool }
 
 private let timeRe = try? NSRegularExpression(pattern: #"time=([0-9.]+)"#)
 private let ttlRe = try? NSRegularExpression(pattern: #"ttl=([0-9]+)"#)
 private let ssidRe = try? NSRegularExpression(pattern: #"^\s*SSID : (.+)$"#, options: .anchorsMatchLines)
+
+func inferredHops(ttl: Int) -> Int {
+    let initial = [64, 128, 255].filter { $0 >= ttl }.min() ?? 255
+    return initial - ttl
+}
+
+/// Onboard/captive responders sit 1–2 hops out, or answer about as fast as the gateway.
+func isOnPathEcho(ms: Double, hops: Int?, gatewayMs: Double?) -> Bool {
+    if let hops, hops <= 2 { return true }
+    if let gw = gatewayMs, ms <= gw + 10, (hops ?? 99) <= 6 { return true }
+    return false
+}
+
+/// Inflight/hotel proxies SYN-ACK locally — connect time matches the cabin hop, not WAN.
+func isLocalProxyConnect(_ connectMs: Double, gatewayMs: Double?) -> Bool {
+    if let gw = gatewayMs { return connectMs <= max(gw * 2, gw + 12) }
+    return false
+}
 
 func pingHost(_ host: String, timeoutMs: String, honesty: Bool) -> PingResult {
     // ping -W is ms; give the process a little headroom past that.
     let procTimeout = max(2.0, ((Double(timeoutMs) ?? 1000) / 1000.0) + 1.5)
     guard let out = runProc("/sbin/ping", ["-c", "1", "-W", timeoutMs, "-s", "16", host], timeout: procTimeout),
           let timeRe else {
-        return PingResult(ms: nil, rejected: false, failed: true)
+        return PingResult(ms: nil, hops: nil, rejected: false, failed: true)
     }
     let range = NSRange(out.startIndex..., in: out)
     guard let tm = timeRe.firstMatch(in: out, range: range), let tr = Range(tm.range(at: 1), in: out),
           let raw = Double(out[tr]), let ms = finiteNonNeg(raw) else {
-        return PingResult(ms: nil, rejected: false, failed: true)
+        return PingResult(ms: nil, hops: nil, rejected: false, failed: true)
     }
-    if !honesty { return PingResult(ms: ms, rejected: false, failed: false) }
-    guard let ttlRe,
-          let ttlm = ttlRe.firstMatch(in: out, range: range), let tlr = Range(ttlm.range(at: 1), in: out),
-          let ttl = Int(out[tlr]) else {
-        return PingResult(ms: nil, rejected: false, failed: true)
+    var hops: Int?
+    if let ttlRe,
+       let ttlm = ttlRe.firstMatch(in: out, range: range), let tlr = Range(ttlm.range(at: 1), in: out),
+       let ttl = Int(out[tlr]) {
+        hops = inferredHops(ttl: ttl)
     }
-    let initial = [64, 128, 255].filter { $0 >= ttl }.min() ?? 255
-    if initial - ttl <= 1 { return PingResult(ms: nil, rejected: true, failed: false) }
-    return PingResult(ms: ms, rejected: false, failed: false)
+    if !honesty { return PingResult(ms: ms, hops: hops, rejected: false, failed: false) }
+    guard let hops else {
+        return PingResult(ms: nil, hops: nil, rejected: false, failed: true)
+    }
+    if hops <= 2 { return PingResult(ms: nil, hops: hops, rejected: true, failed: false) }
+    return PingResult(ms: ms, hops: hops, rejected: false, failed: false)
 }
 
-/// TCP connect RTT approximation (1× RTT). Prefer over TLS handshake, which is ~2–3× RTT + DNS.
-func tcpProbe() -> Double? {
-    guard let port = NWEndpoint.Port(rawValue: tcpFallback.port) else { return nil }
-    let conn = NWConnection(host: .init(tcpFallback.host), port: port, using: .tcp)
+func connectProbe(host: String, port: UInt16, using params: NWParameters, wait: TimeInterval) -> Double? {
+    guard let nwPort = NWEndpoint.Port(rawValue: port) else { return nil }
+    let conn = NWConnection(host: .init(host), port: nwPort, using: params)
     let sem = DispatchSemaphore(value: 0)
     let state = NSLock()
     var ok = false
@@ -163,11 +188,21 @@ func tcpProbe() -> Double? {
         }
     }
     conn.start(queue: .global(qos: .utility))
-    _ = sem.wait(timeout: .now() + 4)
+    _ = sem.wait(timeout: .now() + wait)
     conn.cancel()
     state.lock(); let success = ok; state.unlock()
     guard success, let ms = finiteNonNeg(Date().timeIntervalSince(t0) * 1000) else { return nil }
     return ms
+}
+
+/// TCP connect ≈ 1× RTT — but only when nothing on-path SYN-ACKs for the destination.
+func tcpProbe() -> Double? {
+    connectProbe(host: tcpFallback.host, port: tcpFallback.port, using: .tcp, wait: 4)
+}
+
+/// TLS handshake crosses the real WAN when TCP is terminated at a cabin/hotel proxy.
+func tlsProbe() -> Double? {
+    connectProbe(host: tlsFallback.host, port: tlsFallback.port, using: .tls, wait: 8)
 }
 
 struct WanProbe {
@@ -175,13 +210,21 @@ struct WanProbe {
 }
 
 func probeWAN(forceTLS: Bool, lastTLS: inout Date?, gateway: String?, doGW: Bool) -> WanProbe {
+    var gw: Double?
+    if doGW, let g = gateway {
+        let r = pingHost(g, timeoutMs: "500", honesty: false)
+        gw = r.ms
+    }
     var honest: [Double] = [], rejected = 0, failed = 0, total = 0
     for h in icmpTargets {
         total += 1
-        let r = pingHost(h, timeoutMs: "1000", honesty: true)
+        let r = pingHost(h, timeoutMs: icmpTimeoutMs, honesty: true)
         if r.rejected { rejected += 1 }
         else if r.failed { failed += 1 }
-        else if let m = r.ms { honest.append(m) }
+        else if let m = r.ms {
+            if isOnPathEcho(ms: m, hops: r.hops, gatewayMs: gw) { rejected += 1 }
+            else { honest.append(m) }
+        }
     }
     var ms: Double?, src: String?
     // Best honest RTT — max() biased the menu bar to Wi‑Fi wakeup / worse-path spikes.
@@ -190,16 +233,34 @@ func probeWAN(forceTLS: Bool, lastTLS: inout Date?, gateway: String?, doGW: Bool
         let due = forceTLS || lastTLS.map { Date().timeIntervalSince($0) >= fallbackInterval } ?? true
         if due {
             total += 1
-            if let t = tcpProbe() { ms = t; src = "tcp"; lastTLS = Date() }
-            else { failed += 1; lastTLS = Date() }
+            lastTLS = Date()
+            if let chosen = chooseConnectFallback(gatewayMs: gw) {
+                ms = chosen.ms; src = chosen.src
+            } else { failed += 1 }
         }
     }
-    var gw: Double?
-    if doGW, let g = gateway {
-        let r = pingHost(g, timeoutMs: "500", honesty: false)
-        gw = r.ms
-    }
     return WanProbe(ms: ms, src: src, rejected: rejected, failed: failed, total: total, gwMs: gw)
+}
+
+/// TCP connect is ~1 RTT on a clean path. Cabin/hotel proxies SYN-ACK in a few ms;
+/// TLS still does a real handshake over the WAN (shown as ~).
+func chooseConnectFallback(gatewayMs: Double?) -> (ms: Double, src: String)? {
+    let tcp = tcpProbe()
+    if let tcp {
+        let matchesGateway = isLocalProxyConnect(tcp, gatewayMs: gatewayMs)
+        let maybeProxy = matchesGateway || (gatewayMs == nil && tcp < 40)
+        if maybeProxy {
+            // TLS ≫ TCP means the SYN-ACK was local and the handshake went over WAN.
+            if let tls = tlsProbe(), tls > max(tcp * 4, 80) { return (tls, "tls") }
+            if matchesGateway { return nil }
+            return (tcp, "tcp")
+        }
+        return (tcp, "tcp")
+    }
+    if let tls = tlsProbe(), !isLocalProxyConnect(tls, gatewayMs: gatewayMs) {
+        return (tls, "tls")
+    }
+    return nil
 }
 
 struct Identity: Equatable {
@@ -589,7 +650,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if let at = lastLatAt, Date().timeIntervalSince(at) <= staleAfter,
            let m = finiteNonNeg(median(recentLats) ?? lastLatMs ?? .nan) {
             let n = Int(m.rounded())
-            // ~ marks non-ICMP approximation (TCP connect fallback)
+            // ~ marks non-ICMP approximation (TCP connect or TLS handshake)
             lat = lastLatSrc == "icmp" ? "\(n)ms" : "~\(n)ms"
         } else { lat = "✕" }
         paintStatus(lat: lat, down: fmtRate(displayDown), up: fmtRate(displayUp))

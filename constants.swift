@@ -3,6 +3,7 @@
 enum Host {
     static let cloudflareDNS = "1.1.1.1"
     static let googleDNS = "8.8.8.8"
+    static let cloudflare = "one.one.one.one"
     static let speedTest = "speed.cloudflare.com"
 }
 
