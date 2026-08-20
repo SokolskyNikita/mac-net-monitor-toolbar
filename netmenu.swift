@@ -6,19 +6,11 @@
 // FUTURE: file rotation
 
 import AppKit
-import Network
 import CoreWLAN
 import CoreLocation
 
-let icmpTargets = [Host.cloudflareDNS, Host.googleDNS]
-// IP literal — avoid DNS in the TCP timing path.
-let tcpFallback = (host: Host.cloudflareDNS, port: UInt16(443))
-// Hostname — TLS needs SNI; used only when TCP connect is a local proxy SYN-ACK.
-let tlsFallback = (host: Host.cloudflare, port: UInt16(443))
+/// Menu-bar latency — one WAN probe cycle every `probeInterval` (wall clock).
 let probeInterval: TimeInterval = 3
-let fallbackInterval: TimeInterval = 30
-/// Inflight/sat RTT is often 600–1500ms; 1000ms censored real replies and fell through to TCP.
-let icmpTimeoutMs = "4000"
 let staleAfter: TimeInterval = 60
 let sampleInterval: TimeInterval = 1
 let rateDisplayInterval: TimeInterval = 5
@@ -117,151 +109,7 @@ func deltaRates(old: Counters, new: Counters, dt: TimeInterval) -> (down: Double
     return (Double(dr) / dt, Double(du) / dt)
 }
 
-struct PingResult { var ms: Double?; var hops: Int?; var rejected: Bool; var failed: Bool }
-
-private let timeRe = try? NSRegularExpression(pattern: #"time=([0-9.]+)"#)
-private let ttlRe = try? NSRegularExpression(pattern: #"ttl=([0-9]+)"#)
 private let ssidRe = try? NSRegularExpression(pattern: #"^\s*SSID : (.+)$"#, options: .anchorsMatchLines)
-
-func inferredHops(ttl: Int) -> Int {
-    let initial = [64, 128, 255].filter { $0 >= ttl }.min() ?? 255
-    return initial - ttl
-}
-
-/// Onboard/captive responders sit 1–2 hops out, or answer about as fast as the gateway.
-func isOnPathEcho(ms: Double, hops: Int?, gatewayMs: Double?) -> Bool {
-    if let hops, hops <= 2 { return true }
-    if let gw = gatewayMs, ms <= gw + 10, (hops ?? 99) <= 6 { return true }
-    return false
-}
-
-/// Inflight/hotel proxies SYN-ACK locally — connect time matches the cabin hop, not WAN.
-func isLocalProxyConnect(_ connectMs: Double, gatewayMs: Double?) -> Bool {
-    if let gw = gatewayMs { return connectMs <= max(gw * 2, gw + 12) }
-    return false
-}
-
-func pingHost(_ host: String, timeoutMs: String, honesty: Bool) -> PingResult {
-    // ping -W is ms; give the process a little headroom past that.
-    let procTimeout = max(2.0, ((Double(timeoutMs) ?? 1000) / 1000.0) + 1.5)
-    guard let out = runProc("/sbin/ping", ["-c", "1", "-W", timeoutMs, "-s", "16", host], timeout: procTimeout),
-          let timeRe else {
-        return PingResult(ms: nil, hops: nil, rejected: false, failed: true)
-    }
-    let range = NSRange(out.startIndex..., in: out)
-    guard let tm = timeRe.firstMatch(in: out, range: range), let tr = Range(tm.range(at: 1), in: out),
-          let raw = Double(out[tr]), let ms = finiteNonNeg(raw) else {
-        return PingResult(ms: nil, hops: nil, rejected: false, failed: true)
-    }
-    var hops: Int?
-    if let ttlRe,
-       let ttlm = ttlRe.firstMatch(in: out, range: range), let tlr = Range(ttlm.range(at: 1), in: out),
-       let ttl = Int(out[tlr]) {
-        hops = inferredHops(ttl: ttl)
-    }
-    if !honesty { return PingResult(ms: ms, hops: hops, rejected: false, failed: false) }
-    guard let hops else {
-        return PingResult(ms: nil, hops: nil, rejected: false, failed: true)
-    }
-    if hops <= 2 { return PingResult(ms: nil, hops: hops, rejected: true, failed: false) }
-    return PingResult(ms: ms, hops: hops, rejected: false, failed: false)
-}
-
-func connectProbe(host: String, port: UInt16, using params: NWParameters, wait: TimeInterval) -> Double? {
-    guard let nwPort = NWEndpoint.Port(rawValue: port) else { return nil }
-    let conn = NWConnection(host: .init(host), port: nwPort, using: params)
-    let sem = DispatchSemaphore(value: 0)
-    let state = NSLock()
-    var ok = false
-    var finished = false
-    let t0 = Date()
-    conn.stateUpdateHandler = { s in
-        state.lock()
-        defer { state.unlock() }
-        guard !finished else { return }
-        switch s {
-        case .ready:
-            ok = true; finished = true; sem.signal()
-        case .failed, .cancelled:
-            finished = true; sem.signal()
-        default: break
-        }
-    }
-    conn.start(queue: .global(qos: .utility))
-    _ = sem.wait(timeout: .now() + wait)
-    conn.cancel()
-    state.lock(); let success = ok; state.unlock()
-    guard success, let ms = finiteNonNeg(Date().timeIntervalSince(t0) * 1000) else { return nil }
-    return ms
-}
-
-/// TCP connect ≈ 1× RTT — but only when nothing on-path SYN-ACKs for the destination.
-func tcpProbe() -> Double? {
-    connectProbe(host: tcpFallback.host, port: tcpFallback.port, using: .tcp, wait: 4)
-}
-
-/// TLS handshake crosses the real WAN when TCP is terminated at a cabin/hotel proxy.
-func tlsProbe() -> Double? {
-    connectProbe(host: tlsFallback.host, port: tlsFallback.port, using: .tls, wait: 8)
-}
-
-struct WanProbe {
-    var ms: Double?; var src: String?; var rejected: Int; var failed: Int; var total: Int; var gwMs: Double?
-}
-
-func probeWAN(forceTLS: Bool, lastTLS: inout Date?, gateway: String?, doGW: Bool) -> WanProbe {
-    var gw: Double?
-    if doGW, let g = gateway {
-        let r = pingHost(g, timeoutMs: "500", honesty: false)
-        gw = r.ms
-    }
-    var honest: [Double] = [], rejected = 0, failed = 0, total = 0
-    for h in icmpTargets {
-        total += 1
-        let r = pingHost(h, timeoutMs: icmpTimeoutMs, honesty: true)
-        if r.rejected { rejected += 1 }
-        else if r.failed { failed += 1 }
-        else if let m = r.ms {
-            if isOnPathEcho(ms: m, hops: r.hops, gatewayMs: gw) { rejected += 1 }
-            else { honest.append(m) }
-        }
-    }
-    var ms: Double?, src: String?
-    // Best honest RTT — max() biased the menu bar to Wi‑Fi wakeup / worse-path spikes.
-    if let m = honest.min() { ms = m; src = "icmp" }
-    else {
-        let due = forceTLS || lastTLS.map { Date().timeIntervalSince($0) >= fallbackInterval } ?? true
-        if due {
-            total += 1
-            lastTLS = Date()
-            if let chosen = chooseConnectFallback(gatewayMs: gw) {
-                ms = chosen.ms; src = chosen.src
-            } else { failed += 1 }
-        }
-    }
-    return WanProbe(ms: ms, src: src, rejected: rejected, failed: failed, total: total, gwMs: gw)
-}
-
-/// TCP connect is ~1 RTT on a clean path. Cabin/hotel proxies SYN-ACK in a few ms;
-/// TLS still does a real handshake over the WAN (shown as ~).
-func chooseConnectFallback(gatewayMs: Double?) -> (ms: Double, src: String)? {
-    let tcp = tcpProbe()
-    if let tcp {
-        let matchesGateway = isLocalProxyConnect(tcp, gatewayMs: gatewayMs)
-        let maybeProxy = matchesGateway || (gatewayMs == nil && tcp < 40)
-        if maybeProxy {
-            // TLS ≫ TCP means the SYN-ACK was local and the handshake went over WAN.
-            if let tls = tlsProbe(), tls > max(tcp * 4, 80) { return (tls, "tls") }
-            if matchesGateway { return nil }
-            return (tcp, "tcp")
-        }
-        return (tcp, "tcp")
-    }
-    if let tls = tlsProbe(), !isLocalProxyConnect(tls, gatewayMs: gatewayMs) {
-        return (tls, "tls")
-    }
-    return nil
-}
 
 struct Identity: Equatable {
     var iface: String?; var type: String; var network: String?; var bssid: String?
@@ -650,18 +498,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if let at = lastLatAt, Date().timeIntervalSince(at) <= staleAfter,
            let m = finiteNonNeg(median(recentLats) ?? lastLatMs ?? .nan) {
             let n = Int(m.rounded())
-            // ~ marks non-ICMP approximation (TCP connect or TLS handshake)
+            // ~ marks non-ICMP approximation (TLS handshake or HTTP TTFB)
             lat = lastLatSrc == "icmp" ? "\(n)ms" : "~\(n)ms"
         } else { lat = "✕" }
         paintStatus(lat: lat, down: fmtRate(displayDown), up: fmtRate(displayUp))
     }
 
     func probeLoop() {
-        var tls: Date?
         while true {
+            let started = Date()
             autoreleasepool {
                 let probeIdentity = snapshotIdentity()
-                let r = probeWAN(forceTLS: false, lastTLS: &tls, gateway: probeIdentity.router, doGW: true)
+                let r = probeWAN(gateway: probeIdentity.router, probeGateway: true)
                 DispatchQueue.main.async { [weak self] in
                     guard let self, self.identity.sameNetwork(as: probeIdentity) else { return }
                     self.winTotal += r.total; self.winRejected += r.rejected; self.winFailed += r.failed
@@ -675,7 +523,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     self.updateTitle()
                 }
             }
-            Thread.sleep(forTimeInterval: probeInterval)
+            let wait = probeInterval - Date().timeIntervalSince(started)
+            if wait > 0 { Thread.sleep(forTimeInterval: wait) }
         }
     }
 

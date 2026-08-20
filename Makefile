@@ -3,7 +3,7 @@ SIGN_ID?=-
 
 .PHONY: build check app run clean
 
-SOURCES=constants.swift netmenu.swift main.swift
+SOURCES=constants.swift latency.swift netmenu.swift main.swift
 
 build/NetMenu: $(SOURCES)
 	mkdir -p build && swiftc $(SWIFT_FLAGS) $(SOURCES) -o build/NetMenu

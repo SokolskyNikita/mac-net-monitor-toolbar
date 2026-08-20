@@ -4,8 +4,7 @@ import Foundation
 if CommandLine.arguments.contains("--sample") {
     let c0 = readCounters(); Thread.sleep(forTimeInterval: 1); let c1 = readCounters()
     let (down, up) = deltaRates(old: c0, new: c1, dt: 1)
-    var tls: Date? = nil
-    let r = probeWAN(forceTLS: true, lastTLS: &tls, gateway: nil, doGW: false)
+    let r = probeWAN(gateway: nil, probeGateway: false)
     let id = resolveIdentitySample()
     let latStr = r.ms.map { String(format: "%.1f", $0) } ?? "nan"
     let netName = id.network ?? "none"
