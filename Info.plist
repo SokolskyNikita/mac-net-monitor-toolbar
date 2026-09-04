@@ -2,12 +2,37 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>CFBundleIdentifier</key><string>me.sokolsky.netmenu</string>
-    <key>CFBundleName</key><string>NetMenu</string>
-    <key>CFBundleExecutable</key><string>NetMenu</string>
-    <key>CFBundlePackageType</key><string>APPL</string>
-    <key>LSUIElement</key><true/>
-    <key>NSLocationUsageDescription</key><string>Reads the current Wi-Fi network name and access point (SSID/BSSID) to tag network statistics.</string>
-    <key>NSLocalNetworkUsageDescription</key><string>Pings your router to separate Wi-Fi latency from internet latency.</string>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleDisplayName</key>
+    <string>NetMenu</string>
+    <key>CFBundleExecutable</key>
+    <string>NetMenu</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>CFBundleIdentifier</key>
+    <string>me.sokolsky.netmenu</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>NetMenu</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.utilities</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSHumanReadableCopyright</key>
+    <string>Copyright © 2026 Nikita Sokolsky</string>
+    <key>NSLocationUsageDescription</key>
+    <string>Reads the current Wi-Fi network name and access point (SSID/BSSID) to tag network statistics.</string>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>Pings your router to separate Wi-Fi latency from internet latency.</string>
 </dict>
 </plist>

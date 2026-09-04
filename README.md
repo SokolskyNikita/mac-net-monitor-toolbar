@@ -4,6 +4,31 @@ macOS menu bar app that shows live **WAN latency**, **download**, and **upload**
 
 ![NetMenu in the macOS menu bar showing latency and throughput](images/mac-net-monitor-screenshot.png)
 
+## Install
+
+Apple silicon or Intel Mac, macOS 14 (Sonoma) or later. Xcode is not required for the prebuilt app.
+
+```bash
+brew tap SokolskyNikita/netmenu https://github.com/SokolskyNikita/mac-net-monitor-toolbar
+brew install --cask netmenu
+```
+
+Or download `NetMenu-*.zip` from [Releases](https://github.com/SokolskyNikita/mac-net-monitor-toolbar/releases) and move `NetMenu.app` to `/Applications`.
+
+Until the app is Developer ID–signed and notarized, macOS may block the first launch. Use **System Settings → Privacy & Security → Open Anyway**, or:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/NetMenu.app
+```
+
+First launch may prompt for **Location** (SSID/BSSID) and **Local Network** (gateway ping). Denying either leaves those fields empty; the rest still works.
+
+## Update
+
+```bash
+brew update && brew upgrade --cask netmenu
+```
+
 ## Features
 
 - ICMP latency probes to `1.1.1.1` / `8.8.8.8` (TCP connect fallback when ICMP is blocked)
@@ -12,25 +37,24 @@ macOS menu bar app that shows live **WAN latency**, **download**, and **upload**
 - Session peak rates and a Cloudflare-backed speed test (~7 MB)
 - Per-minute JSONL samples under `~/Library/Application Support/NetMenu/stats.jsonl`
 
-## Requirements
+## Development
 
-- macOS (Apple silicon recommended)
-- Xcode Command Line Tools (`swiftc`)
-- First launch may prompt for **Location** (SSID/BSSID) and **Local Network** (gateway ping). Denying either leaves those fields empty; the rest still works.
-
-## Build and run
+Requires Xcode Command Line Tools (`swiftc`).
 
 ```bash
 make run          # build, bundle, codesign (ad-hoc), open
 make check        # one-shot sample JSON to stdout
+make dist         # universal .app zip → dist/NetMenu-VERSION.zip
 make build        # binary only → build/NetMenu
 ```
 
 Ad-hoc signing (`SIGN_ID=-`) is the default. TCC grants reset when the signature changes. For a stable local identity:
 
-1. Keychain Access → Certificate Assistant → Create a Certificate  
-2. Name: `netmenu-selfsign`, type: **Code Signing**  
+1. Keychain Access → Certificate Assistant → Create a Certificate
+2. Name: `netmenu-selfsign`, type: **Code Signing**
 3. `make app SIGN_ID=netmenu-selfsign && open NetMenu.app`
+
+Developer ID + notarization (optional): `make notarize SIGN_ID="Developer ID Application: …"` after `xcrun notarytool store-credentials netmenu-notary`. See [RELEASING.md](RELEASING.md).
 
 ## Sample mode
 

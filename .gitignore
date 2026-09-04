@@ -1,4 +1,7 @@
 build/
+dist/
 NetMenu.app/
+images/AppIcon.iconset/
+images/AppIcon-1024.png
 *.swp
 .DS_Store

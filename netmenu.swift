@@ -354,6 +354,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let rev = NSMenuItem(title: "Reveal stats file", action: #selector(revealStats), keyEquivalent: "")
         rev.target = self; menu.addItem(rev)
         menu.addItem(.separator())
+        let about = NSMenuItem(title: "About NetMenu", action: #selector(showAbout), keyEquivalent: "")
+        about.target = self; menu.addItem(about)
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         item.menu = menu
 
@@ -548,6 +550,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             try? Data().write(to: url)
         }
         NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
+    @objc func showAbout(_ sender: Any?) {
+        let short = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? ""
+        NSApp.activate(ignoringOtherApps: true)
+        NSApp.orderFrontStandardAboutPanel(options: [
+            .applicationName: "NetMenu",
+            .applicationVersion: short,
+            .version: build
+        ])
     }
 
     @objc func runSpeedTest() {

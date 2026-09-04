@@ -1,0 +1,98 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check tag matches Info.plist
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          plist="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Info.plist)"
+          if [ "$tag" != "$plist" ]; then
+            echo "tag v${tag} does not match CFBundleShortVersionString ${plist}"
+            exit 1
+          fi
+
+      - name: Import Developer ID certificate
+        if: ${{ secrets.APPLE_CERTIFICATE_P12 != '' }}
+        env:
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          cert="$RUNNER_TEMP/developer-id.p12"
+          keychain="$RUNNER_TEMP/app-signing.keychain-db"
+          echo "$APPLE_CERTIFICATE_P12" | base64 --decode > "$cert"
+          security create-keychain -p "" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "" "$keychain"
+          security import "$cert" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "" "$keychain"
+          security list-keychain -d user -s "$keychain"
+          identity="$(security find-identity -v -p codesigning "$keychain" | awk -F'"' '/Developer ID Application/ {print $2; exit}')"
+          if [ -z "$identity" ]; then
+            echo "no Developer ID Application identity in imported certificate"
+            exit 1
+          fi
+          echo "SIGN_ID=$identity" >> "$GITHUB_ENV"
+
+      - name: Build zip
+        run: |
+          make dist SIGN_ID="${SIGN_ID:--}"
+
+      - name: Notarize
+        if: ${{ secrets.APPLE_NOTARY_KEY != '' && secrets.APPLE_CERTIFICATE_P12 != '' }}
+        env:
+          APPLE_NOTARY_KEY: ${{ secrets.APPLE_NOTARY_KEY }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        run: |
+          key="$RUNNER_TEMP/AuthKey.p8"
+          printf '%s\n' "$APPLE_NOTARY_KEY" > "$key"
+          version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Info.plist)"
+          zip="dist/NetMenu-${version}.zip"
+          xcrun notarytool submit "$zip" \
+            --key "$key" --key-id "$APPLE_NOTARY_KEY_ID" --issuer "$APPLE_NOTARY_ISSUER_ID" --wait
+          xcrun stapler staple NetMenu.app
+          rm -f "$zip"
+          ditto -c -k --keepParent --norsrc --noextattr --noqtn NetMenu.app "$zip"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Info.plist)"
+          zip="dist/NetMenu-${version}.zip"
+          notes="NetMenu ${version}."
+          if [ "${SIGN_ID:--}" = "-" ]; then
+            notes+=$'\n\nAd-hoc signed. First launch may need System Settings → Privacy & Security → Open Anyway.'
+          fi
+          gh release create "$GITHUB_REF_NAME" "$zip" --title "NetMenu ${version}" --notes "$notes"
+
+      - name: Update Homebrew cask on main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Info.plist)"
+          sha256="$(shasum -a 256 "dist/NetMenu-${version}.zip" | awk '{print $1}')"
+          git fetch origin main
+          git checkout -B main origin/main
+          bash scripts/update-cask.sh "$version" "$sha256"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Casks/netmenu.rb
+          if git diff --staged --quiet; then
+            echo "cask already up to date"
+            exit 0
+          fi
+          git commit -m "chore: bump Homebrew cask to ${version}"
+          git push origin main
