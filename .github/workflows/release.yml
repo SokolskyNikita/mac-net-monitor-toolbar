@@ -11,6 +11,12 @@ permissions:
 jobs:
   release:
     runs-on: macos-15
+    env:
+      APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_NOTARY_KEY: ${{ secrets.APPLE_NOTARY_KEY }}
+      APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+      APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
     steps:
       - uses: actions/checkout@v4
 
@@ -24,10 +30,7 @@ jobs:
           fi
 
       - name: Import Developer ID certificate
-        if: ${{ secrets.APPLE_CERTIFICATE_P12 != '' }}
-        env:
-          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        if: env.APPLE_CERTIFICATE_P12 != ''
         run: |
           cert="$RUNNER_TEMP/developer-id.p12"
           keychain="$RUNNER_TEMP/app-signing.keychain-db"
@@ -50,11 +53,7 @@ jobs:
           make dist SIGN_ID="${SIGN_ID:--}"
 
       - name: Notarize
-        if: ${{ secrets.APPLE_NOTARY_KEY != '' && secrets.APPLE_CERTIFICATE_P12 != '' }}
-        env:
-          APPLE_NOTARY_KEY: ${{ secrets.APPLE_NOTARY_KEY }}
-          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
-          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        if: env.APPLE_NOTARY_KEY != '' && env.APPLE_CERTIFICATE_P12 != ''
         run: |
           key="$RUNNER_TEMP/AuthKey.p8"
           printf '%s\n' "$APPLE_NOTARY_KEY" > "$key"
