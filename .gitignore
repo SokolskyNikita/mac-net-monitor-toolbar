@@ -1,4 +1,6 @@
 build/
+.build/
+.swiftpm/
 dist/
 NetMenu.app/
 images/AppIcon.iconset/

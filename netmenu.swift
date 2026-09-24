@@ -78,6 +78,17 @@ func median(_ xs: [Double]) -> Double? {
     return n % 2 == 1 ? s[n / 2] : (s[n / 2 - 1] + s[n / 2]) / 2
 }
 
+/// Append one sample. A source change drops the previous window so an ICMP reply and a
+/// connect-timer fallback cannot be averaged into an RTT no probe returned.
+func pushLatency(_ ms: Double, src: String?, into samples: inout [Double], source: inout String?, limit: Int) {
+    if src != source {
+        samples.removeAll(keepingCapacity: true)
+        source = src
+    }
+    samples.append(ms)
+    if samples.count > limit { samples.removeFirst(samples.count - limit) }
+}
+
 struct Counters { var rx: [String: UInt32] = [:]; var tx: [String: UInt32] = [:] }
 
 func readCounters() -> Counters {
@@ -421,13 +432,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         winDownSum = 0; winUpSum = 0; winTicks = 0; winDownPeak = 0; winUpPeak = 0
     }
 
+    func clearLatency() {
+        recentLats.removeAll(keepingCapacity: true)
+        lastLatMs = nil; lastLatSrc = nil; lastLatAt = nil
+    }
+
     func noteLatency(_ ms: Double, src: String?) {
         guard let ms = finiteNonNeg(ms) else { return }
-        lastLatMs = ms; lastLatSrc = src; lastLatAt = Date()
-        recentLats.append(ms)
-        if recentLats.count > displayLatWindow { recentLats.removeFirst(recentLats.count - displayLatWindow) }
-        winLats.append(ms); winLatSrc = src
-        if winLats.count > Self.maxWinSamples { winLats.removeFirst(winLats.count - Self.maxWinSamples) }
+        lastLatMs = ms; lastLatAt = Date()
+        pushLatency(ms, src: src, into: &recentLats, source: &lastLatSrc, limit: displayLatWindow)
+        pushLatency(ms, src: src, into: &winLats, source: &winLatSrc, limit: Self.maxWinSamples)
     }
 
     func tick() {
@@ -500,8 +514,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if let at = lastLatAt, Date().timeIntervalSince(at) <= staleAfter,
            let m = finiteNonNeg(median(recentLats) ?? lastLatMs ?? .nan) {
             let n = Int(m.rounded())
-            // ~ marks non-ICMP approximation (TLS handshake or HTTP TTFB)
-            lat = lastLatSrc == "icmp" ? "\(n)ms" : "~\(n)ms"
+            // ~ marks a non-ICMP approximation (HTTP trace)
+            lat = lastLatSrc == LatencySource.icmp.rawValue ? "\(n)ms" : "~\(n)ms"
         } else { lat = "✕" }
         paintStatus(lat: lat, down: fmtRate(displayDown), up: fmtRate(displayUp))
     }
@@ -511,12 +525,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let started = Date()
             autoreleasepool {
                 let probeIdentity = snapshotIdentity()
-                let r = probeWAN(gateway: probeIdentity.router, probeGateway: true)
+                let r = Latency.measure(gateway: probeIdentity.router)
                 DispatchQueue.main.async { [weak self] in
                     guard let self, self.identity.sameNetwork(as: probeIdentity) else { return }
                     self.winTotal += r.total; self.winRejected += r.rejected; self.winFailed += r.failed
-                    if let m = r.ms { self.noteLatency(m, src: r.src) }
-                    if let g = r.gwMs, let g = finiteNonNeg(g) {
+                    if r.captive { self.clearLatency() }
+                    else if let m = r.ms { self.noteLatency(m, src: r.source?.rawValue) }
+                    if let g = r.gatewayMs, let g = finiteNonNeg(g) {
                         self.winGW.append(g)
                         if self.winGW.count > Self.maxWinSamples {
                             self.winGW.removeFirst(self.winGW.count - Self.maxWinSamples)

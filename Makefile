@@ -10,7 +10,14 @@ DIST_DIR := dist
 DIST_ZIP := $(DIST_DIR)/NetMenu-$(VERSION).zip
 ICON := images/AppIcon.icns
 
-.PHONY: build check app run dist notarize icon clean
+.PHONY: build check test app run dist notarize icon clean
+
+# Command Line Tools ship Swift Testing outside the default search path; Xcode finds it on its own.
+TESTING_FW := $(shell xcode-select -p)/Library/Developer/Frameworks
+TESTING_LIB := $(shell xcode-select -p)/Library/Developer/usr/lib
+TEST_FLAGS := $(if $(wildcard $(TESTING_FW)/Testing.framework),\
+	-Xswiftc -F -Xswiftc $(TESTING_FW) -Xlinker -F -Xlinker $(TESTING_FW) \
+	-Xlinker -rpath -Xlinker $(TESTING_FW) -Xlinker -rpath -Xlinker $(TESTING_LIB))
 
 SOURCES = constants.swift latency.swift netmenu.swift main.swift
 ARCH_BINS = $(foreach a,$(ARCHS),build/NetMenu-$(a))
@@ -28,6 +35,9 @@ check: build/NetMenu
 	./build/NetMenu --sample > /tmp/netmenu_check.txt
 	cat /tmp/netmenu_check.txt
 	tail -n 1 /tmp/netmenu_check.txt | /usr/bin/env python3 -m json.tool > /dev/null
+
+test:
+	swift test $(TEST_FLAGS)
 
 $(ICON): scripts/generate-icon.swift
 	swift scripts/generate-icon.swift
@@ -78,4 +88,4 @@ notarize: dist
 	shasum -a 256 $(DIST_ZIP)
 
 clean:
-	rm -rf build NetMenu.app $(DIST_DIR)
+	rm -rf build .build NetMenu.app $(DIST_DIR)
