@@ -27,8 +27,11 @@ Requires macOS 14 (Sonoma) or later on Apple silicon or Intel.
 
 ```bash
 brew tap SokolskyNikita/netmenu https://github.com/SokolskyNikita/mac-net-monitor-toolbar
+brew trust sokolskynikita/netmenu
 brew install --cask netmenu
 ```
+
+Homebrew 7 and later only load casks from third-party taps you've trusted. If you see `Refusing to load cask ... from untrusted tap`, run the `brew trust` line once.
 
 ### Manual download
 
@@ -52,7 +55,7 @@ macOS may also ask for two permissions. Both are optional:
 ## Update and uninstall
 
 ```bash
-# Update
+# Update (run `brew trust sokolskynikita/netmenu` once first on Homebrew 7+)
 brew update && brew upgrade --cask netmenu
 
 # Uninstall

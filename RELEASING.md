@@ -57,6 +57,7 @@ This repo is the tap (`Casks/netmenu.rb`):
 
 ```bash
 brew tap SokolskyNikita/netmenu https://github.com/SokolskyNikita/mac-net-monitor-toolbar
+brew trust sokolskynikita/netmenu   # Homebrew 7+ refuses untrusted taps
 brew install --cask netmenu
 ```
 
