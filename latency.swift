@@ -32,6 +32,8 @@ struct WanProbe {
     var failed: Int
     /// ICMP targets probed this cycle; denominator for the logged loss rate.
     var total: Int
+    /// One verdict per echo, in the order the echoes were passed to `decide`.
+    var verdicts: [Latency.EchoVerdict] = []
     var gatewayMs: Double?
     /// A login wall answered the captive check. The caller should drop the displayed RTT.
     var captive: Bool
@@ -66,15 +68,17 @@ enum Latency {
     static func decide(echoes: [EchoReply?], gatewayMs: Double?, portal: Captive,
                        httpFallback: () -> Double?) -> WanProbe {
         var wan: [Double] = [], rejected = 0, failed = 0
-        for echo in echoes {
-            switch judge(echo, gatewayMs: gatewayMs) {
+        let verdicts = echoes.map { judge($0, gatewayMs: gatewayMs) }
+        for verdict in verdicts {
+            switch verdict {
             case .wan(let ms): wan.append(ms)
             case .onPath: rejected += 1
             case .noReply: failed += 1
             }
         }
         var probe = WanProbe(ms: nil, source: nil, rejected: rejected, failed: failed,
-                             total: max(echoes.count, 1), gatewayMs: gatewayMs, captive: false)
+                             total: max(echoes.count, 1), verdicts: verdicts, gatewayMs: gatewayMs,
+                             captive: false)
 
         if portal == .portal {
             probe.rejected += wan.count
@@ -94,7 +98,8 @@ enum Latency {
 
     private static func runParallelProbes(gateway: String?) -> (echoes: [EchoReply?], gatewayMs: Double?, portal: Captive) {
         let group = DispatchGroup()
-        let echoes = Locked<[EchoReply?]>([])
+        // Indexed by target so connection health can track each host's loss separately.
+        let echoes = Locked<[EchoReply?]>(Array(repeating: nil, count: icmpTargets.count))
         let gatewayMs = Locked<Double?>(nil)
         let portal = Locked(Captive.unknown)
 
@@ -105,8 +110,8 @@ enum Latency {
         if let gateway {
             run { gatewayMs.set(ping(gateway, timeoutMs: gatewayTimeoutMs)?.ms) }
         }
-        for host in icmpTargets {
-            run { let r = ping(host, timeoutMs: icmpTimeoutMs); echoes.mutate { $0.append(r) } }
+        for (i, host) in icmpTargets.enumerated() {
+            run { let r = ping(host, timeoutMs: icmpTimeoutMs); echoes.mutate { $0[i] = r } }
         }
         run { portal.set(detectPortal()) }
 

@@ -19,7 +19,7 @@ TEST_FLAGS := $(if $(wildcard $(TESTING_FW)/Testing.framework),\
 	-Xswiftc -F -Xswiftc $(TESTING_FW) -Xlinker -F -Xlinker $(TESTING_FW) \
 	-Xlinker -rpath -Xlinker $(TESTING_FW) -Xlinker -rpath -Xlinker $(TESTING_LIB))
 
-SOURCES = constants.swift latency.swift netmenu.swift main.swift
+SOURCES = constants.swift latency.swift health.swift netmenu.swift main.swift
 ARCH_BINS = $(foreach a,$(ARCHS),build/NetMenu-$(a))
 
 build/NetMenu-%: $(SOURCES)

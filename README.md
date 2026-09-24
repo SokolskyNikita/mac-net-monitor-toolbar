@@ -13,8 +13,9 @@ NetMenu is built for unreliable networks: hotels, airports, planes, and phone ho
 ## Features
 
 - **Honest latency.** Pings public DNS servers and `google.com` every 3 seconds and ignores replies from the local network path.
+- **Connection health.** A 0–100% score next to the latency that combines packet loss, latency stability, and latency level.
 - **Captive portal aware.** Shows `✕` instead of a number until you've passed the Wi‑Fi login page.
-- **Live throughput.** Download and upload rates from the network interface counters, averaged over 5 seconds.
+- **Live throughput.** Download and upload rates from the network interface counters, averaged over 5 seconds, in the menu or optionally in the menu bar.
 - **Built-in speed test.** One click runs a Cloudflare-backed test capped at about 7 MB of data.
 - **Local history.** Writes a per-minute summary to a JSON Lines file you can analyze later.
 - **Private by design.** No accounts, no analytics, nothing uploaded.
@@ -65,7 +66,7 @@ rm -rf ~/Library/Application\ Support/NetMenu   # optional: delete stats history
 
 ## Reading the menu bar
 
-The menu bar shows latency, then download (`↓`) and upload (`↑`) rates.
+The menu bar shows latency and connection health. Download (`↓`) and upload (`↑`) rates are in the menu; turn on **Show throughput in menu bar** to show them next to the health as well.
 
 | Latency display | Meaning |
 | --- | --- |
@@ -75,7 +76,21 @@ The menu bar shows latency, then download (`↓`) and upload (`↑`) rates.
 
 The number is the median of the last five measurements, so a single spike won't make it jump.
 
-Click the icon to see peak rates for this session, run a speed test, or open the stats file.
+Click the icon to see the health breakdown, current and peak rates, run a speed test, or open the stats file.
+
+### Connection health
+
+The percentage next to the latency rates the last minute of probes. It's averaged over 10 seconds and changes at most once every 10 seconds. It appears after three probe cycles (about 9 seconds) and is hidden whenever latency shows `✕`.
+
+A connection that meets Zoom's [recommended limits](https://support.zoom.com/hc/en/article?id=zm_kb&sysparm_article=KB0070504) for HD video (latency up to 150ms, jitter up to 40ms, packet loss up to 2%) scores 100%. Past those limits, three things lower the score, and their effects multiply, so one bad factor is enough to pull it down:
+
+| Factor | Measured as | Example effect |
+| --- | --- | --- |
+| Packet loss | Share of pings lost, counting only targets that answered at least once in the window | 5% loss costs about 32%, 10% about 67% |
+| Instability (jitter) | Average change between consecutive measurements, ignoring the largest 10% | Latency flipping between 15ms and 100ms costs about 60%; a single spike costs nothing |
+| High latency | Median latency | 300ms costs about 11%, 600ms about 44%, and it never costs more than 70% |
+
+A server that never answers pings on your network doesn't count as packet loss. When every ping is blocked and NetMenu falls back to HTTPS, a probe cycle that got no answer counts as lost.
 
 ## How latency is measured
 
@@ -110,6 +125,7 @@ Open it from the menu with **Reveal stats file**. The main fields are:
 | `lat_src` | How latency was measured: `icmp` or `http` (older entries may also contain `tcp` or `tls`) |
 | `gw_ms` | Median router latency |
 | `loss` | Fraction of probes that failed or were rejected |
+| `health` | Connection health score (0–100) at the end of the minute, or `null` if not enough data |
 | `down_Bps`, `up_Bps` | Average throughput in bytes per second |
 | `rssi`, `noise`, `channel`, `tx_rate_mbps` | Wi‑Fi signal details |
 

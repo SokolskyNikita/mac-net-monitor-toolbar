@@ -65,11 +65,37 @@ func finiteNonNeg(_ x: Double, max: Double = 600_000) -> Double? {
     return x
 }
 
+/// At most 4 characters: 999B, 999K, 9.9M, 999M, 9.9G. Thresholds sit below the next unit's
+/// rounding point so 999.6K prints 1.0M, not 1000K.
 func fmtRate(_ bps: Double) -> String {
-    if bps < 1000 { return String(format: "%.0fB", bps) }
-    if bps < 1e6 { return String(format: "%.0fK", bps / 1e3) }
-    if bps < 1e9 { return String(format: "%.1fM", bps / 1e6) }
-    return String(format: "%.1fG", bps / 1e9)
+    if bps < 999.5 { return String(format: "%.0fB", bps) }
+    if bps < 999.5e3 { return String(format: "%.0fK", bps / 1e3) }
+    if bps < 9.95e6 { return String(format: "%.1fM", bps / 1e6) }
+    if bps < 999.5e6 { return String(format: "%.0fM", bps / 1e6) }
+    if bps < 9.95e9 { return String(format: "%.1fG", bps / 1e9) }
+    return String(format: "%.0fG", bps / 1e9)
+}
+
+/// Status item width that grows at once but shrinks only after the content has stayed narrower
+/// for `shrinkAfter`, so neighbouring menu bar icons don't shift every time a digit drops.
+struct StableWidth {
+    static let shrinkAfter: TimeInterval = 30
+    private(set) var width: Double = 0
+    private var narrowerSince: TimeInterval?
+    /// Widest content seen since `narrowerSince`; the width shrinks to this, not the latest value.
+    private var narrowMax: Double = 0
+
+    mutating func fit(_ content: Double, now: TimeInterval) -> Double {
+        if content >= width {
+            width = content; narrowerSince = nil
+        } else if let since = narrowerSince {
+            narrowMax = max(narrowMax, content)
+            if now - since >= Self.shrinkAfter { width = narrowMax; narrowerSince = nil }
+        } else {
+            narrowerSince = now; narrowMax = content
+        }
+        return width
+    }
 }
 
 func median(_ xs: [Double]) -> Double? {
@@ -251,7 +277,8 @@ func resolveIdentitySample() -> Identity {
 }
 
 func buildSampleJSON(id: Identity, secs: Double, latMs: Double?, latMin: Double?, latMax: Double?, latSrc: String?,
-                     gwMs: Double?, loss: Double, rejected: Int, down: Double, up: Double, downPeak: Double, upPeak: Double) -> [String: Any] {
+                     gwMs: Double?, loss: Double, rejected: Int, down: Double, up: Double, downPeak: Double, upPeak: Double,
+                     health: Int? = nil) -> [String: Any] {
     func n(_ v: Double?) -> Any { v.map { $0 as Any } ?? NSNull() }
     func i(_ v: Int?) -> Any { v.map { $0 as Any } ?? NSNull() }
     func s(_ v: String?) -> Any { v.map { $0 as Any } ?? NSNull() }
@@ -260,7 +287,7 @@ func buildSampleJSON(id: Identity, secs: Double, latMs: Double?, latMin: Double?
         "ts": fmt.string(from: Date()), "event": "sample", "secs": secs,
         "if": s(id.iface), "type": id.type, "network": s(id.network), "bssid": s(id.bssid), "router": s(id.router),
         "lat_ms": n(latMs), "lat_min": n(latMin), "lat_max": n(latMax), "lat_src": s(latSrc),
-        "gw_ms": n(gwMs), "loss": loss, "rejected": rejected,
+        "gw_ms": n(gwMs), "loss": loss, "rejected": rejected, "health": i(health),
         "rssi": i(id.rssi), "noise": i(id.noise), "tx_rate_mbps": n(id.txRate), "channel": i(id.channel),
         "down_Bps": down, "up_Bps": up, "down_peak_Bps": downPeak, "up_peak_Bps": upPeak
     ]
@@ -295,6 +322,11 @@ final class SpeedTestBudget {
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem?
     var peakItem: NSMenuItem?
+    var rateItem: NSMenuItem?
+    static let showThroughputKey = "showThroughputInMenuBar"
+    /// Off by default: throughput lives in the menu to keep the menu bar item narrow.
+    var showThroughput = UserDefaults.standard.bool(forKey: AppDelegate.showThroughputKey)
+    var healthItem: NSMenuItem?
     var speedItem: NSMenuItem?
     var locationManager: CLLocationManager?
     /// Ephemeral, no connectivity-wait — fail fast; never auto-retry when the path returns.
@@ -320,6 +352,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var rateDispAt = Date()
     var lastLatMs: Double?; var lastLatSrc: String?; var lastLatAt: Date?
     var recentLats: [Double] = []
+    var health = HealthTracker()
+    var healthDisplay = HealthDisplay()
+    var statusWidth = StableWidth()
     var identity = Identity(iface: nil, type: NetType.offline, network: nil, bssid: nil, router: nil, rssi: nil, noise: nil, txRate: nil, channel: nil)
     /// Snapshot for probe queue — avoids DispatchQueue.main.sync (deadlock risk).
     var identityForProbe = Identity(iface: nil, type: NetType.offline, network: nil, bssid: nil, router: nil, rssi: nil, noise: nil, txRate: nil, channel: nil)
@@ -350,12 +385,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         signal(SIGPIPE, SIG_IGN)
-        // Draw into a fixed-size template image with 3 column anchors — status-item titles reflow/trim text.
-        let item = NSStatusBar.system.statusItem(withLength: Self.statusWidth)
+        // Draw into a template image — status-item titles reflow/trim text.
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         item.button?.imagePosition = .imageOnly
         statusItem = item
-        paintStatus(lat: "✕", down: "0B", up: "0B")
+        paintStatus(lat: "✕", health: "", down: "0B", up: "0B")
         let menu = NSMenu()
+        let hi = NSMenuItem(title: "Connection health: measuring…", action: nil, keyEquivalent: "")
+        hi.isEnabled = false; menu.addItem(hi); healthItem = hi
+        let rate = NSMenuItem(title: "Throughput: —", action: nil, keyEquivalent: "")
+        rate.isEnabled = false; menu.addItem(rate); rateItem = rate
         let peak = NSMenuItem(title: "Peak this session: —", action: nil, keyEquivalent: "")
         peak.isEnabled = false; menu.addItem(peak); peakItem = peak
         let speed = NSMenuItem(title: "No speed test run yet", action: nil, keyEquivalent: "")
@@ -364,6 +403,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         st.target = self; menu.addItem(st)
         let rev = NSMenuItem(title: "Reveal stats file", action: #selector(revealStats), keyEquivalent: "")
         rev.target = self; menu.addItem(rev)
+        menu.addItem(.separator())
+        let showRates = NSMenuItem(title: "Show throughput in menu bar", action: #selector(toggleThroughput(_:)),
+                                   keyEquivalent: "")
+        showRates.target = self; showRates.state = showThroughput ? .on : .off; menu.addItem(showRates)
         menu.addItem(.separator())
         let about = NSMenuItem(title: "About NetMenu", action: #selector(showAbout), keyEquivalent: "")
         about.target = self; menu.addItem(about)
@@ -421,6 +464,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 self.resetWindow()
                 self.recentLats = []
                 self.lastLatMs = nil; self.lastLatSrc = nil; self.lastLatAt = nil
+                self.health.reset(); self.healthDisplay.reset()
             }
             self.setIdentity(new)
         }
@@ -435,6 +479,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func clearLatency() {
         recentLats.removeAll(keepingCapacity: true)
         lastLatMs = nil; lastLatSrc = nil; lastLatAt = nil
+        health.reset(); healthDisplay.reset()
     }
 
     func noteLatency(_ ms: Double, src: String?) {
@@ -470,54 +515,71 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             rateDispAt = now
             updateTitle()
         }
+        if healthDisplay.publish(now: now.timeIntervalSince1970) { updateTitle() }
         peakItem?.title = "Peak this session: \(fmtRate(peakDown))↓ / \(fmtRate(peakUp))↑"
     }
 
     static let statusFont = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
-    // lat | num↓ | num↑ — arrows fixed after values; nums right-aligned in minimal slots
-    static let statusLayout: (w: CGFloat, latEdge: CGFloat, downEdge: CGFloat, downArr: CGFloat, upEdge: CGFloat, upArr: CGFloat) = {
-        let a: [NSAttributedString.Key: Any] = [.font: statusFont]
-        func sw(_ s: String) -> CGFloat { (s as NSString).size(withAttributes: a).width }
-        let latW = sw("~9999ms"), arrW = max(sw("↓"), sw("↑")), numW = sw("1000.0M")
-        let g: CGFloat = 4, ga: CGFloat = 1  // group gap, number→arrow gap
-        let latEdge = latW
-        let downEdge = latEdge + g + numW
-        let downArr = downEdge + ga
-        let upEdge = downArr + arrW + g + numW
-        let upArr = upEdge + ga
-        return (upArr + arrW, latEdge, downEdge, downArr, upEdge, upArr)
-    }()
-    static let statusWidth: CGFloat = statusLayout.w
+    static let statusAttrs: [NSAttributedString.Key: Any] = [.font: statusFont, .foregroundColor: NSColor.black]
+    /// Gap between fields; an arrow hugs its number.
+    static let statusGap: CGFloat = 5
 
-    func paintStatus(lat: String, down: String, up: String) {
-        guard let button = statusItem?.button else { return }
-        let L = Self.statusLayout
-        let img = NSImage(size: NSSize(width: L.w, height: 18), flipped: false) { _ in
-            let attrs: [NSAttributedString.Key: Any] = [.font: Self.statusFont, .foregroundColor: NSColor.black]
-            func drawRight(_ s: String, _ edge: CGFloat) {
-                let sz = (s as NSString).size(withAttributes: attrs)
-                (s as NSString).draw(at: NSPoint(x: edge - sz.width, y: 2), withAttributes: attrs)
+    /// Each field gets a slot wide enough for three digits and is right-aligned in it, so positions
+    /// hold as digit counts change. Longer values (1363ms) widen their slot; `StableWidth` keeps
+    /// the item from shrinking straight back.
+    func paintStatus(lat: String, health: String, down: String, up: String) {
+        guard let item = statusItem, let button = item.button else { return }
+        var fields = [(lat, "999ms"), (health, "100%")]
+        if showThroughput { fields += [(down + "↓", "999K↓"), (up + "↑", "999K↑")] }
+        func width(_ s: String) -> CGFloat { (s as NSString).size(withAttributes: Self.statusAttrs).width }
+        let slots = fields.map { max(width($0.0), width($0.1)) }
+        let content = ceil(slots.reduce(0, +) + Self.statusGap * CGFloat(fields.count - 1))
+        let w = CGFloat(statusWidth.fit(Double(content), now: Date().timeIntervalSince1970))
+        let img = NSImage(size: NSSize(width: w, height: 18), flipped: false) { _ in
+            var edge = w - content
+            for ((s, _), slot) in zip(fields, slots) {
+                edge += slot
+                (s as NSString).draw(at: NSPoint(x: edge - width(s), y: 2), withAttributes: Self.statusAttrs)
+                edge += Self.statusGap
             }
-            drawRight(lat, L.latEdge)
-            drawRight(down, L.downEdge)
-            ("↓" as NSString).draw(at: NSPoint(x: L.downArr, y: 2), withAttributes: attrs)
-            drawRight(up, L.upEdge)
-            ("↑" as NSString).draw(at: NSPoint(x: L.upArr, y: 2), withAttributes: attrs)
             return true
         }
         img.isTemplate = true
+        item.length = w
         button.image = img
     }
 
     func updateTitle() {
         let lat: String
+        var report: HealthReport?
         if let at = lastLatAt, Date().timeIntervalSince(at) <= staleAfter,
            let m = finiteNonNeg(median(recentLats) ?? lastLatMs ?? .nan) {
             let n = Int(m.rounded())
             // ~ marks a non-ICMP approximation (HTTP trace)
             lat = lastLatSrc == LatencySource.icmp.rawValue ? "\(n)ms" : "~\(n)ms"
+            report = healthDisplay.shown
         } else { lat = "✕" }
-        paintStatus(lat: lat, down: fmtRate(displayDown), up: fmtRate(displayUp))
+        paintStatus(lat: lat, health: report.map { "\($0.score)%" } ?? "",
+                    down: fmtRate(displayDown), up: fmtRate(displayUp))
+        healthItem?.title = healthMenuTitle(report)
+        rateItem?.title = "Throughput: \(fmtRate(displayDown))↓ / \(fmtRate(displayUp))↑"
+    }
+
+    @objc func toggleThroughput(_ sender: NSMenuItem) {
+        showThroughput.toggle()
+        UserDefaults.standard.set(showThroughput, forKey: Self.showThroughputKey)
+        sender.state = showThroughput ? .on : .off
+        // Hiding should narrow the item now, not after the usual shrink delay.
+        statusWidth = StableWidth()
+        updateTitle()
+    }
+
+    func healthMenuTitle(_ report: HealthReport?) -> String {
+        guard let h = report else { return "Connection health: measuring…" }
+        var parts = [String(format: "loss %.0f%%", h.loss * 100)]
+        if let j = h.jitterMs { parts.append(String(format: "jitter %.0fms", j)) }
+        if let l = h.latencyMs { parts.append(String(format: "latency %.0fms", l)) }
+        return "Connection health: \(h.score)% (\(parts.joined(separator: ", ")))"
     }
 
     func probeLoop() {
@@ -530,7 +592,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     guard let self, self.identity.sameNetwork(as: probeIdentity) else { return }
                     self.winTotal += r.total; self.winRejected += r.rejected; self.winFailed += r.failed
                     if r.captive { self.clearLatency() }
-                    else if let m = r.ms { self.noteLatency(m, src: r.source?.rawValue) }
+                    else {
+                        self.health.record(r)
+                        self.healthDisplay.add(self.health.report())
+                        if let m = r.ms { self.noteLatency(m, src: r.source?.rawValue) }
+                    }
                     if let g = r.gatewayMs, let g = finiteNonNeg(g) {
                         self.winGW.append(g)
                         if self.winGW.count > Self.maxWinSamples {
@@ -554,7 +620,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let up = winTicks > 0 ? winUpSum / Double(winTicks) : 0
         let obj = buildSampleJSON(id: identity, secs: secs, latMs: latMs, latMin: latMin, latMax: latMax,
                                   latSrc: winLatSrc, gwMs: median(winGW), loss: winLats.isEmpty ? 1.0 : loss,
-                                  rejected: winRejected, down: down, up: up, downPeak: winDownPeak, upPeak: winUpPeak)
+                                  rejected: winRejected, down: down, up: up, downPeak: winDownPeak, upPeak: winUpPeak,
+                                  health: healthDisplay.shown?.score)
         if let line = jsonLine(obj) { appendStatsLine(line) }
         resetWindow()
     }

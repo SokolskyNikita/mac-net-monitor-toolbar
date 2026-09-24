@@ -11,7 +11,7 @@ let package = Package(
             path: ".",
             exclude: ["Tests", "scripts", "images", "Casks", "build", "dist", "NetMenu.app",
                       "Info.plist", "Makefile", "README.md", "RELEASING.md", "LICENSE"],
-            sources: ["constants.swift", "latency.swift", "netmenu.swift", "main.swift"]
+            sources: ["constants.swift", "latency.swift", "health.swift", "netmenu.swift", "main.swift"]
         ),
         .testTarget(
             name: "NetMenuTests",
