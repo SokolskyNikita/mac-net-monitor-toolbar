@@ -21,7 +21,9 @@ if CommandLine.arguments.contains("--sample") {
     let loss = r.total > 0 ? Double(r.failed + r.rejected) / Double(r.total) : 1.0
     let obj = buildSampleJSON(id: id, secs: 1, latMs: r.ms, latMin: r.ms, latMax: r.ms, latSrc: r.source?.rawValue,
                               gwMs: nil, loss: r.ms == nil ? 1.0 : loss, rejected: r.rejected,
-                              down: down, up: up, downPeak: down, upPeak: up)
+                              down: down, up: up, downPeak: down, upPeak: up,
+                              health: r.internetReachable ? nil : 0,
+                              internetChecks: r.internetChecks, captive: r.captive)
     if let line = jsonLine(obj) { print(line) }
     exit(0)
 }

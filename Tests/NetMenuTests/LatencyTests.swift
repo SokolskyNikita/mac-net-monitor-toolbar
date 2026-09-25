@@ -1,6 +1,62 @@
 import Testing
 @testable import NetMenu
 
+@Suite struct InternetAccessTests {
+    @Test func ordinaryPagesAreAccepted() {
+        #expect(Latency.InternetSite.example.accepts(status: 200,
+            body: "<html><title>Example Domain</title><h1>Example Domain</h1></html>"))
+        #expect(Latency.InternetSite.google.accepts(status: 200,
+            body: "User-agent: *\nUser-agent: Yandex\nDisallow: /search\n"))
+    }
+
+    @Test(arguments: Latency.InternetSite.allCases)
+    func portalAndAllowlistedConnectivityPagesAreRejected(site: Latency.InternetSite) {
+        for body in ["", "<html>Sign in to United Wi-Fi</html>",
+                     "<TITLE>Success</TITLE><BODY>Success</BODY>", "fl=123\nh=1.1.1.1\ncolo=ORD\n"] {
+            #expect(!site.accepts(status: 200, body: body))
+        }
+        for status in [0, 204, 302, 403, 511] {
+            #expect(!site.accepts(status: status,
+                body: "User-agent: *\nDisallow: /search\n<title>Example Domain</title><h1>Example Domain</h1>"))
+        }
+    }
+
+    @Test func pingAndAppleSuccessDoNotProveInternetAccess() {
+        let r = Latency.decide(echoes: [.init(ms: 657, hops: 10)], gatewayMs: nil,
+            portal: .internet, internetChecks: ["example.com": false, "www.google.com": false],
+            httpFallback: { Issue.record("ping should remain the latency source"); return nil })
+        #expect(r.ms == 657)
+        #expect(r.source == .icmp)
+        #expect(!r.internetReachable)
+    }
+
+    @Test func oneWorkingSiteIsEnough() {
+        let r = Latency.decide(echoes: [], gatewayMs: nil, portal: .unknown,
+            internetChecks: ["example.com": false, "www.google.com": true], httpFallback: { nil })
+        #expect(r.internetReachable)
+    }
+
+    @Test func cloudflareTraceDoesNotProveOrdinaryInternetAccess() {
+        let r = Latency.decide(echoes: [], gatewayMs: nil, portal: .internet,
+            internetChecks: ["example.com": false, "www.google.com": false], httpFallback: { 700 })
+        #expect(r.ms == 700)
+        #expect(r.source == .http)
+        #expect(!r.internetReachable)
+    }
+
+    @Test func portalWithoutWanPingSkipsFallback() {
+        let r = Latency.decide(echoes: [.init(ms: 1, hops: 1)], gatewayMs: nil, portal: .portal,
+            internetChecks: [:], httpFallback: { Issue.record("portal must skip fallback"); return nil })
+        #expect(r.ms == nil)
+        #expect(!r.internetReachable)
+    }
+
+    @Test func failedHelperCannotReturnSuccessfulOutput() {
+        #expect(runProc("/bin/sh", ["-c", "printf 200; exit 1"], requireSuccess: true) == nil)
+        #expect(runProc("/bin/sh", ["-c", "printf 200"], requireSuccess: true) == "200")
+    }
+}
+
 @Suite struct CaptivePortalTests {
     @Test func appleSuccessPageIsInternet() {
         let body = "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>"
@@ -59,7 +115,7 @@ import Testing
     let near = Latency.EchoReply(ms: 1, hops: 1)
 
     @Test func publishesFastestWanEcho() {
-        let r = Latency.decide(echoes: [slow, far, near, nil], gatewayMs: nil, portal: .internet,
+        let r = Latency.decide(echoes: [slow, far, near, nil], gatewayMs: nil, portal: .internet, internetChecks: ["example.com": true],
                                httpFallback: { Issue.record("fallback must not run"); return nil })
         #expect(r.ms == 25)
         #expect(r.source == .icmp)
@@ -68,22 +124,24 @@ import Testing
         #expect(r.total == 4)
     }
 
-    @Test func loginWallPublishesNothing() {
-        let r = Latency.decide(echoes: [far, near], gatewayMs: nil, portal: .portal,
+    @Test func loginWallPreservesWanPing() {
+        let r = Latency.decide(echoes: [far, near], gatewayMs: nil, portal: .portal, internetChecks: ["example.com": false],
                                httpFallback: { Issue.record("fallback must not run"); return 1363 })
-        #expect(r.ms == nil)
+        #expect(r.ms == 25)
+        #expect(r.source == .icmp)
         #expect(r.captive)
-        #expect(r.rejected == 2)
+        #expect(!r.internetReachable)
+        #expect(r.rejected == 1)
     }
 
     @Test func fallsBackToHttpTrace() {
-        let r = Latency.decide(echoes: [near, nil], gatewayMs: nil, portal: .unknown, httpFallback: { 70 })
+        let r = Latency.decide(echoes: [near, nil], gatewayMs: nil, portal: .unknown, internetChecks: ["example.com": false], httpFallback: { 70 })
         #expect(r.ms == 70)
         #expect(r.source == .http)
     }
 
     @Test func nothingUsableCountsAsFailure() {
-        let r = Latency.decide(echoes: [nil], gatewayMs: nil, portal: .unknown, httpFallback: { nil })
+        let r = Latency.decide(echoes: [nil], gatewayMs: nil, portal: .unknown, internetChecks: ["example.com": false], httpFallback: { nil })
         #expect(r.ms == nil)
         #expect(r.failed == 2)
     }

@@ -4,9 +4,9 @@ import Testing
 private typealias V = Latency.EchoVerdict
 
 /// One probe cycle. By default all five targets answered with `ms`, or all were lost when `ms` is nil.
-private func cycle(_ ms: Double?, source: LatencySource = .icmp, targets: [V]? = nil, at: Double = 0) -> HealthSample {
+private func cycle(_ ms: Double?, source: LatencySource = .icmp, targets: [V]? = nil, at: Double = 0, internetReachable: Bool = true) -> HealthSample {
     let t = targets ?? Array(repeating: ms.map { .wan($0) } ?? .noReply, count: 5)
-    return HealthSample(at: at, ms: ms, source: ms == nil ? nil : source, targets: t)
+    return HealthSample(at: at, ms: ms, source: ms == nil ? nil : source, targets: t, internetReachable: internetReachable)
 }
 
 private func score(_ samples: [HealthSample]) -> Int {
@@ -52,6 +52,51 @@ private func score(_ samples: [HealthSample]) -> Int {
 }
 
 @Suite struct HealthScoreTests {
+    @Test(arguments: [600.0, 650.0, 700.0])
+    func modestSatelliteJitterHasNoExtraPenalty(baseline: Double) {
+        let steady = (0..<20).map { _ in cycle(baseline) }
+        let varying = (0..<20).map { cycle(baseline + ($0 % 2 == 0 ? -50 : 50)) }
+        let report = try! #require(Health.evaluate(varying))
+        #expect(report.jitterMs == 100)
+        #expect(report.latencyMs == baseline)
+        #expect(report.score == score(steady))
+        #expect(report.score >= 50 && report.score <= 56)
+    }
+
+    @Test func largeRelativeSatelliteJitterStillHurts() {
+        let steady = (0..<20).map { _ in cycle(650) }
+        let moderate = (0..<20).map { cycle($0 % 2 == 0 ? 550 : 750) }
+        let severe = (0..<20).map { cycle($0 % 2 == 0 ? 450 : 850) }
+        #expect(score(moderate) < score(steady) - 15)
+        #expect(score(severe) < score(moderate) - 15)
+    }
+
+    @Test func satelliteJitterAllowanceDoesNotMaskBlockedInternet() {
+        let samples = (0..<20).map {
+            cycle($0 % 2 == 0 ? 600 : 700, internetReachable: false)
+        }
+        #expect(score(samples) == 0)
+    }
+
+    @Test func restrictedInternetIsZeroEvenWithPerfectPing() {
+        let samples = (0..<20).map { _ in cycle(15, internetReachable: false) }
+        let r = Health.evaluate(samples)
+        #expect(r?.score == 0)
+        #expect(r?.loss == 0)
+        #expect(r?.latencyMs == 15)
+        #expect(r?.internetReachable == false)
+    }
+
+    @Test func failedInternetCheckBypassesCalibrationAndHealthyHistory() {
+        let failure = cycle(657, internetReachable: false)
+        #expect(score([failure]) == 0)
+        #expect(score((0..<20).map { _ in cycle(15) } + [failure]) == 0)
+    }
+
+    @Test func verifiedRecoveryRestoresNormalScoring() {
+        #expect(score([cycle(15, internetReachable: false), cycle(15), cycle(15)]) == 100)
+    }
+
     @Test func needsMinimumCycles() {
         #expect(Health.evaluate((1..<Health.minCycles).map { _ in cycle(15) }) == nil)
         #expect(Health.evaluate((0..<Health.minCycles).map { _ in cycle(15) }) != nil)
@@ -179,11 +224,60 @@ private func score(_ samples: [HealthSample]) -> Int {
     }
 }
 
+@Suite struct RelativeJitterTests {
+    @Test(arguments: [0.0, 50.0, 150.0, 200.0])
+    func fastLinksKeepExistingPenalties(latency: Double) {
+        for jitter in [0.0, 40, 60, 85, 100, 400] {
+            #expect(Health.jitterPenalty(jitter, latencyMs: latency) == Health.jitterCurve.penalty(jitter))
+        }
+    }
+
+    @Test func sameRelativeVariationHasSamePenaltyOnSlowLinks() {
+        let expected = Health.jitterPenalty(200, latencyMs: 650)
+        #expect(expected > 0.3 && expected < 0.4)
+        #expect(abs(Health.jitterPenalty(400, latencyMs: 1300) - expected) < 1e-9)
+    }
+
+    @Test func penaltyGrowsWithJitterAndFallsWithBaseline() {
+        let byJitter = stride(from: 0.0, through: 1000, by: 10).map {
+            Health.jitterPenalty($0, latencyMs: 650)
+        }
+        #expect(zip(byJitter, byJitter.dropFirst()).allSatisfy { $0 <= $1 })
+        let byLatency = stride(from: 0.0, through: 1000, by: 10).map {
+            Health.jitterPenalty(100, latencyMs: $0)
+        }
+        #expect(zip(byLatency, byLatency.dropFirst()).allSatisfy { $0 >= $1 })
+    }
+
+    @Test func unavailableOrInvalidBaselineKeepsAbsolutePenalty() {
+        for baseline: Double? in [nil, -1, .nan, .infinity] {
+            #expect(Health.jitterPenalty(100, latencyMs: baseline) == Health.jitterCurve.penalty(100))
+        }
+    }
+}
+
 @Suite struct HealthTrackerTests {
+    @Test func websiteFailureFlowsThroughTrackerToDisplayImmediately() {
+        var tracker = HealthTracker()
+        var display = HealthDisplay()
+        for i in 0..<3 { tracker.record(probe(15), at: t0 + Double(i)) }
+        display.add(tracker.report(now: t0 + 2))
+        _ = display.publish(now: t0 + 2)
+        #expect(display.shown?.score == 100)
+
+        var restricted = probe(15)
+        restricted.internetChecks = ["example.com": false, "www.google.com": false]
+        tracker.record(restricted, at: t0 + 3)
+        display.add(tracker.report(now: t0 + 3))
+        _ = display.publish(now: t0 + 3)
+        #expect(display.shown?.score == 0)
+        #expect(display.shown?.latencyMs == 15)
+    }
+
     func probe(_ ms: Double?) -> WanProbe {
         let v: V = ms.map { .wan($0) } ?? .noReply
         return WanProbe(ms: ms, source: ms == nil ? nil : .icmp, rejected: 0, failed: ms == nil ? 5 : 0,
-                        total: 5, verdicts: Array(repeating: v, count: 5), gatewayMs: nil, captive: false)
+                        total: 5, verdicts: Array(repeating: v, count: 5), gatewayMs: nil, captive: false, internetChecks: ["example.com": true])
     }
 
     let t0: Double = 1_000_000
@@ -214,6 +308,25 @@ private func score(_ samples: [HealthSample]) -> Int {
 }
 
 @Suite struct HealthDisplayTests {
+    @Test func outageAndRecoveryBypassSmoothing() {
+        var d = HealthDisplay()
+        d.add(report(100)); _ = d.publish(now: 0)
+        d.add(report(100))
+        var offline = report(0)
+        offline.internetReachable = false
+        d.add(offline)
+        let failed = d.publish(now: 1)
+        #expect(failed)
+        #expect(d.shown?.score == 0)
+        #expect(d.shown?.internetReachable == false)
+        d.add(offline)
+        d.add(report(80))
+        let recovered = d.publish(now: 2)
+        #expect(recovered)
+        #expect(d.shown?.score == 80)
+        #expect(d.shown?.internetReachable == true)
+    }
+
     func report(_ score: Int, loss: Double = 0) -> HealthReport {
         HealthReport(score: score, loss: loss, jitterMs: 10, latencyMs: 20)
     }
@@ -312,7 +425,7 @@ private func score(_ samples: [HealthSample]) -> Int {
         let echoes: [Latency.EchoReply?] = [
             Latency.EchoReply(ms: 25, hops: 10), nil, Latency.EchoReply(ms: 1, hops: 1)
         ]
-        let r = Latency.decide(echoes: echoes, gatewayMs: nil, portal: .internet, httpFallback: { nil })
+        let r = Latency.decide(echoes: echoes, gatewayMs: nil, portal: .internet, internetChecks: ["example.com": true], httpFallback: { nil })
         #expect(r.verdicts == [.wan(25), .noReply, .onPath])
     }
 }

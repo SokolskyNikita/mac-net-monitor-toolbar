@@ -14,10 +14,15 @@
 // - Jitter is the mean absolute change between consecutive RTTs (RFC 3550 style): 15-100-15-100
 //   scores badly, a slow drift does not. The largest ~10% of changes are trimmed so a single
 //   wakeup spike, which produces two large changes, does not read as instability.
+//   Above 200ms median RTT, divide jitter by RTT/200 before applying the curve. This scales
+//   both the free allowance and penalty ramp: up to max(40ms, 20% of RTT) costs nothing.
+//   This is a relative-stability heuristic, not a real-time application's jitter guarantee.
 // - Latency is the window median. Latency caps at a 70% penalty: a stable, lossless satellite
 //   link is slow, not broken.
 // - Scores are computed every probe cycle over the last minute, then averaged over 10 seconds
 //   for display so the menu bar does not flicker between neighbouring values.
+// - If the latest ordinary HTTPS checks all fail, health is immediately 0%, even when ping
+//   still works. Neither the calibration period nor display smoothing can hide that failure.
 
 import Foundation
 
@@ -28,6 +33,7 @@ struct HealthSample {
     var source: LatencySource?
     /// Per-target verdicts in `Latency.icmpTargets` order.
     var targets: [Latency.EchoVerdict]
+    var internetReachable: Bool
 }
 
 struct HealthReport: Equatable {
@@ -37,6 +43,7 @@ struct HealthReport: Equatable {
     var loss: Double
     var jitterMs: Double?
     var latencyMs: Double?
+    var internetReachable: Bool = true
 }
 
 struct HealthCurve {
@@ -71,8 +78,10 @@ enum Health {
     static let minCycles = 3
     /// ≤2% free, 5% ≈ 32% penalty, 10% ≈ 67%, 100% = 100%.
     static let lossCurve = HealthCurve(free: 0.02, half: 0.05, steepness: 1.5, max: 1, full: 1)
-    /// ≤40ms free, 60ms ≈ 31% penalty, 85ms ≈ 61%.
+    /// Normalized jitter: ≤40ms free, 60ms ≈ 31% penalty, 85ms ≈ 61%.
     static let jitterCurve = HealthCurve(free: 40, half: 25, steepness: 2, max: 0.8)
+    /// Preserve the absolute jitter curve on fast links; scale it with RTT above this point.
+    static let jitterReferenceLatency: Double = 200
     /// ≤150ms free, 300ms ≈ 11% penalty, 600ms ≈ 44%, 1000ms ≈ 60%.
     static let latencyCurve = HealthCurve(free: 150, half: 350, steepness: 2, max: 0.7)
     /// The menu bar shows the mean score over this period and changes at most this often.
@@ -81,17 +90,27 @@ enum Health {
 
     // MARK: - Scoring
 
-    /// Nil until the window holds `minCycles` cycles.
+    /// Nil until calibrated, except a failed internet check immediately reports zero.
     static func evaluate(_ samples: [HealthSample]) -> HealthReport? {
-        guard samples.count >= minCycles else { return nil }
+        guard let latest = samples.last else { return nil }
+        guard samples.count >= minCycles || !latest.internetReachable else { return nil }
         let loss = lossRate(samples)
         let jitter = jitterMs(samples)
         let latency = latencyMs(samples)
         let keep = (1 - lossCurve.penalty(loss))
-            * (1 - jitterCurve.penalty(jitter ?? 0))
+            * (1 - jitterPenalty(jitter ?? 0, latencyMs: latency))
             * (1 - latencyCurve.penalty(latency ?? 0))
-        let score = Int((100 * keep).rounded())
-        return HealthReport(score: min(100, max(0, score)), loss: loss, jitterMs: jitter, latencyMs: latency)
+        let score = latest.internetReachable ? Int((100 * keep).rounded()) : 0
+        return HealthReport(score: min(100, max(0, score)), loss: loss, jitterMs: jitter,
+                            latencyMs: latency, internetReachable: latest.internetReachable)
+    }
+
+    /// A 100ms variation is small on a 650ms link but disruptive on a 50ms link.
+    /// Keep reporting raw jitter in milliseconds; only its scoring input is normalized.
+    static func jitterPenalty(_ jitter: Double, latencyMs: Double?) -> Double {
+        let baseline = latencyMs.flatMap { finiteNonNeg($0) } ?? 0
+        let scale = max(1, baseline / jitterReferenceLatency)
+        return jitterCurve.penalty(jitter / scale)
     }
 
     static func lossRate(_ samples: [HealthSample]) -> Double {
@@ -142,7 +161,8 @@ struct HealthTracker {
 
     mutating func record(_ probe: WanProbe, at: TimeInterval = HealthTracker.now()) {
         samples.append(HealthSample(at: at, ms: probe.ms.flatMap { finiteNonNeg($0) },
-                                    source: probe.source, targets: probe.verdicts))
+                                    source: probe.source, targets: probe.verdicts,
+                                    internetReachable: probe.internetReachable))
         prune(now: at)
     }
 
@@ -168,13 +188,20 @@ struct HealthDisplay {
     private var publishedAt: TimeInterval?
 
     mutating func add(_ report: HealthReport?) {
-        if let report { pending.append(report) }
+        guard let report else { return }
+        // Do not average a confirmed outage with an earlier healthy score (or vice versa).
+        if !report.internetReachable || pending.last?.internetReachable != report.internetReachable {
+            pending.removeAll(keepingCapacity: true)
+        }
+        pending.append(report)
     }
 
     /// True when `shown` changed.
     mutating func publish(now: TimeInterval = HealthTracker.now()) -> Bool {
         guard !pending.isEmpty else { return false }
-        if let at = publishedAt, now - at < Health.displayInterval { return false }
+        let accessChanged = pending.last?.internetReachable != shown?.internetReachable
+        if !accessChanged, pending.last?.internetReachable != false,
+           let at = publishedAt, now - at < Health.displayInterval { return false }
         let next = Self.mean(pending)
         pending.removeAll(keepingCapacity: true)
         publishedAt = now
@@ -193,6 +220,7 @@ struct HealthDisplay {
         let score = avg(reports.map { Double($0.score) }) ?? 0
         return HealthReport(score: Int(score.rounded()), loss: avg(reports.map(\.loss)) ?? 0,
                             jitterMs: avg(reports.compactMap(\.jitterMs)),
-                            latencyMs: avg(reports.compactMap(\.latencyMs)))
+                            latencyMs: avg(reports.compactMap(\.latencyMs)),
+                            internetReachable: reports.last?.internetReachable ?? false)
     }
 }

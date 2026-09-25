@@ -1,8 +1,8 @@
 // WAN round-trip time that stays honest on captive portals, SYN proxies, and TLS MITM.
 //
 // One cycle runs every probe in parallel, then `decide` picks what to publish:
-//   1. Apple's captive check shows a login page  → publish nothing.
-//   2. Some ICMP echo came from beyond the local path → publish the fastest one.
+//   1. Some ICMP echo came from beyond the local path → publish the fastest one.
+//   2. Apple's captive check shows a login page → skip the HTTPS latency fallback.
 //   3. Otherwise a Cloudflare trace over HTTPS answered → publish its time-to-first-byte.
 //   4. Otherwise → publish nothing.
 //
@@ -26,7 +26,7 @@ enum LatencySource: String {
 struct WanProbe {
     var ms: Double?
     var source: LatencySource?
-    /// ICMP echoes discarded as answered by the local path, or by anything behind a login wall.
+    /// ICMP echoes discarded as answered by the local path.
     var rejected: Int
     /// Probes that got no usable answer.
     var failed: Int
@@ -35,8 +35,11 @@ struct WanProbe {
     /// One verdict per echo, in the order the echoes were passed to `decide`.
     var verdicts: [Latency.EchoVerdict] = []
     var gatewayMs: Double?
-    /// A login wall answered the captive check. The caller should drop the displayed RTT.
+    /// A login wall answered the captive check. This does not invalidate a WAN ping.
     var captive: Bool
+    /// Ordinary HTTPS sites, checked independently of ping and captive-portal allowlists.
+    var internetChecks: [String: Bool]
+    var internetReachable: Bool { internetChecks.values.contains(true) }
 }
 
 enum Latency {
@@ -49,6 +52,7 @@ enum Latency {
     static let gatewayTimeoutMs = 1000
     static let captiveWait: TimeInterval = 4
     static let httpWait: TimeInterval = 15
+    static let internetWait: TimeInterval = 8
     /// Upper bound for the parallel phase: the slowest ping plus process-kill slack.
     static let cycleWait: TimeInterval = 14
 
@@ -61,11 +65,13 @@ enum Latency {
     static func measure(gateway: String?) -> WanProbe {
         let found = runParallelProbes(gateway: gateway)
         return decide(echoes: found.echoes, gatewayMs: found.gatewayMs, portal: found.portal,
+                      internetChecks: found.internetChecks,
                       httpFallback: httpProbe)
     }
 
     /// Pure decision step. `httpFallback` runs only when no ICMP echo can be published.
     static func decide(echoes: [EchoReply?], gatewayMs: Double?, portal: Captive,
+                       internetChecks: [String: Bool],
                        httpFallback: () -> Double?) -> WanProbe {
         var wan: [Double] = [], rejected = 0, failed = 0
         let verdicts = echoes.map { judge($0, gatewayMs: gatewayMs) }
@@ -78,17 +84,12 @@ enum Latency {
         }
         var probe = WanProbe(ms: nil, source: nil, rejected: rejected, failed: failed,
                              total: max(echoes.count, 1), verdicts: verdicts, gatewayMs: gatewayMs,
-                             captive: false)
+                             captive: portal == .portal, internetChecks: internetChecks)
 
-        if portal == .portal {
-            probe.rejected += wan.count
-            probe.captive = true
-            return probe
-        }
         // Fastest echo: slower ones are wakeup spikes or worse paths, not the link.
         if let best = wan.min() {
             probe.ms = best; probe.source = .icmp
-        } else if let ms = httpFallback() {
+        } else if portal != .portal, let ms = httpFallback() {
             probe.ms = ms; probe.source = .http
         } else {
             probe.failed += 1
@@ -96,12 +97,13 @@ enum Latency {
         return probe
     }
 
-    private static func runParallelProbes(gateway: String?) -> (echoes: [EchoReply?], gatewayMs: Double?, portal: Captive) {
+    private static func runParallelProbes(gateway: String?) -> (echoes: [EchoReply?], gatewayMs: Double?, portal: Captive, internetChecks: [String: Bool]) {
         let group = DispatchGroup()
         // Indexed by target so connection health can track each host's loss separately.
         let echoes = Locked<[EchoReply?]>(Array(repeating: nil, count: icmpTargets.count))
         let gatewayMs = Locked<Double?>(nil)
         let portal = Locked(Captive.unknown)
+        let internetChecks = Locked(Dictionary(uniqueKeysWithValues: InternetSite.allCases.map { ($0.rawValue, false) }))
 
         func run(_ work: @escaping () -> Void) {
             group.enter()
@@ -114,9 +116,57 @@ enum Latency {
             run { let r = ping(host, timeoutMs: icmpTimeoutMs); echoes.mutate { $0[i] = r } }
         }
         run { portal.set(detectPortal()) }
+        for site in InternetSite.allCases {
+            run {
+                let reachable = checkInternet(site)
+                internetChecks.mutate { $0[site.rawValue] = reachable }
+            }
+        }
 
         _ = group.wait(timeout: .now() + cycleWait)
-        return (echoes.value, gatewayMs.value, portal.value)
+        return (echoes.value, gatewayMs.value, portal.value, internetChecks.value)
+    }
+
+    // MARK: - Ordinary internet access
+
+    enum InternetSite: String, CaseIterable {
+        case example = "example.com"
+        case google = "www.google.com"
+
+        var url: String {
+            switch self {
+            case .example: return "https://example.com/"
+            case .google: return "https://www.google.com/robots.txt"
+            }
+        }
+
+        /// Require a real response body, not just DNS, a TCP/TLS handshake, or a login redirect.
+        func accepts(status: Int, body: String) -> Bool {
+            guard status == 200 else { return false }
+            switch self {
+            case .example:
+                return body.contains("<title>Example Domain</title>") && body.contains("<h1>Example Domain</h1>")
+            case .google:
+                return body.hasPrefix("User-agent: *") && body.contains("Disallow: /search")
+            }
+        }
+    }
+
+    static func checkInternet(_ site: InternetSite) -> Bool {
+        let bodyURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("netmenu-internet-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: bodyURL) }
+        // -q disables user curlrc overrides. TLS verification stays enabled; no redirects,
+        // cookies, or local cache. The nonce and no-cache header also avoid proxy cache hits.
+        guard let out = runProc("/usr/bin/curl", [
+            "-q", "-sS", "--proto", "=https", "--max-time", String(Int(internetWait)),
+            "--max-redirs", "0", "--max-filesize", "65536",
+            "-H", "Cache-Control: no-cache", "-H", "Accept-Encoding: identity",
+            "-o", bodyURL.path, "-w", "%{http_code}",
+            site.url + "?netmenu=" + UUID().uuidString
+        ], timeout: internetWait + 2, requireSuccess: true),
+              let status = Int(out.trimmingCharacters(in: .whitespacesAndNewlines)) else { return false }
+        return site.accepts(status: status, body: readPrefix(of: bodyURL, bytes: 65536))
     }
 
     // MARK: - ICMP

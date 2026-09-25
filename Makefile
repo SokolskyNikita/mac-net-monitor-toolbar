@@ -13,13 +13,15 @@ ICON := images/AppIcon.icns
 .PHONY: build check test app run dist notarize icon clean
 
 # Command Line Tools ship Swift Testing outside the default search path; Xcode finds it on its own.
+# Their _Testing_Foundation overlay lacks module interfaces; these tests need only core Testing.
 TESTING_FW := $(shell xcode-select -p)/Library/Developer/Frameworks
 TESTING_LIB := $(shell xcode-select -p)/Library/Developer/usr/lib
 TEST_FLAGS := $(if $(wildcard $(TESTING_FW)/Testing.framework),\
+	-Xswiftc -Xfrontend -Xswiftc -disable-cross-import-overlays \
 	-Xswiftc -F -Xswiftc $(TESTING_FW) -Xlinker -F -Xlinker $(TESTING_FW) \
 	-Xlinker -rpath -Xlinker $(TESTING_FW) -Xlinker -rpath -Xlinker $(TESTING_LIB))
 
-SOURCES = constants.swift latency.swift health.swift netmenu.swift main.swift
+SOURCES = constants.swift latency.swift health.swift speedtest.swift netmenu.swift main.swift
 ARCH_BINS = $(foreach a,$(ARCHS),build/NetMenu-$(a))
 
 build/NetMenu-%: $(SOURCES)
