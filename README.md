@@ -80,7 +80,7 @@ Click the icon to see the health breakdown, current and peak rates, run a speed 
 
 ### Connection health
 
-The percentage next to the latency rates the last minute of probes. It's averaged over 10 seconds and changes at most once every 10 seconds. It appears after three probe cycles (about 9 seconds) and is hidden whenever latency shows `✕`.
+The percentage next to the latency rates the last minute of probes. It's averaged over 10 seconds and changes at most once every 10 seconds. For the first three probe cycles (about 9 seconds) a spinner shows in its place while it calibrates. It's hidden whenever latency shows `✕`.
 
 A connection that meets Zoom's [recommended limits](https://support.zoom.com/hc/en/article?id=zm_kb&sysparm_article=KB0070504) for HD video (latency up to 150ms, jitter up to 40ms, packet loss up to 2%) scores 100%. Past those limits, three things lower the score, and their effects multiply, so one bad factor is enough to pull it down:
 

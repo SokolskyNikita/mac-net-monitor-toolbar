@@ -521,25 +521,44 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     static let statusFont = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
     static let statusAttrs: [NSAttributedString.Key: Any] = [.font: statusFont, .foregroundColor: NSColor.black]
-    /// Gap between fields; an arrow hugs its number.
-    static let statusGap: CGFloat = 5
+    /// Gap between fields, with a separator line in the middle; an arrow hugs its number.
+    static let statusGap: CGFloat = 9
+    static let separatorAlpha: CGFloat = 0.3
+    /// Health field while it calibrates. Right-aligned like "100%", so the % stays put and the
+    /// spinner, drawn over the digit positions, is all that changes when the score arrives.
+    static let calibratingText = "%"
+    static let spinnerFPS: TimeInterval = 12
+
+    var spinnerTimer: Timer?
+    var spinnerPhase = 0
+    var lastStatus = (lat: "✕", health: "", down: "0B", up: "0B")
 
     /// Each field gets a slot wide enough for three digits and is right-aligned in it, so positions
     /// hold as digit counts change. Longer values (1363ms) widen their slot; `StableWidth` keeps
     /// the item from shrinking straight back.
     func paintStatus(lat: String, health: String, down: String, up: String) {
         guard let item = statusItem, let button = item.button else { return }
+        lastStatus = (lat, health, down, up)
         var fields = [(lat, "999ms"), (health, "100%")]
         if showThroughput { fields += [(down + "↓", "999K↓"), (up + "↑", "999K↑")] }
         func width(_ s: String) -> CGFloat { (s as NSString).size(withAttributes: Self.statusAttrs).width }
         let slots = fields.map { max(width($0.0), width($0.1)) }
         let content = ceil(slots.reduce(0, +) + Self.statusGap * CGFloat(fields.count - 1))
         let w = CGFloat(statusWidth.fit(Double(content), now: Date().timeIntervalSince1970))
+        let angle = CGFloat(spinnerPhase % 12) * 30
         let img = NSImage(size: NSSize(width: w, height: 18), flipped: false) { _ in
             var edge = w - content
-            for ((s, _), slot) in zip(fields, slots) {
+            for (i, ((s, _), slot)) in zip(fields, slots).enumerated() {
+                if i > 0 {
+                    NSColor.black.withAlphaComponent(Self.separatorAlpha).setFill()
+                    NSRect(x: (edge - Self.statusGap / 2).rounded() - 0.5, y: 4, width: 1, height: 10).fill()
+                }
                 edge += slot
-                (s as NSString).draw(at: NSPoint(x: edge - width(s), y: 2), withAttributes: Self.statusAttrs)
+                let x = edge - width(s)
+                (s as NSString).draw(at: NSPoint(x: x, y: 2), withAttributes: Self.statusAttrs)
+                if s == Self.calibratingText {
+                    Self.drawSpinner(center: NSPoint(x: x - width("0"), y: 9), angle: angle)
+                }
                 edge += Self.statusGap
             }
             return true
@@ -549,18 +568,46 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         button.image = img
     }
 
+    /// A 270° arc; rotating `angle` animates it.
+    static func drawSpinner(center: NSPoint, angle: CGFloat) {
+        let arc = NSBezierPath()
+        arc.appendArc(withCenter: center, radius: 3.5, startAngle: -angle, endAngle: -angle + 270)
+        arc.lineWidth = 1.4
+        arc.lineCapStyle = .round
+        NSColor.black.setStroke()
+        arc.stroke()
+    }
+
+    func setSpinning(_ on: Bool) {
+        if on, spinnerTimer == nil {
+            let t = Timer(timeInterval: 1 / Self.spinnerFPS, repeats: true) { [weak self] _ in
+                guard let self else { return }
+                self.spinnerPhase += 1
+                let s = self.lastStatus
+                self.paintStatus(lat: s.lat, health: s.health, down: s.down, up: s.up)
+            }
+            RunLoop.main.add(t, forMode: .common)
+            spinnerTimer = t
+        } else if !on {
+            spinnerTimer?.invalidate(); spinnerTimer = nil
+        }
+    }
+
     func updateTitle() {
         let lat: String
         var report: HealthReport?
+        var calibrating = false
         if let at = lastLatAt, Date().timeIntervalSince(at) <= staleAfter,
            let m = finiteNonNeg(median(recentLats) ?? lastLatMs ?? .nan) {
             let n = Int(m.rounded())
             // ~ marks a non-ICMP approximation (HTTP trace)
             lat = lastLatSrc == LatencySource.icmp.rawValue ? "\(n)ms" : "~\(n)ms"
             report = healthDisplay.shown
+            calibrating = report == nil
         } else { lat = "✕" }
-        paintStatus(lat: lat, health: report.map { "\($0.score)%" } ?? "",
-                    down: fmtRate(displayDown), up: fmtRate(displayUp))
+        setSpinning(calibrating)
+        let healthText = report.map { "\($0.score)%" } ?? (calibrating ? Self.calibratingText : "")
+        paintStatus(lat: lat, health: healthText, down: fmtRate(displayDown), up: fmtRate(displayUp))
         healthItem?.title = healthMenuTitle(report)
         rateItem?.title = "Throughput: \(fmtRate(displayDown))↓ / \(fmtRate(displayUp))↑"
     }
