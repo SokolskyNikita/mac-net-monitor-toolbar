@@ -3,7 +3,7 @@ build/
 .swiftpm/
 dist/
 NetMenu.app/
-images/AppIcon.iconset/
-images/AppIcon-1024.png
+Resources/AppIcon.iconset/
+Resources/AppIcon-1024.png
 *.swp
 .DS_Store

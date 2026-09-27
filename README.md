@@ -6,7 +6,7 @@
 
 A lightweight macOS menu bar app that shows your live **internet latency**, **download rate**, and **upload rate** at a glance.
 
-![NetMenu in the macOS menu bar showing latency and throughput](images/mac-net-monitor-screenshot.png)
+![NetMenu in the macOS menu bar showing latency and throughput](docs/images/mac-net-monitor-screenshot.png)
 
 NetMenu is built for unreliable networks: hotels, airports, planes, and phone hotspots. It filters out fake low pings from captive portals and in-flight proxies, and checks ordinary HTTPS sites separately so working ping cannot disguise blocked internet access.
 
@@ -177,6 +177,23 @@ To take one measurement without the menu bar UI or any permission prompts, run:
 ./build/NetMenu --sample
 ```
 
+### Project layout
+
+```text
+Sources/NetMenu/
+  App/          App lifecycle and entry point
+  Monitoring/   Bandwidth, latency, health, network identity, and speed tests
+  Support/      Shared constants, process helpers, and stats logging
+  UI/           Menu bar rendering
+Resources/      App metadata and icon
+Tests/          Swift Testing suites
+docs/           Release guide and screenshots
+scripts/        Icon generation and Homebrew release helpers
+Casks/          Homebrew cask
+```
+
+Both the Makefile and Swift package discover Swift files under `Sources/NetMenu` automatically.
+
 ### Code signing
 
 By default, builds are signed ad hoc (`SIGN_ID=-`). macOS ties permission grants to the signature, so every rebuild asks for Location and Local Network again. To avoid that, create a stable local signing identity:
@@ -189,7 +206,7 @@ By default, builds are signed ad hoc (`SIGN_ID=-`). macOS ties permission grants
    make app SIGN_ID=netmenu-selfsign && open NetMenu.app
    ```
 
-For Developer ID signing, notarization, and publishing releases, see [RELEASING.md](RELEASING.md).
+For Developer ID signing, notarization, and publishing releases, see the [release guide](docs/RELEASING.md).
 
 ## Privacy
 

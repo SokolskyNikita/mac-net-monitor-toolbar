@@ -20,10 +20,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check tag matches Info.plist
+      - name: Check tag matches Resources/Info.plist
         run: |
           tag="${GITHUB_REF_NAME#v}"
-          plist="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Info.plist)"
+          plist="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Resources/Info.plist)"
           if [ "$tag" != "$plist" ]; then
             echo "tag v${tag} does not match CFBundleShortVersionString ${plist}"
             exit 1
@@ -57,7 +57,7 @@ jobs:
         run: |
           key="$RUNNER_TEMP/AuthKey.p8"
           printf '%s\n' "$APPLE_NOTARY_KEY" > "$key"
-          version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Info.plist)"
+          version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Resources/Info.plist)"
           zip="dist/NetMenu-${version}.zip"
           xcrun notarytool submit "$zip" \
             --key "$key" --key-id "$APPLE_NOTARY_KEY_ID" --issuer "$APPLE_NOTARY_ISSUER_ID" --wait
@@ -69,7 +69,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Info.plist)"
+          version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Resources/Info.plist)"
           zip="dist/NetMenu-${version}.zip"
           notes="NetMenu ${version}."
           if [ "${SIGN_ID:--}" = "-" ]; then
@@ -81,7 +81,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Info.plist)"
+          version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Resources/Info.plist)"
           sha256="$(shasum -a 256 "dist/NetMenu-${version}.zip" | awk '{print $1}')"
           git fetch origin main
           git checkout -B main origin/main

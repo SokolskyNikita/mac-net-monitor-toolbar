@@ -4,13 +4,15 @@ Cut a GitHub Release from a version tag. CI builds a universal `NetMenu.app` zip
 
 ## Version bump
 
-1. Edit `Info.plist`:
+Run the commands below from the repository root.
+
+1. Edit `Resources/Info.plist`:
    - `CFBundleShortVersionString` — marketing version, e.g. `1.0.1`
    - `CFBundleVersion` — integer build, increment every release
 2. Commit on `main`:
 
 ```bash
-git add Info.plist
+git add Resources/Info.plist
 git commit -m "release: 1.0.1"
 git tag v1.0.1
 git push origin main --tags

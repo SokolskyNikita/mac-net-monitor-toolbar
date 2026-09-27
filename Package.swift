@@ -7,11 +7,7 @@ let package = Package(
     platforms: [.macOS(.v14)],
     targets: [
         .executableTarget(
-            name: "NetMenu",
-            path: ".",
-            exclude: ["Tests", "scripts", "images", "Casks", "build", "dist", "NetMenu.app",
-                      "Info.plist", "Makefile", "README.md", "RELEASING.md", "LICENSE"],
-            sources: ["constants.swift", "process.swift", "identity.swift", "statusbar.swift", "bandwidth.swift", "statslog.swift", "latency.swift", "health.swift", "speedtest.swift", "netmenu.swift", "main.swift"]
+            name: "NetMenu"
         ),
         .testTarget(
             name: "NetMenuTests",

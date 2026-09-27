@@ -2,7 +2,7 @@
 import AppKit
 
 let outDir = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-    .appendingPathComponent("images", isDirectory: true)
+    .appendingPathComponent("Resources", isDirectory: true)
 try FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
 
 func drawIcon(size: CGFloat) -> NSImage {
