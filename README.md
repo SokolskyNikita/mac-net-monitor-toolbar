@@ -4,7 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![macOS 14+](https://img.shields.io/badge/macOS-14%2B-lightgrey)
 
-A macOS menu bar app that shows live internet latency, connection health and throughput, with a speed test and a per-minute history log.
+A macOS menu bar app that shows live internet latency, connection health, throughput and top bandwidth users, with a speed test and a per-minute history log.
 
 NetMenu is built for unreliable networks such as hotels, airports, planes and phone hotspots. It discards fake low pings answered by captive portals and in-flight proxies. It also checks that ordinary websites load, since ping can work while web access is blocked. There are no accounts or analytics; apart from its probes and the speed tests you start, nothing leaves your Mac.
 
@@ -52,6 +52,16 @@ macOS may also ask for two optional permissions:
 ## Reading the menu bar
 
 The menu bar shows latency and connection health. Download (`↓`) and upload (`↑`) rates come from the network interface counters, averaged over 5 seconds. They appear in the menu alongside their peaks and the health breakdown; turn on **Show throughput in menu bar** to put them next to the health too. **Peak this connection** resets on every network change, including a switch to another Wi‑Fi network or access point.
+
+### Top apps
+
+The **Top apps** row updates at most once every **10 seconds**, ranking apps by all their downloaded and uploaded bytes over the preceding 10-second sampling window. It lists the largest contributors until their combined share reaches **80%**, capped at **three apps**. If three fall short, it shows their actual approximate share, such as `Top apps (~64%): Firefox, Dropbox, Spotify`. Long names are shortened to fit.
+
+NetMenu reads macOS's built-in `nettop` counters for TCP and UDP traffic on Wi-Fi and wired interfaces, including local network traffic but excluding loopback. Helpers inside the same app bundle are grouped together. Entries with the same display name, such as multiple `curl` processes, are then combined before ranking, regardless of their process IDs or executable paths. This needs no administrator access or new permission in a normal app launch. App names stay on your Mac and aren't added to the stats log.
+
+Shares are approximate because socket and interface counters differ. Unattributed interface traffic stays in the total; if app counters exceed that total, their sum is used instead. If interface counters are temporarily missing, the app counters supply the total. VPNs, proxies and shared services may appear as the traffic owner.
+
+Temporary sampling failures and network changes keep the previous list visible for about a minute, labelled **last sample**, while collection retries. **Unavailable** appears only after three failed initial readings or a minute without a valid sample, on the next display update. A valid idle reading shows **no traffic**. One malformed process row doesn't discard other usable rows. Retry and recovery labels follow the same 10-second display cadence.
 
 ### Latency
 

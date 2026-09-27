@@ -65,6 +65,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var statusRenderer: StatusBarRenderer?
     var peakItem: NSMenuItem?
     var rateItem: NSMenuItem?
+    var topAppsItem: NSMenuItem?
+    let appBandwidthMonitor = AppBandwidthMonitor()
+    var appBandwidthDisplay = AppBandwidthDisplay()
     static let showThroughputKey = "showThroughputInMenuBar"
     /// Off by default: throughput lives in the menu to keep the menu bar item narrow.
     var showThroughput = UserDefaults.standard.bool(forKey: AppDelegate.showThroughputKey)
@@ -130,6 +133,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         hi.isEnabled = false; menu.addItem(hi); healthItem = hi
         let rate = NSMenuItem(title: "Throughput: —", action: nil, keyEquivalent: "")
         rate.isEnabled = false; menu.addItem(rate); rateItem = rate
+        let topApps = NSMenuItem(title: "Top apps: measuring…", action: nil, keyEquivalent: "")
+        topApps.isEnabled = false; menu.addItem(topApps); topAppsItem = topApps
         let peak = NSMenuItem(title: "Peak this connection: —", action: nil, keyEquivalent: "")
         peak.isEnabled = false; menu.addItem(peak); peakItem = peak
         let speed = NSMenuItem(title: "No speed test run yet", action: nil, keyEquivalent: "")
@@ -156,6 +161,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         let counters = readCounters(); let now = BandwidthClock.now()
         bandwidth = BandwidthTracker(counters: counters, at: now); winStart = now
+        appBandwidthMonitor.start { [weak self] snapshot in
+            self?.showAppBandwidth(snapshot)
+        }
         idQ.async { [weak self] in self?.refreshIdentity() }
         let t = Timer(timeInterval: BandwidthTracker.sampleInterval, repeats: true) { [weak self] _ in self?.tick() }
         RunLoop.main.add(t, forMode: .common)
@@ -169,6 +177,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        appBandwidthMonitor.stop()
         // Finish queued writes or an in-progress compaction before the process exits.
         statsQ.sync {}
     }
@@ -200,6 +209,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 self.flushLog(at: now)
                 self.peakItem?.title = "Peak this connection: —"
                 self.bandwidth.resetConnection(counters: counters, at: now)
+                self.resetAppBandwidth(at: now)
                 self.recentLats = []
                 self.lastLatMs = nil; self.lastLatSrc = nil; self.lastLatAt = nil
                 self.health.reset(); self.healthDisplay.reset()
@@ -224,8 +234,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func tick(counters: Counters? = readCounters(), at: TimeInterval = BandwidthClock.now()) {
+        topAppsItem?.title = appBandwidthDisplay.title(at: at)
         switch bandwidth.record(counters, at: at) {
         case .gap(let endedAt):
+            resetAppBandwidth(at: at)
             flushLog(at: endedAt, resetAt: at)
             updateTitle()
             return
@@ -238,6 +250,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         if healthDisplay.publish() { updateTitle() }
         peakItem?.title = "Peak this connection: \(fmtRate(bandwidth.peak.down))↓ / \(fmtRate(bandwidth.peak.up))↑"
+    }
+
+    func showAppBandwidth(_ snapshot: AppBandwidthSnapshot?, at: TimeInterval = BandwidthClock.now()) {
+        appBandwidthDisplay.record(snapshot, at: at)
+        topAppsItem?.title = appBandwidthDisplay.title(at: at)
+    }
+
+    func resetAppBandwidth(at: TimeInterval = BandwidthClock.now()) {
+        appBandwidthMonitor.reset()
+        appBandwidthDisplay.restart(at: at)
+        topAppsItem?.title = appBandwidthDisplay.title(at: at)
     }
 
     func updateTitle() {
