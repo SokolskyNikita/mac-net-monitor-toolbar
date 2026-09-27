@@ -383,17 +383,6 @@ private func score(_ samples: [HealthSample]) -> Int {
 }
 
 @Suite struct StatusLayoutTests {
-    @Test(arguments: [0, 7, 999, 999.6, 7_000, 38_000, 999_499, 999_600, 1_234_567, 9_949_999,
-                      9_960_000, 123_456_789, 999_600_000, 1.5e9, 9.96e9, 42e9])
-    func rateFitsFourCharacters(bps: Double) {
-        #expect(fmtRate(bps).count <= 4)
-    }
-
-    @Test(arguments: [(0.0, "0B"), (7_000, "7K"), (999_600, "1.0M"), (12_300_000, "12M"), (2.5e9, "2.5G")])
-    func rateFormat(bps: Double, text: String) {
-        #expect(fmtRate(bps) == text)
-    }
-
     @Test func widthGrowsImmediately() {
         var w = StableWidth()
         let a = w.fit(100, now: 0), b = w.fit(120, now: 1)

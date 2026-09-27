@@ -120,7 +120,14 @@ Once a minute, NetMenu appends one JSON object per line to:
 ~/Library/Application Support/NetMenu/stats.jsonl
 ```
 
-Open it from the menu with **Reveal stats file**. The main fields are:
+Open it from the menu with **Reveal stats file**.
+
+The log is capped at **100 MB (100,000,000 bytes)**. When an append would exceed the cap,
+NetMenu removes the oldest entries and retains roughly the newest 90 MB of complete JSON
+lines, leaving room for future appends. Trimming runs in the background using bounded memory
+and an atomic file replacement. Existing oversized logs are also trimmed when the app starts.
+
+The main fields are:
 
 | Field | Description |
 | --- | --- |

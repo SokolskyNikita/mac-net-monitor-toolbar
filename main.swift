@@ -2,8 +2,8 @@ import AppKit
 import Foundation
 
 if CommandLine.arguments.contains("--sample") {
-    let c0 = readCounters(); Thread.sleep(forTimeInterval: 1); let c1 = readCounters()
-    let (down, up) = deltaRates(old: c0, new: c1, dt: 1)
+    let bandwidth = measureBandwidth()
+    let down = bandwidth.rates.down, up = bandwidth.rates.up
     let r = Latency.measure(gateway: nil)
     let id = resolveIdentitySample()
     let latStr = r.ms.map { String(format: "%.1f", $0) } ?? "nan"
@@ -19,7 +19,7 @@ if CommandLine.arguments.contains("--sample") {
     let upI = UInt64(finiteNonNeg(up, max: 1e13)?.rounded() ?? 0)
     print("latency_ms=\(latStr) down_Bps=\(downI) up_Bps=\(upI) type=\(id.type) network=\(netJSON)")
     let loss = r.total > 0 ? Double(r.failed + r.rejected) / Double(r.total) : 1.0
-    let obj = buildSampleJSON(id: id, secs: 1, latMs: r.ms, latMin: r.ms, latMax: r.ms, latSrc: r.source?.rawValue,
+    let obj = buildSampleJSON(id: id, secs: bandwidth.seconds, latMs: r.ms, latMin: r.ms, latMax: r.ms, latSrc: r.source?.rawValue,
                               gwMs: nil, loss: r.ms == nil ? 1.0 : loss, rejected: r.rejected,
                               down: down, up: up, downPeak: down, upPeak: up,
                               health: r.internetReachable ? nil : 0,
