@@ -8,7 +8,7 @@ A macOS menu bar app that shows live internet latency, connection health, throug
 
 NetMenu is built for unreliable networks such as hotels, airports, planes and phone hotspots. It discards fake low pings answered by captive portals and in-flight proxies. It also checks that ordinary websites load, since ping can work while web access is blocked. There are no accounts or analytics; apart from its probes and the speed tests you start, nothing leaves your Mac.
 
-![NetMenu menu showing latency, connection health, throughput and top bandwidth apps](docs/images/mac-net-monitor-screenshot.png)
+<img src="docs/images/mac-net-monitor-screenshot.png" alt="NetMenu menu showing latency, connection health, throughput and top bandwidth apps" width="395">
 
 ## Install
 
