@@ -239,7 +239,10 @@ final class AppBandwidthMonitor {
     private func sampleLoop(generation token: Int) {
         var failures = 0
         while isCurrent(token) {
-            if let snapshot = collect(generation: token) {
+            // This loop is one never-ending work item: without a pool per sample, everything
+            // Process, Pipe and NSRunningApplication autorelease piles up (~35 MB/day).
+            let snapshot = autoreleasepool { collect(generation: token) }
+            if let snapshot {
                 failures = 0
                 deliver(snapshot, generation: token)
             } else {
@@ -263,6 +266,12 @@ final class AppBandwidthMonitor {
         guard seconds.isFinite, seconds > 0, seconds <= Self.maxSampleSeconds else { return nil }
 
         let identities = AppBandwidthProcessGrouper.aggregate(rows) { row in
+            // NetMenu's own probes (ping, curl) count as NetMenu, not as the user's curl.
+            if HelperPIDs.shared.contains(row.pid) {
+                return AppBandwidthProcessGrouper.identity(processName: "NetMenu", pid: getpid(),
+                                                           executablePath: Bundle.main.executablePath,
+                                                           runningApplicationName: "NetMenu")
+            }
             let runningApplication = NSRunningApplication(processIdentifier: row.pid)
             let path = processPath(pid: row.pid) ?? runningApplication?.bundleURL?.path
             let appName = runningApplication?.localizedName
@@ -298,8 +307,18 @@ final class AppBandwidthMonitor {
         process.standardOutput = outputPipe
         process.standardError = errorPipe
 
-        do { try process.run() } catch { return nil }
+        do { try process.run() } catch {
+            for pipe in [inputPipe, outputPipe, errorPipe] {
+                try? pipe.fileHandleForReading.close(); try? pipe.fileHandleForWriting.close()
+            }
+            DiagLog.shared.warn("apps", "cannot launch nettop: \(error.localizedDescription)", throttleKey: "nettop-launch")
+            return nil
+        }
         guard attach(process, generation: token) else {
+            // Stop nettop first: draining a running nettop would block until it exits on its own.
+            terminateAndWait(process)
+            try? inputPipe.fileHandleForWriting.close()
+            _ = drainAndClose(outputPipe); _ = drainAndClose(errorPipe)
             terminateAndWait(process)
             return nil
         }
@@ -312,15 +331,16 @@ final class AppBandwidthMonitor {
         let drainGroup = DispatchGroup()
         drainGroup.enter()
         DispatchQueue.global(qos: .utility).async {
-            let data = outputPipe.fileHandleForReading.readDataToEndOfFile()
+            let data = drainAndClose(outputPipe)
             output.lock.lock(); output.data = data; output.lock.unlock()
             drainGroup.leave()
         }
         drainGroup.enter()
         DispatchQueue.global(qos: .utility).async {
-            _ = errorPipe.fileHandleForReading.readDataToEndOfFile()
+            _ = drainAndClose(errorPipe)
             drainGroup.leave()
         }
+        defer { try? inputPipe.fileHandleForWriting.close() }
 
         let startedAt = BandwidthClock.now()
         var timedOut = false
@@ -337,11 +357,23 @@ final class AppBandwidthMonitor {
             Thread.sleep(forTimeInterval: 0.05)
         }
         if process.isRunning { terminateAndWait(process) }
-        else { process.waitUntilExit() }
+        if !process.isRunning { process.waitUntilExit() }
         _ = drainGroup.wait(timeout: .now() + 2)
         detach(process, generation: token)
 
-        guard !timedOut, isCurrent(token), process.terminationStatus == 0 else { return nil }
+        // terminationStatus raises an Objective-C exception while the process is still running.
+        guard !process.isRunning else {
+            DiagLog.shared.error("apps", "nettop survived SIGKILL", throttleKey: "nettop-zombie")
+            return nil
+        }
+        guard !timedOut, isCurrent(token) else {
+            if timedOut { DiagLog.shared.warn("apps", "nettop timed out", throttleKey: "nettop-timeout") }
+            return nil
+        }
+        guard process.terminationStatus == 0 else {
+            DiagLog.shared.warn("apps", "nettop exited \(process.terminationStatus)", throttleKey: "nettop-exit")
+            return nil
+        }
         output.lock.lock(); let data = output.data; output.lock.unlock()
         return String(data: data, encoding: .utf8)
     }
@@ -390,13 +422,7 @@ final class AppBandwidthMonitor {
     }
 
     private func terminateAndWait(_ process: Process) {
-        requestTermination(process)
-        let deadline = BandwidthClock.now() + 1.0
-        while process.isRunning, BandwidthClock.now() < deadline {
-            Thread.sleep(forTimeInterval: 0.02)
-        }
-        if process.isRunning { _ = Darwin.kill(process.processIdentifier, SIGKILL) }
-        if !process.isRunning { process.waitUntilExit() }
+        terminateProcess(process, grace: 1.0)
     }
 
     private func processPath(pid: Int32) -> String? {

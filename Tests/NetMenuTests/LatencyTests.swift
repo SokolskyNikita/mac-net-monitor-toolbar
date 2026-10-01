@@ -1,10 +1,16 @@
+import Foundation
 import Testing
 @testable import NetMenu
 
 @Suite struct InternetAccessTests {
     @Test func ordinaryPagesAreAccepted() {
+        // Before and after IANA's September 2026 redesign.
         #expect(Latency.InternetSite.example.accepts(status: 200,
-            body: "<html><title>Example Domain</title><h1>Example Domain</h1></html>"))
+            body: "<html><title>Example Domain</title><h1>Example Domain</h1>"
+                + "<p>This domain is for use in illustrative examples in documents.</p></html>"))
+        #expect(Latency.InternetSite.example.accepts(status: 200,
+            body: "<!doctype html><html lang=en><head><title>Example Domain</title></head><body>"
+                + "<p>This domain is for use in documentation examples without needing permission.</p></body></html>"))
         #expect(Latency.InternetSite.google.accepts(status: 200,
             body: "User-agent: *\nUser-agent: Yandex\nDisallow: /search\n"))
     }
@@ -17,7 +23,7 @@ import Testing
         }
         for status in [0, 204, 302, 403, 511] {
             #expect(!site.accepts(status: status,
-                body: "User-agent: *\nDisallow: /search\n<title>Example Domain</title><h1>Example Domain</h1>"))
+                body: "User-agent: *\nDisallow: /search\n<title>Example Domain</title>This domain is for use in"))
         }
     }
 
@@ -49,6 +55,42 @@ import Testing
             internetChecks: [:], httpFallback: { Issue.record("portal must skip fallback"); return nil })
         #expect(r.ms == nil)
         #expect(!r.internetReachable)
+    }
+
+    @Test func localCurlFailuresAreNotNetworkFailures() {
+        #expect(Latency.isLocalCurlFailure(code: 56, stderr: "curl: (56) Failure writing output to destination"))
+        #expect(Latency.isLocalCurlFailure(code: 23, stderr: ""))
+        #expect(!Latency.isLocalCurlFailure(code: 56, stderr: "curl: (56) Recv failure: Connection reset by peer"))
+        #expect(!Latency.isLocalCurlFailure(code: 6, stderr: "curl: (6) Could not resolve host: example.com"))
+        #expect(!Latency.isLocalCurlFailure(code: 28, stderr: "curl: (28) Operation timed out"))
+    }
+
+    @Test func websitesAreCheckedEveryCycleOnlyWhenSomethingLooksOff() {
+        let good = Latency.decide(echoes: [.init(ms: 9, hops: 9)], gatewayMs: nil, portal: .internet,
+                                  internetChecks: [:], httpFallback: { nil })
+        func due(_ since: Int, _ web: InternetStatus = .reachable, _ p: WanProbe? = nil, changed: Bool = false) -> Bool {
+            Latency.websiteCheckDue(cyclesSinceCheck: since, lastWebsites: web, previous: p ?? good, networkChanged: changed)
+        }
+        #expect(!due(0)); #expect(!due(3)); #expect(due(4))
+        #expect(due(0, .unreachable)); #expect(due(0, .unknown))
+        #expect(due(0, changed: true))
+        #expect(Latency.websiteCheckDue(cyclesSinceCheck: 0, lastWebsites: .reachable, previous: nil, networkChanged: false))
+        let lossy = Latency.decide(echoes: [.init(ms: 9, hops: 9), nil], gatewayMs: nil, portal: .internet,
+                                   internetChecks: [:], httpFallback: { nil })
+        #expect(due(0, .reachable, lossy))
+        let dark = Latency.decide(echoes: [nil], gatewayMs: nil, portal: .unknown, internetChecks: [:], httpFallback: { nil })
+        #expect(due(0, .reachable, dark))
+    }
+
+    @Test func helperKilledBySignalIsReportedAsSuch() {
+        let r = runProcess("/bin/sh", ["-c", "kill -TERM $$"])
+        #expect(r.outcome == .signaled(SIGTERM))
+    }
+
+    @Test func helperStderrIsCaptured() {
+        let r = runProcess("/bin/sh", ["-c", "echo oops >&2; exit 3"])
+        #expect(r.stderr == "oops")
+        #expect(r.outcome == .exited(3))
     }
 
     @Test func failedHelperCannotReturnSuccessfulOutput() {
@@ -143,7 +185,31 @@ import Testing
     @Test func nothingUsableCountsAsFailure() {
         let r = Latency.decide(echoes: [nil], gatewayMs: nil, portal: .unknown, internetChecks: ["example.com": false], httpFallback: { nil })
         #expect(r.ms == nil)
-        #expect(r.failed == 2)
+        // Never more failures than probes: logged loss stays within 0–100%.
+        #expect(r.failed == 1)
+        #expect(r.total == 1)
+    }
+
+    @Test func unmeasuredEchoesAreNeitherLostNorCounted() {
+        let r = Latency.decide(echoes: [far, nil, nil], unmeasured: [1], gatewayMs: nil, portal: .internet,
+                               internetChecks: ["example.com": true], httpFallback: { nil })
+        #expect(r.verdicts == [.wan(25), .unmeasured, .noReply])
+        #expect(r.failed == 1)
+        #expect(r.total == 2)
+        #expect(r.measured)
+    }
+
+    @Test func internetStatusDistinguishesUnknown() {
+        func probe(_ checks: [String: Bool]) -> WanProbe {
+            Latency.decide(echoes: [far], gatewayMs: nil, portal: .internet, internetChecks: checks, httpFallback: { nil })
+        }
+        #expect(probe(["example.com": false, "www.google.com": true]).internet == .reachable)
+        #expect(probe(["example.com": false]).internet == .unreachable)
+        #expect(probe([:]).internet == .unknown)
+        let nothing = Latency.decide(echoes: [nil], unmeasured: [0], gatewayMs: nil, portal: .unknown,
+                                     internetChecks: [:], httpFallback: { nil })
+        #expect(!nothing.measured)
+        #expect(nothing.corroboratesOutage)
     }
 }
 

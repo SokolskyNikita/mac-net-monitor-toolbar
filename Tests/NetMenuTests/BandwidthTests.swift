@@ -160,6 +160,18 @@ private func expectApproximatelyEqual(_ actual: Double, _ expected: Double) {
         #expect(tracker.window.peak.up == 80)
     }
 
+    @Test func shortIntervalCountsTowardAveragesButNotPeaks() {
+        var tracker = BandwidthTracker(counters: counters(0, 0), at: 0)
+        _ = tracker.record(counters(100, 10), at: 1)
+        // A late tick then an early one: 100 bytes in 0.1s is a 1000 B/s burst, not a 1s rate.
+        _ = tracker.record(counters(200, 20), at: 1.9)
+        _ = tracker.record(counters(300, 30), at: 2.0)
+        expectApproximatelyEqual(tracker.current.down, 1000)
+        expectApproximatelyEqual(tracker.peak.down, 100 / 0.9)
+        expectApproximatelyEqual(tracker.window.peak.down, 100 / 0.9)
+        expectApproximatelyEqual(tracker.window.average.down, 150)
+    }
+
     @Test func tracksTenGigabitsPerSecondOverUnequalIntervals() {
         var tracker = BandwidthTracker(counters: counters(0, 0), at: 0)
 

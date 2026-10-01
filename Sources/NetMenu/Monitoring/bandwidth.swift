@@ -149,8 +149,10 @@ struct BandwidthWindow {
         guard seconds.isFinite, seconds > 0 else { return }
         downBytes += rates.down * seconds; upBytes += rates.up * seconds
         self.seconds += seconds; sampleCount += 1
-        peak.down = max(peak.down, rates.down)
-        peak.up = max(peak.up, rates.up)
+        if seconds >= BandwidthTracker.minPeakInterval {
+            peak.down = max(peak.down, rates.down)
+            peak.up = max(peak.up, rates.up)
+        }
     }
 }
 
@@ -160,6 +162,9 @@ struct BandwidthTracker {
     static let sampleInterval: TimeInterval = 1
     static let displayInterval: TimeInterval = 5
     static let maxSampleInterval: TimeInterval = 5
+    /// Peaks are one-second rates. A tick that lands early after a late one spans a fraction of
+    /// a second and can catch a sub-second burst, so it counts toward averages but not peaks.
+    static let minPeakInterval: TimeInterval = 0.75
 
     enum Update: Equatable {
         case sampled
@@ -213,8 +218,10 @@ struct BandwidthTracker {
             rate.isFinite && rate >= 0 && rate <= 1e13 ? rate : 0
         }
         current = BandwidthRates(down: sanitize(down), up: sanitize(up))
-        peak.down = max(peak.down, current.down)
-        peak.up = max(peak.up, current.up)
+        if dt >= Self.minPeakInterval {
+            peak.down = max(peak.down, current.down)
+            peak.up = max(peak.up, current.up)
+        }
         window.add(current, seconds: dt)
         displayWindow.add(current, seconds: dt)
 

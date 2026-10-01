@@ -74,7 +74,7 @@ final class StatusBarRenderer {
         func width(_ s: String) -> CGFloat { (s as NSString).size(withAttributes: Self.statusAttrs).width }
         let slots = fields.map { max(width($0.0), width($0.1)) }
         let content = ceil(slots.reduce(0, +) + Self.statusGap * CGFloat(fields.count - 1))
-        let w = CGFloat(statusWidth.fit(Double(content), now: Date().timeIntervalSince1970))
+        let w = CGFloat(statusWidth.fit(Double(content), now: BandwidthClock.now()))
         let angle = CGFloat(spinnerPhase % 12) * 30
         let img = NSImage(size: NSSize(width: w, height: 18), flipped: false) { _ in
             var edge = w - content

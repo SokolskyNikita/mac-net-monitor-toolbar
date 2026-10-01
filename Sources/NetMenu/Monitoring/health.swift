@@ -8,11 +8,17 @@
 // Past the limit, each penalty follows a Hill curve on the excess e, max × eᵏ / (eᵏ + halfᵏ):
 // half of `max` at `half` past the limit, saturating at `max`.
 //
-// - Loss only counts targets that answered at least once in the window, so a host that blocks
-//   ICMP on this network is not mistaken for loss. With no such target (ICMP blocked, HTTP
-//   fallback), a cycle that published nothing counts as lost.
-// - Jitter is the mean absolute change between consecutive RTTs (RFC 3550 style): 15-100-15-100
-//   scores badly, a slow drift does not. The largest ~10% of changes are trimmed so a single
+// - Measurements this Mac could not make (a helper failed to launch, a ping target did not
+//   resolve, a probe was cut off) are excluded everywhere. A local fault never reads as loss.
+// - Loss is per target: each host that answered at least once in the window gets its own loss
+//   rate. The lossiest host is dropped (keeping a majority) only while it is both more than 10
+//   points worse than the others pooled and statistically implausible under their rate
+//   (binomial tail < 1%), so one host rate-limiting ICMP is not mistaken for a bad link, while
+//   real loss, which hits every host alike, still counts in full even over a few cycles. With no such host (ICMP
+//   blocked, HTTP fallback), a cycle that published nothing counts as lost.
+// - Jitter is the mean absolute change between consecutive RTTs to the same host (RFC 3550, per
+//   stream): 15-100-15-100 scores badly, a slow drift does not, and the fastest host changing
+//   from one cycle to the next is not jitter. The largest ~10% of changes are trimmed so a single
 //   wakeup spike, which produces two large changes, does not read as instability.
 //   Above 200ms median RTT, divide jitter by RTT/200 before applying the curve. This scales
 //   both the free allowance and penalty ramp: up to max(40ms, 20% of RTT) costs nothing.
@@ -21,19 +27,34 @@
 //   link is slow, not broken.
 // - Scores are computed every probe cycle over the last minute, then averaged over 10 seconds
 //   for display so the menu bar does not flicker between neighbouring values.
-// - If the latest ordinary HTTPS checks all fail, health is immediately 0%, even when ping
-//   still works. Neither the calibration period nor display smoothing can hide that failure.
+// - Outage: when every ordinary HTTPS check fails, health is 0% once the failure is confirmed:
+//   immediately if nothing else got through that cycle or a login wall is up, otherwise on the
+//   second failing cycle in a row, so one dropped request on a working link cannot zero the
+//   score. Neither calibration nor display smoothing can hide a confirmed outage.
+// - After wake or a network change, cycles are ignored until something answers (at most
+//   `settleLimit`), so the seconds Wi-Fi takes to rejoin do not read as loss for a minute.
+// - Time is monotonic and includes sleep, so wall-clock changes cannot keep stale cycles.
 
 import Foundation
 
 struct HealthSample {
-    /// Seconds since 1970.
+    /// Monotonic seconds (`HealthTracker.now()`).
     var at: TimeInterval
     var ms: Double?
     var source: LatencySource?
     /// Per-target verdicts in `Latency.icmpTargets` order.
     var targets: [Latency.EchoVerdict]
-    var internetReachable: Bool
+    var internet: InternetStatus
+    /// This cycle alone confirms failed website checks (see `WanProbe.corroboratesOutage`).
+    var corroborated: Bool = false
+}
+
+extension HealthSample {
+    init(at: TimeInterval, ms: Double?, source: LatencySource?, targets: [Latency.EchoVerdict],
+         internetReachable: Bool, corroborated: Bool = false) {
+        self.init(at: at, ms: ms, source: source, targets: targets,
+                  internet: internetReachable ? .reachable : .unreachable, corroborated: corroborated)
+    }
 }
 
 struct HealthReport: Equatable {
@@ -43,7 +64,10 @@ struct HealthReport: Equatable {
     var loss: Double
     var jitterMs: Double?
     var latencyMs: Double?
+    /// False only during a confirmed outage.
     var internetReachable: Bool = true
+    /// The latest website checks failed but the outage is not confirmed yet.
+    var websitesFailing: Bool = false
 }
 
 struct HealthCurve {
@@ -78,6 +102,10 @@ enum Health {
     static let minCycles = 3
     /// ≤2% free, 5% ≈ 32% penalty, 10% ≈ 67%, 100% = 100%.
     static let lossCurve = HealthCurve(free: 0.02, half: 0.05, steepness: 1.5, max: 1, full: 1)
+    /// A host this much lossier than the others pooled, and at least this unlikely under their
+    /// loss rate, is treated as filtering ICMP.
+    static let lossOutlierMargin = 0.10
+    static let lossOutlierPValue = 0.01
     /// Normalized jitter: ≤40ms free, 60ms ≈ 31% penalty, 85ms ≈ 61%.
     static let jitterCurve = HealthCurve(free: 40, half: 25, steepness: 2, max: 0.8)
     /// Preserve the absolute jitter curve on fast links; scale it with RTT above this point.
@@ -87,22 +115,36 @@ enum Health {
     /// The menu bar shows the mean score over this period and changes at most this often.
     static let displayInterval: TimeInterval = 10
     static let jitterTrim = 0.1
+    /// Longest wait after wake or a network change before failures count again.
+    static let settleLimit: TimeInterval = 30
 
     // MARK: - Scoring
 
-    /// Nil until calibrated, except a failed internet check immediately reports zero.
+    /// Nil until calibrated, except a confirmed outage immediately reports zero.
     static func evaluate(_ samples: [HealthSample]) -> HealthReport? {
-        guard let latest = samples.last else { return nil }
-        guard samples.count >= minCycles || !latest.internetReachable else { return nil }
+        guard !samples.isEmpty else { return nil }
+        let outage = confirmedOutage(samples)
+        guard samples.count >= minCycles || outage else { return nil }
         let loss = lossRate(samples)
         let jitter = jitterMs(samples)
         let latency = latencyMs(samples)
         let keep = (1 - lossCurve.penalty(loss))
             * (1 - jitterPenalty(jitter ?? 0, latencyMs: latency))
             * (1 - latencyCurve.penalty(latency ?? 0))
-        let score = latest.internetReachable ? Int((100 * keep).rounded()) : 0
+        let raw = 100 * keep
+        let score = outage || !raw.isFinite ? 0 : Int(raw.rounded())
+        let failing = samples.last(where: { $0.internet != .unknown })?.internet == .unreachable
         return HealthReport(score: min(100, max(0, score)), loss: loss, jitterMs: jitter,
-                            latencyMs: latency, internetReachable: latest.internetReachable)
+                            latencyMs: latency, internetReachable: !outage,
+                            websitesFailing: failing && !outage)
+    }
+
+    /// The latest judged website check failed, and either that cycle corroborates it or the
+    /// judged cycle before it failed too. Cycles whose checks could not run are skipped.
+    static func confirmedOutage(_ samples: [HealthSample]) -> Bool {
+        let judged = samples.filter { $0.internet != .unknown }
+        guard let last = judged.last, last.internet == .unreachable else { return false }
+        return last.corroborated || judged.dropLast().last?.internet == .unreachable
     }
 
     /// A 100ms variation is small on a 650ms link but disruptive on a 50ms link.
@@ -114,30 +156,75 @@ enum Health {
     }
 
     static func lossRate(_ samples: [HealthSample]) -> Double {
+        guard !samples.isEmpty else { return 0 }
+        struct Tally { var lost = 0, sent = 0; var rate: Double { Double(lost) / Double(sent) } }
         let slots = samples.map(\.targets.count).max() ?? 0
-        var replied = 0, lost = 0
+        var tallies: [Tally] = []
         for slot in 0..<slots {
-            let verdicts = samples.compactMap { $0.targets.indices.contains(slot) ? $0.targets[slot] : nil }
-            guard verdicts.contains(where: { if case .wan = $0 { return true } else { return false } }) else { continue }
-            for v in verdicts {
-                switch v {
-                case .wan: replied += 1
-                case .noReply: lost += 1
-                case .onPath: break
+            var t = Tally(), answered = false
+            for s in samples where s.targets.indices.contains(slot) {
+                switch s.targets[slot] {
+                case .wan: t.sent += 1; answered = true
+                case .noReply: t.sent += 1; t.lost += 1
+                case .onPath, .unmeasured: break
                 }
             }
+            if answered { tallies.append(t) }
         }
-        if replied > 0 { return Double(lost) / Double(replied + lost) }
+        func pooled(_ ts: ArraySlice<Tally>) -> Double {
+            let sent = ts.reduce(0) { $0 + $1.sent }
+            return sent > 0 ? Double(ts.reduce(0) { $0 + $1.lost }) / Double(sent) : 0
+        }
+        if !tallies.isEmpty {
+            var kept = tallies.sorted { $0.rate < $1.rate }[...]
+            let minKeep = tallies.count / 2 + 1
+            while kept.count > minKeep, let worst = kept.last {
+                let rest = kept.dropLast()
+                let restLost = rest.reduce(0) { $0 + $1.lost }, restSent = rest.reduce(0) { $0 + $1.sent }
+                // Laplace-smoothed, so "the others lost nothing" does not make any loss impossible.
+                let p = Double(restLost + 1) / Double(restSent + 2)
+                guard worst.rate - pooled(rest) > lossOutlierMargin,
+                      binomialUpperTail(k: worst.lost, n: worst.sent, p: p) < lossOutlierPValue else { break }
+                kept = rest
+            }
+            return pooled(kept)
+        }
         return Double(samples.filter { $0.ms == nil }.count) / Double(samples.count)
     }
 
-    /// Mean absolute change between consecutive same-source RTTs, top ~10% trimmed.
+    /// P(X ≥ k) for X ~ Binomial(n, p).
+    static func binomialUpperTail(k: Int, n: Int, p: Double) -> Double {
+        guard k > 0 else { return 1 }
+        guard k <= n, p > 0 else { return 0 }
+        guard p < 1 else { return 1 }
+        var total = 0.0
+        for i in k...n {
+            let logC = lgamma(Double(n + 1)) - lgamma(Double(i + 1)) - lgamma(Double(n - i + 1))
+            total += exp(logC + Double(i) * log(p) + Double(n - i) * log1p(-p))
+        }
+        return min(1, total)
+    }
+
+    /// Mean absolute change between consecutive RTTs to the same host, top ~10% trimmed.
+    /// Without ICMP replies, falls back to consecutive same-source published RTTs.
     static func jitterMs(_ samples: [HealthSample]) -> Double? {
-        let rtts = samples.compactMap { s in s.ms.map { (ms: $0, source: s.source) } }
-        guard rtts.count >= 2 else { return nil }
         var deltas: [Double] = []
-        for (a, b) in zip(rtts, rtts.dropFirst()) where a.source == b.source {
-            deltas.append(abs(b.ms - a.ms))
+        if samples.last(where: { $0.ms != nil })?.source == .icmp {
+            let slots = samples.map(\.targets.count).max() ?? 0
+            for slot in 0..<slots {
+                var previous: Double?
+                for s in samples where s.targets.indices.contains(slot) {
+                    guard case .wan(let ms) = s.targets[slot], ms.isFinite else { continue }
+                    if let previous { deltas.append(abs(ms - previous)) }
+                    previous = ms
+                }
+            }
+        }
+        if deltas.isEmpty {
+            let rtts = samples.compactMap { s in s.ms.map { (ms: $0, source: s.source) } }
+            for (a, b) in zip(rtts, rtts.dropFirst()) where a.source == b.source {
+                deltas.append(abs(b.ms - a.ms))
+            }
         }
         guard !deltas.isEmpty else { return nil }
         deltas.sort()
@@ -155,15 +242,36 @@ enum Health {
 /// Rolling window of probe cycles for one network.
 struct HealthTracker {
     private(set) var samples: [HealthSample] = []
+    private(set) var settleUntil: TimeInterval?
 
-    /// Wall clock rather than uptime, which stops while the Mac sleeps.
-    static func now() -> TimeInterval { Date().timeIntervalSince1970 }
+    enum Recorded: String {
+        case recorded
+        /// Nothing in the cycle could be measured.
+        case unmeasured
+        /// Waiting for the network to come up after wake or a network change.
+        case settling
+    }
 
-    mutating func record(_ probe: WanProbe, at: TimeInterval = HealthTracker.now()) {
+    /// Monotonic and includes sleep: wall-clock changes cannot keep stale cycles in the window.
+    static func now() -> TimeInterval { BandwidthClock.now() }
+
+    @discardableResult
+    mutating func record(_ probe: WanProbe, at: TimeInterval = HealthTracker.now()) -> Recorded {
+        guard probe.measured else { return .unmeasured }
+        if let until = settleUntil {
+            guard probe.anySuccess || at >= until else { return .settling }
+            settleUntil = nil
+        }
         samples.append(HealthSample(at: at, ms: probe.ms.flatMap { finiteNonNeg($0) },
                                     source: probe.source, targets: probe.verdicts,
-                                    internetReachable: probe.internetReachable))
+                                    internet: probe.internet, corroborated: probe.corroboratesOutage))
         prune(now: at)
+        return .recorded
+    }
+
+    /// Ignore failing cycles until something answers or `Health.settleLimit` passes.
+    mutating func settle(at now: TimeInterval = HealthTracker.now()) {
+        settleUntil = now + Health.settleLimit
     }
 
     mutating func reset() {
@@ -172,11 +280,15 @@ struct HealthTracker {
 
     /// Cycles older than `Health.window` are ignored, so a long sleep does not leave stale history.
     func report(now: TimeInterval = HealthTracker.now()) -> HealthReport? {
-        Health.evaluate(samples.filter { now - $0.at <= Health.window })
+        Health.evaluate(samples.filter { Self.isCurrent($0, now: now) })
+    }
+
+    private static func isCurrent(_ s: HealthSample, now: TimeInterval) -> Bool {
+        now - s.at <= Health.window && s.at <= now + 1
     }
 
     private mutating func prune(now: TimeInterval) {
-        samples.removeAll { now - $0.at > Health.window }
+        samples.removeAll { !Self.isCurrent($0, now: now) }
     }
 }
 
@@ -221,6 +333,7 @@ struct HealthDisplay {
         return HealthReport(score: Int(score.rounded()), loss: avg(reports.map(\.loss)) ?? 0,
                             jitterMs: avg(reports.compactMap(\.jitterMs)),
                             latencyMs: avg(reports.compactMap(\.latencyMs)),
-                            internetReachable: reports.last?.internetReachable ?? false)
+                            internetReachable: reports.last?.internetReachable ?? false,
+                            websitesFailing: reports.last?.websitesFailing ?? false)
     }
 }

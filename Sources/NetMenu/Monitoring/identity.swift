@@ -7,8 +7,14 @@ struct Identity: Equatable {
     var iface: String?; var type: String; var network: String?; var bssid: String?
     var router: String?; var rssi: Int?; var noise: Int?; var txRate: Double?; var channel: Int?
     func sameNetwork(as x: Identity) -> Bool {
-        iface == x.iface && type == x.type && network == x.network && bssid == x.bssid && router == x.router
+        guard iface == x.iface && type == x.type && router == x.router else { return false }
+        if network == x.network && bssid == x.bssid { return true }
+        // Learning the name of the same link (Location access resolving after launch) is not a change.
+        return isUnnamedWiFi || x.isUnnamedWiFi
     }
+
+    /// Wi-Fi whose SSID and BSSID macOS has not revealed yet.
+    var isUnnamedWiFi: Bool { type == NetType.wifi && bssid == nil && network == PortName.wifi }
 }
 
 func parseRoute() -> (iface: String?, gateway: String?) {
@@ -26,7 +32,28 @@ func parseRoute() -> (iface: String?, gateway: String?) {
     return (nil, nil)
 }
 
-func hardwarePorts() -> [String: String] {
+private let portsLock = NSLock()
+private var cachedPorts: (at: TimeInterval, map: [String: String])?
+private let portsMaxAge: TimeInterval = 300
+
+/// Interface → hardware port names rarely change; re-read them every 5 minutes, or at once when
+/// `iface` is missing (a newly attached adapter or tethered phone).
+func hardwarePorts(including iface: String? = nil) -> [String: String] {
+    let now = BandwidthClock.now()
+    portsLock.lock()
+    let cached = cachedPorts
+    portsLock.unlock()
+    // VPN interfaces are never hardware ports, so their absence is not a reason to re-read.
+    let expected = iface.map { !["utun", "ipsec", "ppp"].contains(where: $0.hasPrefix) } ?? false
+    if let cached, now - cached.at < portsMaxAge, !expected || iface.map({ cached.map[$0] != nil }) == true {
+        return cached.map
+    }
+    let map = hardwarePortsUncached()
+    if !map.isEmpty { portsLock.lock(); cachedPorts = (now, map); portsLock.unlock() }
+    return map
+}
+
+private func hardwarePortsUncached() -> [String: String] {
     guard let out = runProc("/usr/sbin/networksetup", ["-listallhardwareports"]) else { return [:] }
     var map: [String: String] = [:], port: String?
     for line in out.split(separator: "\n") {
@@ -39,15 +66,37 @@ func hardwarePorts() -> [String: String] {
     return map
 }
 
+func isRedactedSSID(_ ssid: String) -> Bool {
+    let t = ssid.trimmingCharacters(in: .whitespaces)
+    return t.isEmpty || t == "<redacted>"
+}
+
 func ssidIpconfig(_ iface: String) -> String? {
     guard let out = runProc("/usr/sbin/ipconfig", ["getsummary", iface], timeout: 5),
           let re = ssidRe else { return nil }
     let range = NSRange(out.startIndex..., in: out)
     guard let m = re.firstMatch(in: out, range: range), let r = Range(m.range(at: 1), in: out) else { return nil }
-    return String(out[r])
+    let ssid = String(out[r])
+    return isRedactedSSID(ssid) ? nil : ssid
 }
 
+private let profilerLock = NSLock()
+private var profilerFailedAt: TimeInterval?
+/// system_profiler takes ~5s and, without Location access, only returns "<redacted>".
+private let profilerRetryAfter: TimeInterval = 600
+
 func ssidProfiler(_ iface: String) -> String? {
+    let now = BandwidthClock.now()
+    profilerLock.lock()
+    let skip = profilerFailedAt.map { now - $0 < profilerRetryAfter } ?? false
+    profilerLock.unlock()
+    guard !skip else { return nil }
+    let name = ssidProfilerUncached(iface)
+    profilerLock.lock(); profilerFailedAt = name == nil ? now : nil; profilerLock.unlock()
+    return name
+}
+
+private func ssidProfilerUncached(_ iface: String) -> String? {
     // system_profiler can be huge/slow — timeout + async pipe drain in runProc avoids hangs.
     guard let out = runProc("/usr/sbin/system_profiler", ["SPAirPortDataType", "-json"], timeout: 12),
           let data = out.data(using: .utf8),
@@ -55,7 +104,8 @@ func ssidProfiler(_ iface: String) -> String? {
           let arr = json["SPAirPortDataType"] as? [[String: Any]], let root = arr.first,
           let ifaces = root["spairport_airport_interfaces"] as? [[String: Any]] else { return nil }
     for i in ifaces where (i["_name"] as? String) == iface {
-        if let net = i["spairport_current_network_information"] as? [String: Any], let n = net["_name"] as? String { return n }
+        if let net = i["spairport_current_network_information"] as? [String: Any], let n = net["_name"] as? String,
+           !isRedactedSSID(n) { return n }
     }
     return nil
 }
@@ -65,7 +115,8 @@ func wifiDetails(iface: String) -> (ssid: String?, bssid: String?, rssi: Int?, n
     var result: (String?, String?, Int?, Int?, Double?, Int?) = (nil, nil, nil, nil, nil, nil)
     let work = {
         guard let cw = CWWiFiClient.shared().interface(withName: iface) else { return }
-        result.0 = cw.ssid()
+        // Before Location access resolves, macOS returns a placeholder instead of the name.
+        result.0 = cw.ssid().flatMap { isRedactedSSID($0) ? nil : $0 }
         result.1 = cw.bssid()
         let r = cw.rssiValue(); if r != 0 { result.2 = r }
         let n = cw.noiseMeasurement(); if n != 0 { result.3 = n }
@@ -82,7 +133,7 @@ func resolveIdentity() -> Identity {
     guard let iface else {
         return Identity(iface: nil, type: NetType.offline, network: nil, bssid: nil, router: nil, rssi: nil, noise: nil, txRate: nil, channel: nil)
     }
-    let ports = hardwarePorts(); let port = ports[iface] ?? ""
+    let ports = hardwarePorts(including: iface); let port = ports[iface] ?? ""
     var type = NetType.ethernet, network: String? = port.isEmpty ? iface : port
     var bssid: String?, rssi: Int?, noise: Int?, txRate: Double?, channel: Int?
     let isVPN = iface.hasPrefix("utun") || iface.hasPrefix("ipsec") || iface.hasPrefix("ppp")
@@ -115,7 +166,7 @@ func resolveIdentitySample() -> Identity {
     guard let iface else {
         return Identity(iface: nil, type: NetType.offline, network: nil, bssid: nil, router: nil, rssi: nil, noise: nil, txRate: nil, channel: nil)
     }
-    let ports = hardwarePorts(); let port = ports[iface] ?? ""
+    let ports = hardwarePorts(including: iface); let port = ports[iface] ?? ""
     var type = NetType.ethernet, network: String? = port.isEmpty ? iface : port
     let isVPN = iface.hasPrefix("utun") || iface.hasPrefix("ipsec") || iface.hasPrefix("ppp")
     if port == PortName.wifi || port == PortName.airPort { type = NetType.wifi }

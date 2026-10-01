@@ -1,12 +1,22 @@
+import Foundation
 import Testing
 @testable import NetMenu
 
 private typealias V = Latency.EchoVerdict
 
 /// One probe cycle. By default all five targets answered with `ms`, or all were lost when `ms` is nil.
-private func cycle(_ ms: Double?, source: LatencySource = .icmp, targets: [V]? = nil, at: Double = 0, internetReachable: Bool = true) -> HealthSample {
+private func cycle(_ ms: Double?, source: LatencySource = .icmp, targets: [V]? = nil, at: Double = 0,
+                   internetReachable: Bool = true, corroborated: Bool = false) -> HealthSample {
     let t = targets ?? Array(repeating: ms.map { .wan($0) } ?? .noReply, count: 5)
-    return HealthSample(at: at, ms: ms, source: ms == nil ? nil : source, targets: t, internetReachable: internetReachable)
+    return HealthSample(at: at, ms: ms, source: ms == nil ? nil : source, targets: t,
+                        internetReachable: internetReachable, corroborated: corroborated)
+}
+
+/// 20 cycles of 5 targets at `ms`, with `lost` of the 100 echoes lost, spread evenly across targets.
+private func spreadLoss(_ lost: Int, ms: Double = 20) -> [HealthSample] {
+    (0..<20).map { i in
+        cycle(ms, targets: (0..<5).map { t in i * 5 + t < lost ? .noReply : .wan(ms) })
+    }
 }
 
 private func score(_ samples: [HealthSample]) -> Int {
@@ -87,10 +97,34 @@ private func score(_ samples: [HealthSample]) -> Int {
         #expect(r?.internetReachable == false)
     }
 
-    @Test func failedInternetCheckBypassesCalibrationAndHealthyHistory() {
+    @Test func oneFailedWebsiteCycleOnAWorkingLinkIsNotAnOutage() {
+        let good = (0..<20).map { _ in cycle(15) }
+        let r = try! #require(Health.evaluate(good + [cycle(15, internetReachable: false)]))
+        #expect(r.score == 100)
+        #expect(r.internetReachable)
+        #expect(r.websitesFailing)
+        #expect(Health.evaluate([cycle(15, internetReachable: false)]) == nil)
+    }
+
+    @Test func secondFailedWebsiteCycleConfirmsOutage() {
         let failure = cycle(657, internetReachable: false)
-        #expect(score([failure]) == 0)
-        #expect(score((0..<20).map { _ in cycle(15) } + [failure]) == 0)
+        #expect(score([failure, failure]) == 0)
+        #expect(score((0..<20).map { _ in cycle(15) } + [failure, failure]) == 0)
+    }
+
+    @Test func corroboratedWebsiteFailureBypassesCalibrationAndHealthyHistory() {
+        let dead = cycle(nil, internetReachable: false, corroborated: true)
+        #expect(score([dead]) == 0)
+        #expect(score((0..<20).map { _ in cycle(15) } + [dead]) == 0)
+    }
+
+    @Test func cyclesWithoutWebsiteVerdictDoNotBreakConfirmation() {
+        var unknown = cycle(15); unknown.internet = .unknown
+        let fail = cycle(15, internetReachable: false)
+        let good = (0..<5).map { _ in cycle(15) }
+        #expect(score(good + [fail, unknown, fail]) == 0)
+        #expect(score(good + [fail, unknown]) == 100)
+        #expect(score(good + [fail, cycle(15), fail]) == 100)
     }
 
     @Test func verifiedRecoveryRestoresNormalScoring() {
@@ -117,7 +151,8 @@ private func score(_ samples: [HealthSample]) -> Int {
     @Test func linkAtZoomLimitsIsPerfect() {
         // Zoom: latency ≤150ms, jitter ≤40ms, loss ≤2%.
         let samples = (0..<20).map { i in
-            cycle(i % 2 == 0 ? 125 : 160, targets: [i < 2 ? .noReply : .wan(125), .wan(125), .wan(125), .wan(125), .wan(125)])
+            let ms: Double = i % 2 == 0 ? 125 : 160
+            return cycle(ms, targets: [i < 2 ? .noReply : .wan(ms), .wan(ms), .wan(ms), .wan(ms), .wan(ms)])
         }
         let r = try! #require(Health.evaluate(samples))
         #expect(abs(r.loss - 0.02) < 1e-9)
@@ -160,11 +195,7 @@ private func score(_ samples: [HealthSample]) -> Int {
     }
 
     @Test func lossPastZoomLimitScoresLower() {
-        func withLoss(_ lostCycles: Int) -> Int {
-            score((0..<20).map { i in
-                cycle(20, targets: [i < lostCycles ? .noReply : .wan(20), .wan(20), .wan(20), .wan(20), .wan(20)])
-            })
-        }
+        func withLoss(_ lostEchoes: Int) -> Int { score(spreadLoss(lostEchoes)) }
         #expect(withLoss(0) == 100)
         #expect(withLoss(2) == 100)
         let scores = [2, 3, 5, 10, 15].map(withLoss)
@@ -172,11 +203,8 @@ private func score(_ samples: [HealthSample]) -> Int {
     }
 
     @Test func sevenPercentLossRoughlyHalvesScore() {
-        // 7 of 100 echoes lost: 5 points past Zoom's 2% limit.
-        let samples = (0..<20).map { i in
-            cycle(20, targets: [i < 7 ? .noReply : .wan(20), .wan(20), .wan(20), .wan(20), .wan(20)])
-        }
-        let r = try! #require(Health.evaluate(samples))
+        // 7 of 100 echoes lost across all hosts: 5 points past Zoom's 2% limit.
+        let r = try! #require(Health.evaluate(spreadLoss(7)))
         #expect(abs(r.loss - 0.07) < 1e-9)
         #expect(r.score >= 45 && r.score <= 52)
     }
@@ -185,6 +213,62 @@ private func score(_ samples: [HealthSample]) -> Int {
         // Quad9 blocked on this network: every cycle, one target silent.
         let samples = (0..<10).map { _ in cycle(20, targets: [.wan(20), .wan(22), .wan(25), .noReply, .wan(30)]) }
         #expect(Health.evaluate(samples)?.loss == 0)
+    }
+
+    @Test func oneHostRateLimitingIcmpIsNotLinkLoss() {
+        // 9.9.9.9 drops 30% of echoes; the other four answer every one.
+        let samples = (0..<20).map { i in
+            cycle(20, targets: [.wan(20), .wan(21), .wan(22), i % 10 < 3 ? .noReply : .wan(25), .wan(30)])
+        }
+        #expect(Health.evaluate(samples)?.loss == 0)
+        #expect(score(samples) == 100)
+    }
+
+    @Test func lossOnEveryHostCountsInFull() {
+        let r = try! #require(Health.evaluate(spreadLoss(10)))
+        #expect(abs(r.loss - 0.10) < 1e-9)
+        // Even when one host is lossier than the rest, shared loss is never discarded.
+        let mixed = (0..<20).map { i in
+            cycle(20, targets: [i < 2 ? .noReply : .wan(20), i < 2 ? .noReply : .wan(20), i < 2 ? .noReply : .wan(20),
+                                i < 2 ? .noReply : .wan(20), i < 8 ? .noReply : .wan(20)])
+        }
+        let m = try! #require(Health.evaluate(mixed))
+        #expect(abs(m.loss - 0.10) < 1e-9)
+    }
+
+    @Test func evenLossIsNotDiscardedOverFewCycles() {
+        // Right after calibration, 10% loss on every host: chance alone makes one host look worse.
+        let samples = [
+            cycle(20, targets: [.noReply, .wan(20), .wan(20), .wan(20), .noReply]),
+            cycle(20, targets: [.wan(20), .wan(20), .noReply, .wan(20), .noReply]),
+            cycle(20, targets: [.wan(20), .wan(20), .wan(20), .wan(20), .wan(20)]),
+        ]
+        let r = try! #require(Health.evaluate(samples))
+        #expect(abs(r.loss - 4.0 / 15) < 1e-9)
+    }
+
+    @Test func binomialTail() {
+        #expect(abs(Health.binomialUpperTail(k: 1, n: 20, p: 0.05) - (1 - pow(0.95, 20))) < 1e-9)
+        #expect(Health.binomialUpperTail(k: 0, n: 5, p: 0.1) == 1)
+        #expect(Health.binomialUpperTail(k: 6, n: 20, p: 1.0 / 82) < 0.001)
+    }
+
+    @Test func unmeasuredProbesAreNotLoss() {
+        // Today's bug: helpers failing to launch read as 30% loss on a perfect link.
+        let samples = (0..<20).map { i in
+            cycle(9, targets: (0..<5).map { t in (i + t) % 3 == 0 ? .unmeasured : .wan(9) })
+        }
+        let r = try! #require(Health.evaluate(samples))
+        #expect(r.loss == 0)
+        #expect(r.score == 100)
+    }
+
+    @Test func fastestHostChangingIsNotJitter() {
+        // 1.1.1.1 at 10ms sometimes drops an echo; the published RTT falls back to 8.8.8.8 at 30ms.
+        let samples = (0..<20).map { i in
+            i % 4 == 0 ? cycle(30, targets: [.noReply, .wan(30)]) : cycle(10, targets: [.wan(10), .wan(30)])
+        }
+        #expect(Health.evaluate(samples)?.jitterMs == 0)
     }
 
     @Test func onPathEchoesAreIgnored() {
@@ -270,8 +354,49 @@ private func score(_ samples: [HealthSample]) -> Int {
         tracker.record(restricted, at: t0 + 3)
         display.add(tracker.report(now: t0 + 3))
         _ = display.publish(now: t0 + 3)
+        #expect(display.shown?.score == 100)
+        tracker.record(restricted, at: t0 + 6)
+        display.add(tracker.report(now: t0 + 6))
+        _ = display.publish(now: t0 + 6)
         #expect(display.shown?.score == 0)
         #expect(display.shown?.latencyMs == 15)
+    }
+
+    @Test func cycleThatMeasuredNothingIsNotRecorded() {
+        var t = HealthTracker()
+        var p = probe(nil)
+        p.verdicts = Array(repeating: .unmeasured, count: 5)
+        p.internetChecks = [:]
+        #expect(t.record(p, at: t0) == .unmeasured)
+        #expect(t.samples.isEmpty)
+    }
+
+    @Test func settlingIgnoresFailuresUntilSomethingAnswers() {
+        var t = HealthTracker()
+        t.settle(at: t0)
+        var dead = probe(nil)
+        dead.internetChecks = ["example.com": false]
+        #expect(t.record(dead, at: t0 + 3) == .settling)
+        #expect(t.record(probe(15), at: t0 + 6) == .recorded)
+        #expect(t.record(dead, at: t0 + 9) == .recorded)
+        #expect(t.samples.count == 2)
+    }
+
+    @Test func settlingEndsAfterLimitSoRealOutagesShow() {
+        var t = HealthTracker()
+        t.settle(at: t0)
+        var dead = probe(nil)
+        dead.internetChecks = ["example.com": false]
+        #expect(t.record(dead, at: t0 + Health.settleLimit - 1) == .settling)
+        #expect(t.record(dead, at: t0 + Health.settleLimit) == .recorded)
+        #expect(t.report(now: t0 + Health.settleLimit)?.score == 0)
+    }
+
+    @Test func futureSamplesAreDropped() {
+        var t = HealthTracker()
+        for i in 0..<5 { t.record(probe(15), at: t0 + 1000 + Double(i)) }
+        t.record(probe(15), at: t0)
+        #expect(t.samples.count == 1)
     }
 
     func probe(_ ms: Double?) -> WanProbe {
