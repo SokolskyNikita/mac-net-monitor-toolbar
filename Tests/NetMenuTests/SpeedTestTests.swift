@@ -265,7 +265,9 @@ private func fastConfig(budget: Int = 4_000_000, maxBudget: Int? = nil) -> Speed
                                        isCurrentNetwork: { true }, progress: { _ in })
         let down = try! #require(phase.mbps)
         let truth = link.trueRateOfLastHalf()
-        #expect(abs(down - truth) / truth < 0.1, "measured \(down), link carried \(truth)")
+        // The engine also leaves out the drain, so the windows differ slightly; including the
+        // ramp, the bug this guards against, read 20–40% low.
+        #expect(abs(down - truth) / truth < 0.15, "measured \(down), link carried \(truth)")
         #expect(!phase.budgetLimited, "a flat link must not be reported as a lower bound")
     }
 

@@ -113,7 +113,7 @@ func runProcess(_ path: String, _ args: [String], timeout: TimeInterval = 10) ->
     }
 }
 
-/// PIDs of helpers NetMenu started recently, so their traffic (ping, curl) is shown as NetMenu's
+/// PIDs of helpers NetMenu started recently, so their traffic (curl) is shown as NetMenu's
 /// in Top apps rather than as the user's own `curl`. Bounded by count and age.
 final class HelperPIDs: @unchecked Sendable {
     static let shared = HelperPIDs()

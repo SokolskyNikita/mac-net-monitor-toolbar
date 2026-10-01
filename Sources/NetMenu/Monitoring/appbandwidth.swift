@@ -266,7 +266,7 @@ final class AppBandwidthMonitor {
         guard seconds.isFinite, seconds > 0, seconds <= Self.maxSampleSeconds else { return nil }
 
         let identities = AppBandwidthProcessGrouper.aggregate(rows) { row in
-            // NetMenu's own probes (ping, curl) count as NetMenu, not as the user's curl.
+            // NetMenu's own website checks (curl) count as NetMenu, not as the user's curl.
             if HelperPIDs.shared.contains(row.pid) {
                 return AppBandwidthProcessGrouper.identity(processName: "NetMenu", pid: getpid(),
                                                            executablePath: Bundle.main.executablePath,

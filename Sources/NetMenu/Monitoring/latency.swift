@@ -344,8 +344,22 @@ enum Latency {
         case unmeasured(String)
     }
 
-    /// One `/sbin/ping`.
+    /// One ICMP echo, sent in-process (see icmp.swift); `/sbin/ping` only if ICMP sockets are unavailable.
     static func ping(_ host: String, timeoutMs: Int) -> PingOutcome {
+        // A name that does not resolve is a DNS problem, not packet loss.
+        guard let address = resolveIPv4(host) else { return .unmeasured("unresolved") }
+        switch ICMPPinger.shared.ping(address, timeoutMs: timeoutMs) {
+        case .reply(let ms, let ttl):
+            guard let ms = finiteNonNeg(ms) else { return .unmeasured("bad RTT") }
+            return .reply(EchoReply(ms: ms, hops: inferredHops(ttl: ttl)))
+        case .lost: return .lost
+        case .unmeasured(let why): return .unmeasured(why)
+        case .unavailable: return subprocessPing(host, timeoutMs: timeoutMs)
+        }
+    }
+
+    /// One `/sbin/ping` process.
+    static func subprocessPing(_ host: String, timeoutMs: Int) -> PingOutcome {
         let procTimeout = max(3.0, Double(timeoutMs) / 1000 + 2)
         let r = runProcess("/sbin/ping", ["-c", "1", "-W", String(timeoutMs), "-s", "16", host], timeout: procTimeout)
         switch r.outcome {
