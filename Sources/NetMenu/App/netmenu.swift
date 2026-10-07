@@ -598,11 +598,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDelegate {
     @objc func showAbout(_ sender: Any?) {
         let short = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""
         let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? ""
+        let paragraphStyle = NSMutableParagraphStyle()
+        paragraphStyle.alignment = .center
+        let credits = NSAttributedString(string: "GitHub project", attributes: [
+            .link: URL(string: "https://github.com/SokolskyNikita/mac-net-monitor-toolbar")!,
+            .font: NSFont.systemFont(ofSize: NSFont.systemFontSize),
+            .paragraphStyle: paragraphStyle
+        ])
         NSApp.activate(ignoringOtherApps: true)
         NSApp.orderFrontStandardAboutPanel(options: [
             .applicationName: "NetMenu",
             .applicationVersion: short,
-            .version: build
+            .version: build,
+            .credits: credits
         ])
     }
 
