@@ -90,6 +90,7 @@ final class WiFiScanMonitor {
     }
 
     func poll(isWiFi: Bool, now: Date = Date()) {
+        let config = self.config
         let settings = NSRunningApplication.runningApplications(withBundleIdentifier: SystemApp.systemSettingsBundleID)
         guard isWiFi, !settings.isEmpty else {
             if !samples.isEmpty || !scans.isEmpty || warning { reset() }
@@ -101,7 +102,6 @@ final class WiFiScanMonitor {
         inFlight = true; lastQuery = now
         let epoch = generation
         let snapshot = samples
-        let config = self.config
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let result = runProcess("/usr/bin/log", ["show", "--last", "\(Int(ceil(config.wifiScanHistory)))s", "--style", "json",
                 "--predicate", "process == 'airportd' AND (eventMessage CONTAINS 'SCAN request received' OR eventMessage CONTAINS 'Apple80211Scan:')"], timeout: config.wifiScanQueryTimeout)
