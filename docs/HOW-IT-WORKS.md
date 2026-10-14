@@ -1,6 +1,6 @@
 # How NetMenu works
 
-This is the detail behind each number in the menu. For what the numbers mean day to day, see the [README](../README.md).
+This is the detail behind each number in the menu. For what the numbers mean day to day, see the [user guide](USER-GUIDE.md).
 
 ## Probes
 
@@ -87,15 +87,9 @@ A warning beside the menu-bar quality percentage appears immediately for a misse
 
 **N reconnects in past 5 mins** appears only after at least three completed disconnect/reconnect cycles in the rolling five-minute window. It counts path transitions from connected to disconnected and back, excluding startup, wake reconnection, duplicate notifications, and metadata-only changes. Counts age out even with no new traffic.
 
-## Wi-Fi scan warnings
+## Network-name discovery
 
 Network-name discovery reads current connection metadata through CoreWLAN and `ipconfig getsummary` (only `ipconfig` for `--sample`). It does not run `system_profiler SPAirPortDataType`, which can trigger Wi-Fi scans. When the name is unavailable, NetMenu shows “Wi-Fi” or “VPN” instead.
-
-The **Wi-Fi scans** warning correlates slow router pings with scans requested by the Wi-Fi page in System Settings. It requires at least two ICMP router replies over 40ms that overlap completed scans from at least two distinct Settings requests within the last 45 seconds. Only valid router RTTs up to one second are retained. Merely having System Settings open is not evidence, and DNS/TCP/DHCP fallback timings do not trigger detection.
-
-After repeated slow pings, NetMenu queries the last minute of `airportd` unified-log events off the main thread, at most once every 20 seconds, with a five-second timeout. It only queries while System Settings is running and the current connection is classified as `wifi`; a connection classified as `vpn` does not enable this detector even if Wi-Fi carries the VPN. Restricted logs or an unsupported log format can prevent detection.
-
-The warning adds a menu-bar warning symbol and offers **Quit System Settings to stop scans**. Clicking it requests that the entire System Settings app quit, including other settings pages. If the request is refused, NetMenu asks you to close the Wi-Fi page or quit Settings manually. The warning clears when evidence ages out, Settings closes, or monitoring resets after wake or a network change. It identifies correlation, not proof that scans caused every delay.
 
 ## Throughput and peaks
 

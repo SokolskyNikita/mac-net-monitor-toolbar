@@ -35,7 +35,7 @@ Each per-minute entry includes:
 | `health_model`, `health_window_s`, `health_weighting`, `health_weight_half_life_s` | Scoring definition: `delay_budget_v1`, 60-second window, `exponential_age`, 15-second half-life. Older records used `inverse_sqrt_age` and `health_weight_min_age_s`. |
 | `reconnects_5m` | Completed reconnects in the rolling window (five minutes by default), including counts of zero or one hidden by the menu. The legacy field name is retained for readers. |
 | `reconnect_window_s` | Configured reconnect window in seconds, normally 300 |
-| `recent_trouble` | Warning categories active in the last ten seconds: `network loss`, `network latency`, `network jitter`, corresponding `router` categories, and `web access`. An empty array means none. This snapshot does not include the separate Wi-Fi scan warning. |
+| `recent_trouble` | Warning categories active in the last ten seconds: `network loss`, `network latency`, `network jitter`, corresponding `router` categories, and `web access`. An empty array means none. |
 | `internet_checks_fresh` | Whether a measured website check exists within the last 30 seconds; distinguishes stale retained results from current evidence |
 | `internet_reachable` | Whether at least one website passed in the latest website check |
 | `internet_checks` | Latest per-site results for `example.com` and `www.google.com`; a site whose check couldn't run is omitted |
@@ -76,7 +76,7 @@ A network change forces `status` to `failed` and adds `errors.network`. Any reta
 
 - Independent probe completions: each WAN target's verdict, router protocol and outcome, website results, captive check and HTTPS fallback. Late results from an old network epoch or a speed test are discarded.
 - Every visible health change, with loss, jitter and latency
-- Network changes, Location permission changes, sleep and wake, helper failures and Wi-Fi scan-log query failures
+- Network changes, Location permission changes, sleep and wake, and helper failures
 - Every speed test with its full breakdown: connections, data used, timing and errors per direction
 - A heartbeat every 5 minutes with uptime, open files, threads, memory, CPU use (NetMenu's own and its helpers') and failure counters
 

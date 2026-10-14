@@ -80,20 +80,6 @@ import Testing
         }
     }
 
-    @Test func scanThresholdOverrideChangesEvidenceDecision() {
-        let date = Date(timeIntervalSince1970: 100)
-        let sample = WiFiScanEvidence.Sample(end: date, ms: 20)
-        let scan = WiFiScanEvidence.Scan(start: date.addingTimeInterval(-1), end: date, settingsRequest: date)
-        var config = MonitoringConfig()
-        config.wifiScanSlowMs = 10
-        config.wifiScanMinOverlaps = 1
-        config.wifiScanMinRequests = 1
-        config.wifiScanEvidenceWindow = 2
-        #expect(WiFiScanEvidence.hasProblem(samples: [sample], scans: [scan], now: date, config: config))
-        #expect(!WiFiScanEvidence.hasProblem(samples: [sample], scans: [scan], now: date))
-        #expect(!WiFiScanEvidence.hasProblem(samples: [sample], scans: [scan], now: date.addingTimeInterval(3), config: config))
-    }
-
     @Test func loggingOverrideControlsActualCompaction() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

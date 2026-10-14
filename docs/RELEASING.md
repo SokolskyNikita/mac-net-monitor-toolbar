@@ -49,7 +49,7 @@ Repository **Settings → Secrets and variables → Actions**:
 | `APPLE_NOTARY_KEY_ID` | Key ID |
 | `APPLE_NOTARY_ISSUER_ID` | Issuer UUID |
 
-Without a certificate, CI ships an ad-hoc–signed zip. With only the certificate, it ships a Developer ID–signed but unnotarized zip. First launch of an unnotarized build may need **Open Anyway** (see the README).
+Without a certificate, CI ships an ad-hoc–signed zip. With only the certificate, it ships a Developer ID–signed but unnotarized zip. First launch of an unnotarized build may need **Open Anyway** (see [First launch](SETUP.md#first-launch)).
 
 Local notarization:
 
@@ -64,8 +64,9 @@ This repo is the tap (`Casks/netmenu.rb`):
 
 ```bash
 brew tap SokolskyNikita/netmenu https://github.com/SokolskyNikita/mac-net-monitor-toolbar
-brew trust sokolskynikita/netmenu   # Skip only on older Homebrew without this command
-brew install --cask netmenu
+brew install --cask sokolskynikita/netmenu/netmenu
 ```
+
+Installing by the full cask name [trusts that cask automatically](https://docs.brew.sh/Tap-Trust#installing-from-a-tap); a separate `brew trust` command is unnecessary. The explicit tap URL is required because this repository is not named `homebrew-netmenu`.
 
 The supported installation route is this repository's tap. CI maintains its cask directly; no `brew bump-cask-pr` step is part of this release workflow.

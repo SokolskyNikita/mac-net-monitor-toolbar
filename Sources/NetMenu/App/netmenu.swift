@@ -34,9 +34,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDelegate {
     static let showThroughputKey = "showThroughputInMenuBar"
     /// Off by default: throughput lives in the menu to keep the menu bar item narrow.
     var showThroughput = UserDefaults.standard.bool(forKey: AppDelegate.showThroughputKey)
-    let wifiScanMonitor = WiFiScanMonitor()
-    var wifiScanWarningItem: MenuReadoutItem?
-    var wifiScanActionItem: NSMenuItem?
     var localHealthItem: MenuReadoutItem?
     var localHealth = LocalHealthTracker()
     var localHealthDisplay = HealthDisplay()
@@ -124,13 +121,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDelegate {
         reconnectsItem = diagnosticRow("0 reconnects in past 5 mins")
         let local = MenuReadoutItem(readout: .health(.local))
         local.isEnabled = false; menu.addItem(local); localHealthItem = local
-        let scanWarning = MenuReadoutItem(readout: .detail(.warning, "Wi-Fi settings scans coincide with router delays."))
-        scanWarning.isHidden = true; menu.addItem(scanWarning); wifiScanWarningItem = scanWarning
-        let closeSettings = NSMenuItem(title: "Quit System Settings to stop scans", action: #selector(closeWiFiSettings), keyEquivalent: "")
-        closeSettings.target = self; closeSettings.isHidden = true
-        closeSettings.toolTip = "Quits System Settings, including its other open settings pages. Your Wi-Fi connection stays on."
-        menu.addItem(closeSettings); wifiScanActionItem = closeSettings
-        wifiScanMonitor.didChange = { [weak self] in self?.updateTitle() }
         menu.addItem(.separator())
         let rate = MenuReadoutItem(readout: .row(.traffic, value: "—"))
         rate.isEnabled = false; menu.addItem(rate); rateItem = rate
@@ -317,7 +307,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDelegate {
         bumpEpoch()
         health.reset(); healthDisplay.reset()
         recentTrouble = RecentTrouble()
-        wifiScanMonitor.reset()
         localHealth.reset(); localHealthDisplay.reset(); localHealth.settle()
         health.settle()
         lastInternetChecks = nil; lastCaptive = nil
@@ -436,7 +425,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDelegate {
     func tick(counters: Counters? = readCounters(), at: TimeInterval = BandwidthClock.now()) {
         updateSpeedTestRow(at: at)
         guard hasResolvedIdentity else { return }
-        wifiScanMonitor.poll(isWiFi: identity.type == NetType.wifi)
         speedActionItem?.title = speedActionTitle()
         speedActionItem?.toolTip = speedBudgetDescription()
         liveProbes.poll(identity: identity, epoch: snapshotProbeContext().epoch, paused: speedTestRunning, now: at)
@@ -499,10 +487,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDelegate {
         } else { lat = "✕"; displayedLatency = nil }
         let recent = recentTrouble.labels()
         let baseHealth = report.map { "\($0.score)%" } ?? (calibrating ? StatusBarRenderer.calibratingText : "")
-        let hasWarning = !recent.isEmpty || wifiScanMonitor.warning
+        let hasWarning = !recent.isEmpty
         let healthText = hasWarning ? "\(baseHealth) ⚠" : baseHealth
-        wifiScanWarningItem?.isHidden = !wifiScanMonitor.warning
-        wifiScanActionItem?.isHidden = !wifiScanMonitor.warning
         let reconnectCount = reconnects.count()
         reconnectsItem?.isHidden = reconnectCount < Configuration.monitoring.reconnectWarningCount
         let reconnectMinutes = String(format: "%g", Configuration.monitoring.reconnectWindow / 60)
@@ -520,21 +506,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDelegate {
             report: localHealth.report() == nil ? nil : localHealthDisplay.shown)
         localHealthItem?.toolTip = identity.localRouter.map { "Router: \($0.address) on \($0.interface). Same scoring thresholds as internet health." }
         rateItem?.content = .row(.traffic, value: "\(fmtRate(bandwidth.display.down))↓ / \(fmtRate(bandwidth.display.up))↑")
-    }
-
-    @objc func closeWiFiSettings() {
-        let apps = NSRunningApplication.runningApplications(withBundleIdentifier: SystemApp.systemSettingsBundleID)
-        guard !apps.isEmpty else { wifiScanMonitor.reset(); return }
-        let accepted = apps.map { $0.terminate() }.allSatisfy { $0 }
-        if accepted {
-            wifiScanMonitor.reset()
-        } else {
-            let alert = NSAlert()
-            alert.messageText = "Close Wi-Fi settings to stop scans"
-            alert.informativeText = "System Settings couldn’t be quit. Close its Wi-Fi page or quit System Settings manually. Your Wi-Fi connection can stay on."
-            alert.addButton(withTitle: "OK")
-            alert.runModal()
-        }
     }
 
     @objc func toggleThroughput(_ sender: NSMenuItem) {
@@ -587,7 +558,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDelegate {
             switch result.outcome {
             case .reply(let r):
                 verdict = .wan(r.ms); probeStats.recordRouter(r.ms)
-                if result.method == .icmp { wifiScanMonitor.record(ms: r.ms) }
             case .lost: verdict = .noReply
             case .unmeasured: verdict = .unmeasured
             }

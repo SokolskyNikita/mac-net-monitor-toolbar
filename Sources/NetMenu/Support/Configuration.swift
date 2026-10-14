@@ -107,33 +107,6 @@ struct MonitoringConfig {
     var portsCacheLifetime: TimeInterval = 300
     /// Process deadline for reading an interface summary with ipconfig.
     var ipconfigTimeout: TimeInterval = 5
-
-    /// Shortest logged scan accepted as useful scan evidence.
-    var wifiScanMinDuration: TimeInterval = 0.05
-    /// Longest logged scan accepted as plausible scan evidence.
-    var wifiScanMaxDuration: TimeInterval = 10
-    /// Allowed timestamp overlap: a scan may start this far before its Settings request.
-    var wifiScanRequestTolerance: TimeInterval = 0.02
-    /// Maximum time from a Settings scan request to its associated scan completion.
-    var wifiScanRequestMaxAge: TimeInterval = 10
-    /// Maximum age of scans and local RTT spikes considered for the scan warning.
-    var wifiScanEvidenceWindow: TimeInterval = 45
-    /// Local RTT must exceed this many milliseconds to count as a scan-related spike.
-    var wifiScanSlowMs = 40.0
-    /// Minimum slow samples overlapping scans; also gates querying the system log.
-    var wifiScanMinOverlaps = 2
-    /// Minimum distinct Settings scan requests associated with overlapping slow samples.
-    var wifiScanMinRequests = 2
-    /// Discard local RTT samples above this millisecond limit from scan correlation.
-    var wifiScanMaxSampleMs = 1000.0
-    /// Local sample retention period and lookback requested from the system log.
-    var wifiScanHistory: TimeInterval = 60
-    /// Maximum number of local RTT samples retained for scan correlation.
-    var wifiScanMaxSamples = 60
-    /// Minimum spacing between system-log queries while repeated local spikes occur.
-    var wifiScanQueryInterval: TimeInterval = 20
-    /// Process deadline for retrieving Wi-Fi scan evidence from the system log.
-    var wifiScanQueryTimeout: TimeInterval = 5
 }
 
 // MARK: - Health scoring

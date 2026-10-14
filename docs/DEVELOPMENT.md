@@ -62,7 +62,7 @@ CLI results are printed to standard output; these modes do not append sample or 
 Sources/NetMenu/
   App/          App lifecycle and entry point
   Monitoring/   Probe scheduling, ICMP/HTTPS, router protocols, health, network identity,
-                bandwidth/app attribution, connection snapshots, Wi-Fi scans and speed tests
+                bandwidth/app attribution, connection snapshots and speed tests
   Support/      Configuration, shared constants, process helpers, logs and watchdog
   UI/           Menu bar rendering
 Resources/      App metadata and icon
@@ -82,7 +82,7 @@ Product tuning lives in one file, [`Support/Configuration.swift`](../Sources/Net
 
 | Type | Contents |
 | --- | --- |
-| `MonitoringConfig` | Probe cadence/timeouts, website and fallback freshness, router retry policy, bandwidth sampling, identity cache lifetimes, Wi-Fi scan evidence and recent trouble/reconnect thresholds. |
+| `MonitoringConfig` | Probe cadence/timeouts, website and fallback freshness, router retry policy, bandwidth sampling, identity cache lifetimes and recent trouble/reconnect thresholds. |
 | `HealthConfig` | Model identifier, delay/loss calibration, recency weighting, outlier rules, scoring window, startup settling and display smoothing. |
 | `SpeedTestConfig` | Standard/Low Data Mode budgets, stream counts, request sizes, warmup/stability rules, timeouts, cooldowns and result lifetime. |
 | `LoggingConfig` | Stats cadence, byte limit and compaction retention, probe history cap, diagnostic rotation/throttling and heartbeat cadence. |

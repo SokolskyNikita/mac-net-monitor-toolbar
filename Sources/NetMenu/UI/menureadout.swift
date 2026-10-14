@@ -2,10 +2,10 @@ import AppKit
 
 /// Semantic row types select layout; display wording is never used as a type tag.
 enum MenuReadoutKind {
-    case health, local, traffic, peak, topApps, connections, connectionApps, message, result, warning
+    case health, local, traffic, peak, topApps, connections, connectionApps, message, result
 
     var isHealth: Bool { self == .health || self == .local }
-    var isDetailed: Bool { self == .result || self == .warning }
+    var isDetailed: Bool { self == .result }
     var isStacked: Bool { self == .connections || self == .connectionApps }
     var usesProportionalValue: Bool { self == .topApps || self == .connectionApps }
     var label: String {
@@ -18,7 +18,6 @@ enum MenuReadoutKind {
         case .connections: return "Connections"
         case .connectionApps: return "Top conn. consumers"
         case .result: return "Speed test"
-        case .warning: return "⚠ Wi-Fi scans"
         case .message: return ""
         }
     }
@@ -164,7 +163,6 @@ final class MenuReadoutView: NSView {
         } else if kind.isDetailed {
             detail.font = .systemFont(ofSize: 12, weight: .medium)
             detail.textColor = .labelColor
-            if kind == .warning { heading.textColor = Self.warningColor }
         } else {
             value.font = kind.usesProportionalValue ? .systemFont(ofSize: 12)
                 : .monospacedDigitSystemFont(ofSize: 12, weight: .medium)

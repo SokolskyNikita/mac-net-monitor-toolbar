@@ -13,7 +13,7 @@ NetMenu is a single-target native macOS app. Its useful boundaries are measureme
 - `SpeedTest` owns transfer measurement and budgeting. `SpeedTransport` supplies one connection's transfer, latency, cancellation and cleanup operations; `URLSessionSpeedTransport` implements them using macOS networking.
 - `UI/` owns AppKit readout views, status-bar rendering and app-list presentation. Shared numeric helpers live in `Support/measurements.swift`.
 - `MenuReadout` carries a semantic row kind, heading, value, details, numeric score and full accessible text. Renderers use the kind and score for layout, fonts and color; changing wording does not change those decisions. Title-producing conveniences on measurement results share this presentation value with CLI callers.
-- Shared external vocabulary lives in `Support/constants.swift`: `NettopFormat` keeps requested columns and both parsers aligned, and HTTP headers and the System Settings bundle ID have single definitions. Domain contracts remain with their owner: `SpeedTestStatus` is a raw-string enum, and process identity builders own their prefixes. Log serialization converts statuses to their existing wire strings.
+- Shared external vocabulary lives in `Support/constants.swift`: `NettopFormat` keeps requested columns and both parsers aligned, and HTTP headers have single definitions. Domain contracts remain with their owner: `SpeedTestStatus` is a raw-string enum, and process identity builders own their prefixes. Log serialization converts statuses to their existing wire strings.
 - `Support/Configuration.swift` owns compiled product defaults in five value types: monitoring, health, speed tests, logging and reliability. Policy components accept their relevant section, and resets preserve it. OS adapters read immutable defaults; tests substitute their I/O. See [Configuration](DEVELOPMENT.md#configuration) for the settings boundary and override example.
 
 ## SOLID assessment
@@ -30,7 +30,7 @@ NetMenu is a single-target native macOS app. Its useful boundaries are measureme
 
 The folders are organizational boundaries, not separately compiled modules. Some presentation conveniences remain on result types, such as health labels, speed-test descriptions and connection summaries. `AppDelegate` still builds the menu and coordinates speed-test UI state. Those are reasonable tradeoffs for this app's size; a second frontend or substantially larger menu would justify separate presenters and a speed-test UI controller.
 
-`WiFiScanMonitor` and `AppBandwidthMonitor` remain concrete macOS adapters. Their parsers and decision logic are independently testable, but their full lifecycle tests would benefit from injected log/process runners if those integrations become more complex. The diagnostic logger and shared ICMP socket are intentional process-wide resources, not dependencies that every pure calculation should receive.
+`AppBandwidthMonitor` remains a concrete macOS adapter. Its parsers and decision logic are independently testable, but its full lifecycle tests would benefit from an injected process runner if that integration becomes more complex. The diagnostic logger and shared ICMP socket are intentional process-wide resources, not dependencies that every pure calculation should receive.
 
 ## Regression checks
 

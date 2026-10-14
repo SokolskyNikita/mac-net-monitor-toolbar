@@ -44,11 +44,6 @@ enum HTTPMethod {
     static let post = "POST"
 }
 
-/// App identifiers shared by detection and user actions.
-enum SystemApp {
-    static let systemSettingsBundleID = "com.apple.systempreferences"
-}
-
 /// HTTP measurement policy shared by curl and URLSession probes.
 enum HTTPHeader {
     static let cacheControl = "Cache-Control"

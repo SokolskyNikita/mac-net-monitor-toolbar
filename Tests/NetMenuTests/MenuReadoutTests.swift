@@ -42,18 +42,6 @@ import Testing
         #expect(menu.size.width == MenuReadoutView.width)
     }
 
-    @Test func scanWarningFitsAndExposesFullAccessibleText() throws {
-        let title = "⚠ Wi-Fi scans: Wi-Fi settings scans coincide with router delays."
-        let item = MenuReadoutItem(readout: .detail(.warning, "Wi-Fi settings scans coincide with router delays."))
-        let view = try #require(item.view)
-        view.layoutSubtreeIfNeeded()
-        #expect(view.accessibilityLabel() == title)
-        for label in view.subviews.compactMap({ $0 as? NSTextField }) where !label.stringValue.isEmpty {
-            #expect(label.frame.minX >= 0 && label.frame.maxX <= view.bounds.width)
-            #expect(label.frame.maxY <= view.bounds.height)
-        }
-    }
-
     @Test func compactLabelsFitWithinTheReadout() throws {
         let rows: [MenuReadout] = [.row(.traffic, value: "680K↓ / 66K↑"), .row(.peak, value: "8.6M↓ / 2.0M↑"),
                                   .row(.topApps, value: "ChatGPT, git-remote-http", qualifier: " (~82%)")]
