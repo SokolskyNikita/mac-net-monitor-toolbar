@@ -88,36 +88,6 @@ func ssidIpconfig(_ iface: String) -> String? {
     return isRedactedSSID(ssid) ? nil : ssid
 }
 
-private let profilerLock = NSLock()
-private var profilerFailedAt: TimeInterval?
-/// system_profiler takes ~5s and, without Location access, only returns "<redacted>".
-private let profilerRetryAfter = Configuration.monitoring.profilerRetryInterval
-
-func ssidProfiler(_ iface: String) -> String? {
-    let now = BandwidthClock.now()
-    profilerLock.lock()
-    let skip = profilerFailedAt.map { now - $0 < profilerRetryAfter } ?? false
-    profilerLock.unlock()
-    guard !skip else { return nil }
-    let name = ssidProfilerUncached(iface)
-    profilerLock.lock(); profilerFailedAt = name == nil ? now : nil; profilerLock.unlock()
-    return name
-}
-
-private func ssidProfilerUncached(_ iface: String) -> String? {
-    // system_profiler can be huge/slow — timeout + async pipe drain in runProc avoids hangs.
-    guard let out = runProc("/usr/sbin/system_profiler", ["SPAirPortDataType", "-json"], timeout: Configuration.monitoring.profilerTimeout),
-          let data = out.data(using: .utf8),
-          let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-          let arr = json["SPAirPortDataType"] as? [[String: Any]], let root = arr.first,
-          let ifaces = root["spairport_airport_interfaces"] as? [[String: Any]] else { return nil }
-    for i in ifaces where (i["_name"] as? String) == iface {
-        if let net = i["spairport_current_network_information"] as? [String: Any], let n = net["_name"] as? String,
-           !isRedactedSSID(n) { return n }
-    }
-    return nil
-}
-
 /// CoreWLAN is touchy off-main; hop to main briefly for CW* reads only.
 func wifiDetails(iface: String) -> (ssid: String?, bssid: String?, rssi: Int?, noise: Int?, txRate: Double?, channel: Int?) {
     var result: (String?, String?, Int?, Int?, Double?, Int?) = (nil, nil, nil, nil, nil, nil)
@@ -155,7 +125,8 @@ func resolveIdentity() -> Identity {
     }()
     if let wif = wifiIf {
         let w = wifiDetails(iface: wif)
-        let ssid = w.ssid ?? ssidIpconfig(wif) ?? ssidProfiler(wif)
+        // Read current connection metadata only; system_profiler can trigger Wi-Fi scans.
+        let ssid = w.ssid ?? ssidIpconfig(wif)
         if let ssid { network = ssid }
         else { network = type == NetType.wifi ? PortName.wifi : PortName.vpn }
         bssid = w.bssid
@@ -169,7 +140,7 @@ func resolveIdentity() -> Identity {
                     localRouter: resolveLocalRouter(preferred: iface, ports: ports))
 }
 
-// TCC-free identity for --sample: steps 4b→4d only
+// Identity for --sample without CoreWLAN or Location authorization requests.
 func resolveIdentitySample() -> Identity {
     let (iface, router) = parseRoute()
     guard let iface else {
@@ -185,7 +156,6 @@ func resolveIdentitySample() -> Identity {
     let wifiIf: String? = type == NetType.wifi ? iface : (type == NetType.vpn ? ports.first(where: { $0.value == PortName.wifi || $0.value == PortName.airPort })?.key : nil)
     if let wif = wifiIf {
         if let s = ssidIpconfig(wif) { network = s }
-        else if let s = ssidProfiler(wif) { network = s }
         else { network = type == NetType.vpn ? PortName.vpn : PortName.wifi }
     }
     return Identity(iface: iface, type: type, network: network, bssid: nil, router: router, rssi: nil, noise: nil, txRate: nil, channel: nil)

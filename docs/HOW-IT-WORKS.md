@@ -89,6 +89,8 @@ A warning beside the menu-bar quality percentage appears immediately for a misse
 
 ## Wi-Fi scan warnings
 
+Network-name discovery reads current connection metadata through CoreWLAN and `ipconfig getsummary` (only `ipconfig` for `--sample`). It does not run `system_profiler SPAirPortDataType`, which can trigger Wi-Fi scans. When the name is unavailable, NetMenu shows “Wi-Fi” or “VPN” instead.
+
 The **Wi-Fi scans** warning correlates slow router pings with scans requested by the Wi-Fi page in System Settings. It requires at least two ICMP router replies over 40ms that overlap completed scans from at least two distinct Settings requests within the last 45 seconds. Only valid router RTTs up to one second are retained. Merely having System Settings open is not evidence, and DNS/TCP/DHCP fallback timings do not trigger detection.
 
 After repeated slow pings, NetMenu queries the last minute of `airportd` unified-log events off the main thread, at most once every 20 seconds, with a five-second timeout. It only queries while System Settings is running and the current connection is classified as `wifi`; a connection classified as `vpn` does not enable this detector even if Wi-Fi carries the VPN. Restricted logs or an unsupported log format can prevent detection.

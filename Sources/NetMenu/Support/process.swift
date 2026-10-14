@@ -69,7 +69,7 @@ func runProcess(_ path: String, _ args: [String], timeout: TimeInterval = Config
         let box = Box()
         let group = DispatchGroup()
         group.enter()
-        // userInitiated — don't starve behind identity/system_profiler work on utility.
+        // userInitiated — don't starve behind network identity work on utility.
         DispatchQueue.global(qos: .userInitiated).async {
             let d = drainAndClose(outPipe)
             box.lock.lock(); box.data.append(d); box.lock.unlock()

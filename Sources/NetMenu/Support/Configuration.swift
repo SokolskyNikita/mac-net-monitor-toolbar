@@ -105,12 +105,8 @@ struct MonitoringConfig {
 
     /// Maximum cache age for interface-to-hardware-port names; unknown interfaces refresh sooner.
     var portsCacheLifetime: TimeInterval = 300
-    /// Backoff after system_profiler fails to provide usable Wi-Fi identity.
-    var profilerRetryInterval: TimeInterval = 600
     /// Process deadline for reading an interface summary with ipconfig.
     var ipconfigTimeout: TimeInterval = 5
-    /// Process deadline for reading Wi-Fi identity with system_profiler.
-    var profilerTimeout: TimeInterval = 12
 
     /// Shortest logged scan accepted as useful scan evidence.
     var wifiScanMinDuration: TimeInterval = 0.05
