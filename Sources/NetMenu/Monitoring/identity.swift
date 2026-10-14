@@ -6,8 +6,9 @@ private let ssidRe = try? NSRegularExpression(pattern: #"^\s*SSID : (.+)$"#, opt
 struct Identity: Equatable {
     var iface: String?; var type: String; var network: String?; var bssid: String?
     var router: String?; var rssi: Int?; var noise: Int?; var txRate: Double?; var channel: Int?
+    var localRouter: LocalRouter? = nil
     func sameNetwork(as x: Identity) -> Bool {
-        guard iface == x.iface && type == x.type && router == x.router else { return false }
+        guard iface == x.iface && type == x.type && router == x.router, localRouter == x.localRouter else { return false }
         if network == x.network && bssid == x.bssid { return true }
         // Learning the name of the same link (Location access resolving after launch) is not a change.
         return isUnnamedWiFi || x.isUnnamedWiFi
@@ -157,7 +158,8 @@ func resolveIdentity() -> Identity {
     } else if type == NetType.wifi {
         network = PortName.wifi
     }
-    return Identity(iface: iface, type: type, network: network, bssid: bssid, router: router, rssi: rssi, noise: noise, txRate: txRate, channel: channel)
+    return Identity(iface: iface, type: type, network: network, bssid: bssid, router: router, rssi: rssi, noise: noise, txRate: txRate, channel: channel,
+                    localRouter: resolveLocalRouter(preferred: iface, ports: ports))
 }
 
 // TCC-free identity for --sample: steps 4b→4d only

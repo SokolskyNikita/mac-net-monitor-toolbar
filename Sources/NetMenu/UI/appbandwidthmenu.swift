@@ -13,15 +13,14 @@ struct TopBandwidthApps {
             $0.downBytes.isFinite && $0.upBytes.isFinite && $0.downBytes >= 0 && $0.upBytes >= 0
                 && $0.downBytes + $0.upBytes > 0
         }
-        // Group by the full display name before ranking or truncating. Different PIDs,
-        // executable paths, or fallback identities can all represent the same name (curl).
+        // Aggregate by resolved caller identity before ranking. Display aliases never merge apps.
         var grouped: [String: AppBandwidthUsage] = [:]
         for app in valid {
             let name = Self.cleanName(app.name)
-            let key = name.lowercased()
+            let key = app.id
             let previous = grouped[key]
             grouped[key] = AppBandwidthUsage(
-                id: "name:\(key)", name: previous.map { min($0.name, name) } ?? name,
+                id: key, name: previous.map { min($0.name, name) } ?? name,
                 downBytes: (previous?.downBytes ?? 0) + app.downBytes,
                 upBytes: (previous?.upBytes ?? 0) + app.upBytes)
         }
@@ -35,13 +34,18 @@ struct TopBandwidthApps {
         // unattributed physical bytes in the denominator, and never report over 100%.
         let attributed = ranked.reduce(0) { $0 + $1.downBytes + $1.upBytes }
         totalBytes = max(snapshot.totalBytes.isFinite ? snapshot.totalBytes : 0, attributed)
-        var selected: [AppBandwidthUsage] = [], covered = 0.0
-        for app in ranked.prefix(Self.maxApps) {
+        apps = Self.coveringPrefix(ranked, total: totalBytes) { $0.downBytes + $0.upBytes }
+    }
+
+    /// Shared coverage policy for traffic and connection consumers.
+    static func coveringPrefix<T>(_ ranked: [T], total: Double, weight: (T) -> Double) -> [T] {
+        var selected: [T] = [], covered = 0.0
+        for app in ranked.prefix(maxApps) {
             selected.append(app)
-            covered += app.downBytes + app.upBytes
-            if covered >= totalBytes * Self.targetShare { break }
+            covered += weight(app)
+            if covered >= total * targetShare { break }
         }
-        apps = selected
+        return selected
     }
 
     var share: Double {

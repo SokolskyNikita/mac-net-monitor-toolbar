@@ -3,6 +3,11 @@ import Testing
 @testable import NetMenu
 
 private final class BandwidthLoggingApp: AppDelegate {
+    override init() {
+        super.init()
+        hasResolvedIdentity = true
+        speedTestRunning = true // These counter tests must not launch real network probes.
+    }
     var lines: [String] = []
     var displayedRates: [BandwidthRates] = []
 
@@ -40,6 +45,9 @@ private final class BandwidthLoggingApp: AppDelegate {
         #expect(beforeGap["up_peak_Bps"] as? Double == 90)
         #expect(beforeGap["lat_ms"] as? Double == 15)
         #expect(beforeGap["loss"] as? Double == 0.1)
+        #expect(beforeGap["health_weighting"] as? String == "inverse_sqrt_age")
+        #expect(beforeGap["reconnects_5m"] as? Int == 0)
+        #expect(beforeGap["health_raw"] is NSNull)
         #expect(app.winLats.isEmpty)
         #expect(app.winTotal == 0)
         #expect(app.winStart == 20)

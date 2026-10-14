@@ -52,6 +52,8 @@ struct WanProbe {
     var internetChecks: [String: Bool]
     /// Per-probe detail for the diagnostic log.
     var details: [String] = []
+    var gatewayOutcome: Latency.PingOutcome = .unmeasured("no router")
+    var gatewayMethod: LocalProbeMethod = .icmp
 
     var internetReachable: Bool { internetChecks.values.contains(true) }
 
@@ -76,7 +78,13 @@ struct WanProbe {
 
     var logLine: String {
         var parts = details
+        parts.append("gateway_method=\(gatewayMethod.rawValue)")
         parts.append("gw=" + (gatewayMs.map { String(format: "%.1fms", $0) } ?? "-"))
+        switch gatewayOutcome {
+        case .reply: break
+        case .lost: parts.append("gateway=lost")
+        case .unmeasured(let why): parts.append("gateway=unmeasured(\(why))")
+        }
         parts.append("captive=\(captive)")
         parts.append("published=" + (ms.map { String(format: "%.1fms/%@", $0, source?.rawValue ?? "?") } ?? "none"))
         parts.append("internet=\(internet.rawValue)")
@@ -119,12 +127,16 @@ enum Latency {
 
     /// Pass `gateway: nil` to skip the gateway ping (e.g. in `--sample`, which avoids Local Network TCC).
     /// With `checkWebsites: false` the cycle reports `internet == .unknown` and an unknown portal.
-    static func measure(gateway: String?, checkWebsites: Bool = true) -> WanProbe {
-        let found = runParallelProbes(gateway: gateway, checkWebsites: checkWebsites)
-        var probe = decide(echoes: found.echoes, unmeasured: found.unmeasured, gatewayMs: found.gatewayMs,
+    static func measure(gateway: String?, checkWebsites: Bool = true,
+                        localProbe: (() -> LocalProbeResult)? = nil) -> WanProbe {
+        let found = runParallelProbes(gateway: gateway, checkWebsites: checkWebsites, localProbe: localProbe)
+        var probe = decide(echoes: found.echoes, unmeasured: found.unmeasured, gatewayMs: found.gatewayMethod == .icmp ? found.gatewayMs : nil,
                            portal: found.portal, internetChecks: found.internetChecks,
                            httpFallback: httpProbe)
         probe.details = found.details
+        probe.gatewayOutcome = found.gatewayOutcome
+        probe.gatewayMethod = found.gatewayMethod
+        probe.gatewayMs = found.gatewayMs
         return probe
     }
 
@@ -165,17 +177,20 @@ enum Latency {
         var echoes: [EchoReply?]
         var unmeasured: Set<Int>
         var gatewayMs: Double?
+        var gatewayOutcome: PingOutcome
+        var gatewayMethod: LocalProbeMethod
         var portal: Captive
         var internetChecks: [String: Bool]
         var details: [String]
     }
 
-    private static func runParallelProbes(gateway: String?, checkWebsites: Bool) -> ParallelResult {
+    private static func runParallelProbes(gateway: String?, checkWebsites: Bool,
+                                          localProbe: (() -> LocalProbeResult)?) -> ParallelResult {
         let group = DispatchGroup()
         // Indexed by target so connection health can track each host's loss separately. A probe
         // still running at `cycleWait` stays .unmeasured: it was cut off, not answered or lost.
         let echoes = Locked<[PingOutcome]>(Array(repeating: .unmeasured("cut off"), count: icmpTargets.count))
-        let gatewayMs = Locked<Double?>(nil)
+        let gatewayResult = Locked(LocalProbeResult(method: .icmp, outcome: .unmeasured(gateway == nil ? "no router" : "cut off")))
         let portal = Locked(Captive.unknown)
         let checks = Locked<[InternetSite: InternetCheck]>([:])
 
@@ -184,7 +199,7 @@ enum Latency {
             DispatchQueue.global(qos: .userInitiated).async { autoreleasepool { work() }; group.leave() }
         }
         if let gateway {
-            run { if case .reply(let r) = ping(gateway, timeoutMs: gatewayTimeoutMs) { gatewayMs.set(r.ms) } }
+            run { gatewayResult.set(localProbe?() ?? LocalProbeResult(method: .icmp, outcome: ping(gateway, timeoutMs: gatewayTimeoutMs))) }
         }
         for (i, host) in icmpTargets.enumerated() {
             run { let r = ping(host, timeoutMs: icmpTimeoutMs); echoes.mutate { $0[i] = r } }
@@ -198,7 +213,11 @@ enum Latency {
 
         _ = group.wait(timeout: .now() + cycleWait)
         let pings = echoes.value, sites = checks.value
-        var result = ParallelResult(echoes: [], unmeasured: [], gatewayMs: gatewayMs.value,
+        let local = gatewayResult.value
+        let gateway = local.outcome
+        var gatewayMs: Double?
+        if case .reply(let r) = gateway { gatewayMs = r.ms }
+        var result = ParallelResult(echoes: [], unmeasured: [], gatewayMs: gatewayMs, gatewayOutcome: gateway, gatewayMethod: local.method,
                                     portal: portal.value, internetChecks: [:], details: [])
         for (i, outcome) in pings.enumerated() {
             switch outcome {
@@ -346,6 +365,7 @@ enum Latency {
 
     /// One ICMP echo, sent in-process (see icmp.swift); `/sbin/ping` only if ICMP sockets are unavailable.
     static func ping(_ host: String, timeoutMs: Int) -> PingOutcome {
+        if host.contains(":") { return IPv6Pinger.ping(host, timeoutMs: timeoutMs) }
         // A name that does not resolve is a DNS problem, not packet loss.
         guard let address = resolveIPv4(host) else { return .unmeasured("unresolved") }
         switch ICMPPinger.shared.ping(address, timeoutMs: timeoutMs) {

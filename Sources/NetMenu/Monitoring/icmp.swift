@@ -243,7 +243,7 @@ final class ICMPPinger: @unchecked Sendable {
                          payload: Array(icmp[(i + 8)...]))
     }
 
-    private static func timestamp(control: [UInt8], length: Int) -> timeval? {
+    static func timestamp(control: [UInt8], length: Int) -> timeval? {
         let headerSize = MemoryLayout<cmsghdr>.size
         var offset = 0
         while offset + headerSize <= min(length, control.count) {

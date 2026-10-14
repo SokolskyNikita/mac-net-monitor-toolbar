@@ -48,7 +48,7 @@ macOS may also ask for two optional permissions:
 | Permission | Used only for | If denied |
 | --- | --- | --- |
 | Location | Reading the Wi‑Fi network name | Network name is missing from the stats log |
-| Local Network | Pinging your router | Router latency is missing from the stats log |
+| Local Network | Checking your router’s health and latency | Local health and router latency may be unavailable |
 
 ## What you see
 
@@ -60,11 +60,14 @@ The menu bar shows **latency** and **connection health**, for example `9ms │ 1
 | `~180ms` | Ping is blocked on this network, so this is the time to load a small web page instead. |
 | `✕` | Nothing trustworthy got through for a minute. |
 
-**Connection health** is a score for the last minute. A connection good enough for an HD video call (latency up to 150ms, jitter up to 40ms, packet loss up to 2%) scores 100%. Worse loss, jitter or latency pulls it down, and one bad factor is enough. A spinner shows for the first few seconds while it calibrates. If websites stop loading, health drops to **0%** and the menu says **internet sites unreachable**, even if ping still works.
+**Connection health** is a score for the last minute, with newer measurements weighted more heavily (`1 / sqrt(age in seconds)`, capped at 1 for the newest second). A connection good enough for an HD video call (latency up to 150ms, jitter up to 40ms, packet loss up to 2%) scores 100%. Worse loss, jitter or latency pulls it down, and one bad factor is enough. A spinner shows for the first few seconds while it calibrates. If websites stop loading, health drops to **0%** and the menu says **internet sites unreachable**, even if ping still works.
 
 The menu adds:
 
 - **Connection health** with its loss, jitter and latency
+- A brief menu-bar warning for recent loss, latency spikes, jitter or web-access failures
+- **N reconnects in past 5 mins**, shown after at least three completed reconnects
+- **Local health** to your router, with the same score and packet loss, plus jitter and latency rounded to the nearest millisecond. Supports IPv4 and IPv6 routers behind a VPN. If ping fails, it can use direct DNS, TCP or IPv4 DHCP INFORM replies instead. The row names the protocol; a router that answers none shows unavailable.
 - **Throughput**: current download and upload rate, averaged over 5 seconds. Turn on **Show throughput in menu bar** to show it next to health too.
 - **Top apps**: the apps using the most bandwidth over the last 10 seconds, up to three, with their share of all traffic, such as `Top apps (~81%): Firefox`
 - **Peak this connection**: the highest rates since you joined this network. It resets when you switch networks or access points.
@@ -74,7 +77,7 @@ For exactly how each number is measured, see [How NetMenu works](docs/HOW-IT-WOR
 
 ## Speed test
 
-Choose **Run speed test** in the menu, and **Cancel speed test** to stop it. It tests download and upload against Cloudflare and takes from about 5 seconds on fast connections to about 30 on slow ones. The result looks like **Last test: 268↓ / 41↑ Mbps · 9ms, 38ms loaded**: download and upload speed, latency when idle, and latency while the connection is busy. A big jump under load means a busy connection will make calls and games lag.
+Click **Run speed test** in the menu, and **Cancel speed test** to stop it. Clicking either keeps the menu open so you can watch progress and see the result; click outside or press Escape to dismiss it. The result row is hidden until a test starts; completed results stay visible for five minutes. It tests download and upload against Cloudflare and takes from about 5 seconds on fast connections to about 30 on slow ones. The result looks like **Last test: 268↓ / 41↑ Mbps · 9ms, 38ms loaded**: download and upload speed, latency when idle, and latency while the connection is busy. A big jump under load means a busy connection will make calls and games lag.
 
 It uses as little data as it can:
 
@@ -88,8 +91,8 @@ A result with `≥`, such as **≥480↓**, means the connection was still speed
 
 ## Your data
 
-- **Stats history.** Once a minute NetMenu records latency, health, throughput and Wi‑Fi details to a file on your Mac, plus every speed test. Open it with **Reveal stats file**. It's capped at 100 MB.
-- **Diagnostic log.** A detailed log for troubleshooting, capped at 30 MB (about three days). Open it with **Reveal diagnostic log**. If NetMenu shows something that doesn't look right, this log has the details to explain it.
+- **Stats history.** Once a minute NetMenu records latency, health, throughput and Wi‑Fi details to a file on your Mac, plus every speed test. Open it with **Diagnostics → Open stats file**. It's capped at 100 MB.
+- **Diagnostic log.** A detailed log for troubleshooting, capped at 30 MB (about three days). Open it with **Diagnostics → Open diagnostic log**. If NetMenu shows something that doesn't look right, this log has the details to explain it.
 
 Both stay on your Mac. Formats are described in [Logs](docs/LOGS.md).
 

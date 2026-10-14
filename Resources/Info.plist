@@ -19,9 +19,9 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.4.1</string>
+	<string>1.5.0</string>
 	<key>CFBundleVersion</key>
-	<string>11</string>
+	<string>12</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.utilities</string>
 	<key>LSMinimumSystemVersion</key>
@@ -31,7 +31,7 @@
 	<key>NSHumanReadableCopyright</key>
 	<string>Copyright © 2026 Nikita Sokolsky</string>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>Pings your router to separate Wi-Fi latency from internet latency.</string>
+	<string>Checks your router to measure local network health separately from internet health.</string>
 	<key>NSLocationUsageDescription</key>
 	<string>Reads the current Wi-Fi network name and access point (SSID/BSSID) to tag network statistics.</string>
 </dict>

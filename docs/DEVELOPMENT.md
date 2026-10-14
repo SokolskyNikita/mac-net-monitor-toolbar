@@ -22,7 +22,7 @@ make run
 
 ## Command-line modes
 
-The app binary has two modes that run without the menu bar UI:
+The app binary has four modes that run without the menu bar UI:
 
 ```bash
 NetMenu.app/Contents/MacOS/NetMenu --sample
@@ -35,6 +35,18 @@ NetMenu.app/Contents/MacOS/NetMenu --speedtest
 ```
 
 Runs the same speed test as the menu and prints progress and the full result. Add `--low-data` to use the 8 MB budget.
+
+```bash
+NetMenu.app/Contents/MacOS/NetMenu --local-sample
+```
+
+Discovers the physical IPv4 or IPv6 router, including behind a VPN, and prints twenty local probes at three-second intervals plus their health score, loss, jitter and median latency. Uses the same protocol fallback selection as the menu and names the active protocol. Requires Local Network access. Discards the result if the router changed during the run.
+
+```bash
+NetMenu.app/Contents/MacOS/NetMenu --local-probe
+```
+
+Tries ICMP, nonrecursive DNS, TCP 443/80 and IPv4 DHCP INFORM once each against the physical router. Prints response times, timeouts, and unavailable reasons. No lease is renewed or configuration applied. This diagnostic intentionally checks all protocols even if ICMP works; normal monitoring stops at the selected protocol.
 
 ## Project layout
 
@@ -62,6 +74,8 @@ The Makefile and Swift package pick up any Swift file under `Sources/NetMenu/` a
 - Speed test engine tests run against a simulated link in real time
 
 No test needs internet access or uses mobile data.
+
+If a newer Command Line Tools release reports missing `TestingMacros` with the default Swift Build engine, run `make test SWIFT_TEST_FLAGS="--build-system native"`. The tests need local socket and process access; run them outside a restrictive sandbox.
 
 ## Code signing
 

@@ -172,7 +172,7 @@ final class Diagnostics: @unchecked Sendable {
     enum Counter: String, CaseIterable {
         case launchFailure = "launch_failures"
         case processTimeout = "proc_timeouts"
-        case probeCycles = "cycles"
+        case probeCycles = "wan_results"
         case discardedCycles = "discarded_cycles"
         case throttledLogLines = "suppressed_log_lines"
     }

@@ -1,4 +1,5 @@
 SWIFT_FLAGS ?= -O
+SWIFT_TEST_FLAGS ?=
 SIGN_ID ?= -
 MIN_OS ?= 14.0
 ARCHS ?= arm64 x86_64
@@ -40,7 +41,7 @@ check: build/NetMenu
 	tail -n 1 /tmp/netmenu_check.txt | /usr/bin/env python3 -m json.tool > /dev/null
 
 test:
-	swift test $(TEST_FLAGS)
+	swift test $(SWIFT_TEST_FLAGS) $(TEST_FLAGS)
 
 $(ICON): scripts/generate-icon.swift
 	swift scripts/generate-icon.swift

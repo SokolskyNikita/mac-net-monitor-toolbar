@@ -29,6 +29,44 @@ if CommandLine.arguments.contains("--sample") {
     exit(0)
 }
 
+if CommandLine.arguments.contains("--local-sample") || CommandLine.arguments.contains("--local-probe") {
+    func router() -> LocalRouter? {
+        resolveLocalRouter(preferred: parseRoute().iface, ports: hardwarePorts())
+    }
+    guard let target = router() else {
+        print("Local health: unavailable (no local router)"); exit(1)
+    }
+    if CommandLine.arguments.contains("--local-probe") {
+        print("Router: \(target.address) on \(target.interface)")
+        for method in LocalProbeMethod.allCases {
+            switch LocalProtocols.probe(method, target) {
+            case .reply(let r): print(String(format: "%@: %.2fms", method.label, r.ms))
+            case .lost: print("\(method.label): no reply")
+            case .unmeasured(let why): print("\(method.label): unavailable (\(why))")
+            }
+        }
+        exit(0)
+    }
+    let session = LocalProbeSession()
+    print("Router: \(target.address) on \(target.interface); 20 probes, 3 seconds apart")
+    var tracker = LocalHealthTracker()
+    for i in 0..<20 {
+        let start = HealthTracker.now()
+        let result = session.measure(target)
+        tracker.record(result.outcome, method: result.method)
+        print("method: \(result.method.label)")
+        switch result.outcome {
+        case .reply(let reply): print(String(format: "probe %d: %.2fms", i + 1, reply.ms))
+        case .lost: print("probe \(i + 1): no reply")
+        case .unmeasured(let why): print("probe \(i + 1): unavailable (\(why))")
+        }
+        if i < 19 { Thread.sleep(forTimeInterval: max(0, probeInterval - (HealthTracker.now() - start))) }
+    }
+    guard router() == target else { print("Local network changed; result discarded"); exit(1) }
+    print(tracker.menuTitle(router: target.address, report: tracker.report()))
+    exit(0)
+}
+
 if CommandLine.arguments.contains("--speedtest") {
     // Same engine as the menu, without the UI. `--low-data` uses the smaller budget.
     let config = CommandLine.arguments.contains("--low-data") ? SpeedTestConfig.lowData : SpeedTestConfig.standard

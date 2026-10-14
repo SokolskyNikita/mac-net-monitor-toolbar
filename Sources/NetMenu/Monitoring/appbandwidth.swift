@@ -15,6 +15,7 @@ struct AppBandwidthSnapshot: Equatable {
     let apps: [AppBandwidthUsage]
     let totalBytes: Double
     let seconds: TimeInterval
+    var connections: ConnectionCounts? = nil
 }
 
 struct NetTopProcessCounters: Equatable {
@@ -45,11 +46,13 @@ enum AppBandwidthParser {
             let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
             return trimmed.isEmpty ? nil : trimmed
         }
+        let header = output.components(separatedBy: .newlines).first { $0.hasPrefix(",interface,state,") }
+        let columns = header.map { Array($0.components(separatedBy: ",").dropFirst().dropLast()) } ?? ["bytes_in", "bytes_out"]
         var rows: [NetTopProcessCounters] = []
         for line in intervalLines {
             // A process can disappear between nettop's sample and PID attribution, and some
             // process labels cannot be resolved to a PID. Keep the rows we can attribute.
-            if let row = parseRow(line) { rows.append(row) }
+            if let row = parseRow(line, columns: columns) { rows.append(row) }
         }
         // Header-only interval blocks are valid idle samples. A non-empty interval that has no
         // parseable process rows is malformed, so callers can expose unavailable exceptionally.
@@ -63,24 +66,24 @@ enum AppBandwidthParser {
                 .trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
                 .lowercased()
         }
-        guard let bytesIn = columns.firstIndex(of: "bytes_in"),
-              bytesIn + 1 < columns.count else { return false }
-        return columns[bytesIn + 1] == "bytes_out"
+        return columns.contains("bytes_in") && columns.contains("bytes_out")
     }
 
-    private static func parseRow(_ line: String) -> NetTopProcessCounters? {
+    private static func parseRow(_ line: String, columns: [String]) -> NetTopProcessCounters? {
+        guard !["tcp4 ", "tcp6 ", "udp4 ", "udp6 "].contains(where: line.hasPrefix) else { return nil }
         var fields = line.split(separator: ",", omittingEmptySubsequences: false)
         // nettop emits a trailing delimiter after each data row.
         if fields.last?.isEmpty == true { fields.removeLast() }
-        guard fields.count >= 3,
-              let bytesIn = UInt64(fields[fields.count - 2].trimmingCharacters(in: .whitespaces)),
-              let bytesOut = UInt64(fields[fields.count - 1].trimmingCharacters(in: .whitespaces)) else {
-            return nil
-        }
+        guard fields.count >= columns.count + 1,
+              let inIndex = columns.firstIndex(of: "bytes_in"),
+              let outIndex = columns.firstIndex(of: "bytes_out") else { return nil }
+        let values = Array(fields.suffix(columns.count))
+        guard let bytesIn = UInt64(values[inIndex].trimmingCharacters(in: .whitespaces)),
+              let bytesOut = UInt64(values[outIndex].trimmingCharacters(in: .whitespaces)) else { return nil }
 
         // Rejoin everything before the numeric tail so process names containing commas remain
         // intact. nettop appends the pid after the final dot in that process label.
-        var label = fields.dropLast(2).joined(separator: ",").trimmingCharacters(in: .whitespaces)
+        var label = fields.dropLast(columns.count).joined(separator: ",").trimmingCharacters(in: .whitespaces)
         if label.count >= 2, label.first == "\"", label.last == "\"" {
             label.removeFirst(); label.removeLast()
             label = label.replacingOccurrences(of: "\"\"", with: "\"")
@@ -123,7 +126,8 @@ enum AppBandwidthProcessGrouper {
                     id: "app:\(bundlePath)",
                     // A helper may have a localizedName such as "Codex (Service)". The owning
                     // outer bundle's own metadata or directory name is the stable display name.
-                    name: bundleName ?? nonEmpty(fallbackName) ?? runningName ?? processName
+                    name: AppMenuNames.shortName(bundleID: bundle?.bundleIdentifier,
+                        fallback: bundleName ?? nonEmpty(fallbackName) ?? runningName ?? processName)
                 )
             }
 
@@ -256,30 +260,35 @@ final class AppBandwidthMonitor {
 
     private func collect(generation token: Int) -> AppBandwidthSnapshot? {
         guard isCurrent(token) else { return nil }
+        var ancestry = ProcessAncestry()
+        ancestry.capture()
         let before = readCounters()
         let beganAt = BandwidthClock.now()
-        guard let output = runNettop(generation: token), isCurrent(token),
+        guard let output = runNettop(generation: token, captureProcesses: { ancestry.capture() }), isCurrent(token),
               let rows = AppBandwidthParser.parse(output) else { return nil }
         let after = readCounters()
         guard isCurrent(token) else { return nil }
         let seconds = BandwidthClock.now() - beganAt
         guard seconds.isFinite, seconds > 0, seconds <= Self.maxSampleSeconds else { return nil }
 
-        let identities = AppBandwidthProcessGrouper.aggregate(rows) { row in
+        func resolveIdentity(_ row: NetTopProcessCounters) -> AppBandwidthProcessIdentity {
             // NetMenu's own website checks (curl) count as NetMenu, not as the user's curl.
             if HelperPIDs.shared.contains(row.pid) {
                 return AppBandwidthProcessGrouper.identity(processName: "NetMenu", pid: getpid(),
                                                            executablePath: Bundle.main.executablePath,
                                                            runningApplicationName: "NetMenu")
             }
-            let runningApplication = NSRunningApplication(processIdentifier: row.pid)
-            let path = processPath(pid: row.pid) ?? runningApplication?.bundleURL?.path
-            let appName = runningApplication?.localizedName
-            return AppBandwidthProcessGrouper.identity(processName: row.processName,
-                                                       pid: row.pid,
-                                                       executablePath: path,
-                                                       runningApplicationName: appName)
+            return ancestry.identity(processName: row.processName, pid: row.pid)
         }
+        let resolved = Dictionary(rows.map { ($0.pid, resolveIdentity($0)) }, uniquingKeysWith: { first, _ in first })
+        let identities = AppBandwidthProcessGrouper.aggregate(rows) { resolved[$0.pid]! }
+        var connections = ConnectionCounts.parse(output)
+        let connectionApps = connections?.processCounts.compactMap { pid, count in
+            resolved[pid].map { AppConnectionUsage(id: $0.id, name: $0.name, open: count,
+                received: connections?.processPackets[pid]?.received ?? 0,
+                sent: connections?.processPackets[pid]?.sent ?? 0) }
+        }.sorted { $0.name < $1.name } ?? []
+        connections?.apps = connectionApps
         let processTotal = identities.reduce(0.0) { $0 + $1.downBytes + $1.upBytes }
         var totalBytes = processTotal
         if let before, let after {
@@ -289,16 +298,17 @@ final class AppBandwidthMonitor {
             let physicalTotal = physicalDown + physicalUp
             if physicalTotal.isFinite { totalBytes = physicalTotal }
         }
-        return AppBandwidthSnapshot(apps: identities, totalBytes: totalBytes, seconds: seconds)
+        return AppBandwidthSnapshot(apps: identities, totalBytes: totalBytes, seconds: seconds,
+                                    connections: connections)
     }
 
-    private func runNettop(generation token: Int) -> String? {
+    private func runNettop(generation token: Int, captureProcesses: () -> Void) -> String? {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/nettop")
         // nettop accumulates all bytes between the baseline and the second sample. A ten-second
         // interval ranks the whole window, rather than publishing a delayed five-second reading.
-        process.arguments = ["-P", "-L", "2", "-n", "-x", "-d", "-s", String(Int(Self.sampleInterval)),
-                             "-J", "bytes_in,bytes_out", "-t", "wifi", "-t", "wired", "-c"]
+        process.arguments = ["-L", "2", "-n", "-x", "-d", "-s", String(Int(Self.sampleInterval)),
+                             "-J", "interface,state,bytes_in,bytes_out,packets_in,packets_out", "-t", "wifi", "-t", "wired", "-c"]
         let inputPipe = Pipe()
         let outputPipe = Pipe()
         let errorPipe = Pipe()
@@ -344,7 +354,12 @@ final class AppBandwidthMonitor {
 
         let startedAt = BandwidthClock.now()
         var timedOut = false
+        var lastProcessCapture = startedAt
         while process.isRunning {
+            if BandwidthClock.now() - lastProcessCapture >= 1 {
+                captureProcesses()
+                lastProcessCapture = BandwidthClock.now()
+            }
             if !isCurrent(token) {
                 requestTermination(process)
                 break
@@ -374,6 +389,7 @@ final class AppBandwidthMonitor {
             DiagLog.shared.warn("apps", "nettop exited \(process.terminationStatus)", throttleKey: "nettop-exit")
             return nil
         }
+        captureProcesses()
         output.lock.lock(); let data = output.data; output.lock.unlock()
         return String(data: data, encoding: .utf8)
     }
@@ -425,17 +441,4 @@ final class AppBandwidthMonitor {
         terminateProcess(process, grace: 1.0)
     }
 
-    private func processPath(pid: Int32) -> String? {
-        // PROC_PIDPATHINFO_MAXSIZE is a C macro that is not imported by Swift.
-        var path = [CChar](repeating: 0, count: Int(MAXPATHLEN) * 4)
-        let length = path.withUnsafeMutableBufferPointer { buffer -> Int32 in
-            guard let baseAddress = buffer.baseAddress else { return 0 }
-            return proc_pidpath(pid, baseAddress, UInt32(buffer.count))
-        }
-        guard length > 0 else { return nil }
-        return path.withUnsafeBufferPointer { buffer in
-            guard let baseAddress = buffer.baseAddress else { return nil }
-            return String(cString: baseAddress)
-        }
-    }
 }

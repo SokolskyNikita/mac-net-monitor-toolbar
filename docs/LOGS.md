@@ -4,8 +4,8 @@ NetMenu keeps two files on your Mac. Neither is sent anywhere.
 
 | File | Open with | Size limit | Purpose |
 | --- | --- | --- | --- |
-| `~/Library/Application Support/NetMenu/stats.jsonl` | **Reveal stats file** | 100 MB | Per-minute history and speed tests, as JSON |
-| `~/Library/Logs/NetMenu/NetMenu.log` | **Reveal diagnostic log** | 30 MB | Detailed troubleshooting log, as plain text |
+| `~/Library/Application Support/NetMenu/stats.jsonl` | **Diagnostics → Open stats file** | 100 MB | Per-minute history and speed tests, as JSON |
+| `~/Library/Logs/NetMenu/NetMenu.log` | **Diagnostics → Open diagnostic log** | 30 MB | Detailed troubleshooting log, as plain text |
 
 ## Stats log
 
@@ -20,8 +20,19 @@ Each per-minute entry includes:
 | `lat_ms`, `lat_min`, `lat_max` | Median, minimum and maximum latency for the minute |
 | `lat_src` | How latency was measured: `icmp` or `http` (older entries may also contain `tcp` or `tls`) |
 | `gw_ms` | Median router latency |
+| `local_router`, `local_interface` | Physical router address (IPv4 or scoped IPv6) and interface, separate from the VPN default |
+| `local_method` | Active local measurement protocol: `icmp`, `dns`, `tcp443`, `tcp80` or `dhcp`; `null` without a calibrated report |
+| `local_health`, `local_loss`, `local_jitter_ms`, `local_latency_ms` | Smoothed local health and its loss fraction, jitter and median latency; `null` without enough fresh data or if the router has never answered a supported probe |
 | `loss` | Fraction of pings that failed or were rejected, between 0 and 1. Pings that couldn't run are left out. |
 | `health` | Health score (0–100) at the end of the minute, or `null` without enough fresh data; 0 during a confirmed outage |
+| `health_raw`, `health_loss`, `health_jitter_ms`, `health_latency_ms` | Current unsmoothed health score and recency-weighted inputs; distinct from the minute's unweighted `loss` and `lat_ms` |
+| `health_internet_reachable`, `health_websites_failing` | Confirmed-outage reachability and unconfirmed website-failure flags from the current health report; `null` during calibration |
+| `connections` | Latest socket snapshot, or `null` after 15 seconds: open, receiving and sending counts; received/sent packets over `window_s`; and per-app names, open counts and packets. `ranking_basis` is `packets`. TCP includes established connections; UDP includes interface-bound sockets. Loopback is excluded. |
+| `transport_health`, `local_health_raw` | Unsmoothed WAN transport score (before the website outage override) and local-router score |
+| `health_window_s`, `health_weighting`, `health_weight_min_age_s` | Scoring definition: 60-second window, `inverse_sqrt_age`, ages clamped to at least one second |
+| `reconnects_5m` | Completed reconnects in the rolling five-minute window, including counts of zero or one hidden by the menu |
+| `recent_trouble` | Warning categories active in the last ten seconds at snapshot time; an empty array means none. This is a snapshot, not a full incident history. |
+| `internet_checks_fresh` | Whether a measured website check exists within the last 30 seconds; distinguishes stale retained results from current evidence |
 | `internet_reachable` | Whether at least one website passed in the latest website check |
 | `internet_checks` | Latest per-site results for `example.com` and `www.google.com`; a site whose check couldn't run is omitted |
 | `captive` | Whether Apple's captive check detected a login page in the latest cycle |
@@ -46,7 +57,7 @@ Each speed test, including failed and cancelled ones, adds a separate entry with
 
 `NetMenu.log` is for troubleshooting: when NetMenu shows something unexpected, it has the detail to explain it. Console.app also lists it under Log Reports. It records:
 
-- Every probe cycle: each ping target's reply time and hop count, or `lost` / `unmeasured(reason)`; each website check's result, curl error and duration; the captive check; router latency; and what was published
+- Independent probe completions: each WAN target's verdict, router protocol and outcome, website results, captive check and HTTPS fallback. Late results from an old network epoch or a speed test are discarded.
 - Every visible health change, with loss, jitter and latency
 - Network changes, Location permission changes, sleep and wake, and helper failures
 - Every speed test with its full breakdown: connections, data used, timing and errors per direction

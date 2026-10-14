@@ -8,7 +8,7 @@ import AppKit
 import CoreLocation
 import Network
 
-/// Menu-bar latency — one WAN probe cycle every `probeInterval` (wall clock).
+/// Target spacing for independently scheduled router and WAN probes.
 let probeInterval: TimeInterval = 3
 let staleAfter: TimeInterval = 60
 let identityInterval: TimeInterval = 15
@@ -41,7 +41,7 @@ func pushLatency(_ ms: Double, src: String?, into samples: inout [Double], sourc
 
 func buildSampleJSON(id: Identity, secs: Double, latMs: Double?, latMin: Double?, latMax: Double?, latSrc: String?,
                      gwMs: Double?, loss: Double, rejected: Int, down: Double, up: Double, downPeak: Double, upPeak: Double,
-                     health: Int? = nil, internetChecks: [String: Bool]? = nil, captive: Bool? = nil) -> [String: Any] {
+                     health: Int? = nil, internetChecks: [String: Bool]? = nil, captive: Bool? = nil, localHealth: HealthReport? = nil, localMethod: LocalProbeMethod? = nil) -> [String: Any] {
     func n(_ v: Double?) -> Any { v.map { $0 as Any } ?? NSNull() }
     func i(_ v: Int?) -> Any { v.map { $0 as Any } ?? NSNull() }
     func s(_ v: String?) -> Any { v.map { $0 as Any } ?? NSNull() }
@@ -49,6 +49,10 @@ func buildSampleJSON(id: Identity, secs: Double, latMs: Double?, latMin: Double?
         "ts": isoTimestamp(), "event": "sample", "secs": secs,
         "if": s(id.iface), "type": id.type, "network": s(id.network), "bssid": s(id.bssid), "router": s(id.router),
         "lat_ms": n(latMs), "lat_min": n(latMin), "lat_max": n(latMax), "lat_src": s(latSrc),
+        "local_router": s(id.localRouter?.address), "local_interface": s(id.localRouter?.interface),
+        "local_method": s(localMethod?.rawValue),
+        "local_health": i(localHealth?.score), "local_loss": n(localHealth?.loss),
+        "local_jitter_ms": n(localHealth?.jitterMs), "local_latency_ms": n(localHealth?.latencyMs),
         "gw_ms": n(gwMs), "loss": loss, "rejected": rejected, "health": i(health),
         "internet_checks": internetChecks.map { $0 as Any } ?? NSNull(),
         "internet_reachable": internetChecks.map { $0.values.contains(true) as Any } ?? NSNull(),
@@ -90,16 +94,21 @@ func jsonLine(_ obj: [String: Any]) -> String? {
 
 class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDelegate {
     var statusRenderer: StatusBarRenderer?
-    var peakItem: NSMenuItem?
-    var rateItem: NSMenuItem?
-    var topAppsItem: NSMenuItem?
+    var peakItem: MenuReadoutItem?
+    var rateItem: MenuReadoutItem?
+    var topAppsItem: MenuReadoutItem?
     let appBandwidthMonitor = AppBandwidthMonitor()
     var appBandwidthDisplay = AppBandwidthDisplay()
+    var connectionDisplay = ConnectionDisplay()
     static let showThroughputKey = "showThroughputInMenuBar"
     /// Off by default: throughput lives in the menu to keep the menu bar item narrow.
     var showThroughput = UserDefaults.standard.bool(forKey: AppDelegate.showThroughputKey)
-    var healthItem: NSMenuItem?
-    var speedItem: NSMenuItem?
+    var localHealthItem: MenuReadoutItem?
+    var localHealth = LocalHealthTracker()
+    var localHealthDisplay = HealthDisplay()
+    var healthItem: MenuReadoutItem?
+    var speedItem: MenuReadoutItem?
+    var speedResultExpiresAt: TimeInterval?
     var locationManager: CLLocationManager?
     let statsLog = StatsLog()
     let statsQ = DispatchQueue(label: "netmenu.stats", qos: .utility, autoreleaseFrequency: .workItem)
@@ -113,7 +122,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDelegate {
     var bandwidth = BandwidthTracker()
     var lastLatMs: Double?; var lastLatSrc: String?; var lastLatAt: Date?
     var recentLats: [Double] = []
-    var health = HealthTracker()
+    var health = LiveHealthTracker()
+    let liveProbes = LiveProbes()
+    var recentTrouble = RecentTrouble()
+    var reconnects = ReconnectHistory()
+    var reconnectsItem: MenuReadoutItem?
     var healthDisplay = HealthDisplay()
     var lastInternetChecks: [String: Bool]?
     /// Bumped on wake and network path changes; a probe cycle that started under an older epoch
@@ -128,17 +141,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDelegate {
     let launchedAt = BandwidthClock.now()
     var lastCycleAt: TimeInterval?
     var lastWakeAt = BandwidthClock.now()
-    var cycleCount = 0
     static let runningPIDKey = "runningPID"
     var termSource: DispatchSourceSignal?
     var lastCaptive: Bool?
+    var hasResolvedIdentity = false
     var identity = Identity(iface: nil, type: NetType.offline, network: nil, bssid: nil, router: nil, rssi: nil, noise: nil, txRate: nil, channel: nil)
     /// Snapshot for probe queue — avoids DispatchQueue.main.sync (deadlock risk).
     var identityForProbe = Identity(iface: nil, type: NetType.offline, network: nil, bssid: nil, router: nil, rssi: nil, noise: nil, txRate: nil, channel: nil)
     var winStart = BandwidthClock.now()
     var winLats: [Double] = []; var winLatSrc: String?
     var winGW: [Double] = []; var winRejected = 0; var winFailed = 0; var winTotal = 0
-    var probeQ = DispatchQueue(label: "netmenu.probe", qos: .utility, autoreleaseFrequency: .workItem)
     var idQ = DispatchQueue(label: "netmenu.id", qos: .utility, autoreleaseFrequency: .workItem)
     static let maxWinSamples = 120
     static let speedCooldown: TimeInterval = 60
@@ -170,33 +182,50 @@ class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDelegate {
         }
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusRenderer = StatusBarRenderer(statusItem: item)
-        statusRenderer?.render(lat: "✕", health: "", down: "0B", up: "0B",
-                               showThroughput: showThroughput, calibrating: false)
+        statusRenderer?.render(lat: "…", health: StatusBarRenderer.calibratingText, down: "0B", up: "0B",
+                               showThroughput: false, calibrating: true)
         let menu = NSMenu()
-        let hi = NSMenuItem(title: "Connection health: measuring…", action: nil, keyEquivalent: "")
+        let hi = MenuReadoutItem(title: "Connection health: measuring…", style: .health)
         hi.isEnabled = false; menu.addItem(hi); healthItem = hi
-        let rate = NSMenuItem(title: "Throughput: —", action: nil, keyEquivalent: "")
-        rate.isEnabled = false; menu.addItem(rate); rateItem = rate
-        let topApps = NSMenuItem(title: "Top apps: measuring…", action: nil, keyEquivalent: "")
-        topApps.isEnabled = false; menu.addItem(topApps); topAppsItem = topApps
-        let peak = NSMenuItem(title: "Peak this connection: —", action: nil, keyEquivalent: "")
-        peak.isEnabled = false; menu.addItem(peak); peakItem = peak
-        let speed = NSMenuItem(title: "No speed test run yet", action: nil, keyEquivalent: "")
-        speed.isEnabled = false; menu.addItem(speed); speedItem = speed
-        let st = NSMenuItem(title: speedActionTitle(), action: #selector(runSpeedTest), keyEquivalent: "")
-        st.target = self; menu.addItem(st); speedActionItem = st
-        let rev = NSMenuItem(title: "Reveal stats file", action: #selector(revealStats), keyEquivalent: "")
-        rev.target = self; menu.addItem(rev)
-        let diag = NSMenuItem(title: "Reveal diagnostic log", action: #selector(revealDiagnosticLog), keyEquivalent: "")
-        diag.target = self; menu.addItem(diag)
+        func diagnosticRow(_ title: String) -> MenuReadoutItem {
+            let row = MenuReadoutItem(title: title, style: .compact)
+            row.isEnabled = false; row.isHidden = true; menu.addItem(row)
+            return row
+        }
+        reconnectsItem = diagnosticRow("0 reconnects in past 5 mins")
+        let local = MenuReadoutItem(title: "Local health: measuring…", style: .local)
+        local.isEnabled = false; menu.addItem(local); localHealthItem = local
         menu.addItem(.separator())
+        let rate = MenuReadoutItem(title: "Throughput: —", style: .compact)
+        rate.isEnabled = false; menu.addItem(rate); rateItem = rate
+        let topApps = MenuReadoutItem(title: "Top apps: measuring…", style: .compact)
+        topApps.isEnabled = false; menu.addItem(topApps); topAppsItem = topApps
+        let peak = MenuReadoutItem(title: "Peak this connection: —", style: .compact)
+        peak.isEnabled = false; menu.addItem(peak); peakItem = peak
+        menu.addItem(.separator())
+        let speed = MenuReadoutItem(title: "", style: .result)
+        speed.isEnabled = false; speed.isHidden = true; menu.addItem(speed); speedItem = speed
+        let st = KeepOpenMenuItem(title: speedActionTitle(), action: #selector(runSpeedTest), keyEquivalent: "")
+        st.target = self; st.isEnabled = false; menu.addItem(st); speedActionItem = st
+        st.toolTip = speedBudgetDescription()
+        menu.addItem(.separator())
+        let diagnostics = NSMenuItem(title: "Diagnostics", action: nil, keyEquivalent: "")
+        let diagnosticsMenu = NSMenu()
+        let rev = NSMenuItem(title: "Open stats file", action: #selector(revealStats), keyEquivalent: "")
+        rev.target = self; diagnosticsMenu.addItem(rev)
+        let diag = NSMenuItem(title: "Open diagnostic log", action: #selector(revealDiagnosticLog), keyEquivalent: "")
+        diag.target = self; diagnosticsMenu.addItem(diag)
+        diagnostics.submenu = diagnosticsMenu; menu.addItem(diagnostics)
+        let options = NSMenuItem(title: "Options", action: nil, keyEquivalent: "")
+        let optionsMenu = NSMenu()
         let showRates = NSMenuItem(title: "Show throughput in menu bar", action: #selector(toggleThroughput(_:)),
                                    keyEquivalent: "")
-        showRates.target = self; showRates.state = showThroughput ? .on : .off; menu.addItem(showRates)
-        menu.addItem(.separator())
+        showRates.target = self; showRates.state = showThroughput ? .on : .off; optionsMenu.addItem(showRates)
         let about = NSMenuItem(title: "About NetMenu", action: #selector(showAbout), keyEquivalent: "")
-        about.target = self; menu.addItem(about)
-        menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+        about.target = self; optionsMenu.addItem(about)
+        options.submenu = optionsMenu; menu.addItem(options)
+        menu.addItem(.separator())
+        menu.addItem(NSMenuItem(title: "Quit NetMenu", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         item.menu = menu
 
         let lm = CLLocationManager()
@@ -209,13 +238,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDelegate {
 
         let counters = readCounters(); let now = BandwidthClock.now()
         bandwidth = BandwidthTracker(counters: counters, at: now); winStart = now
-        appBandwidthMonitor.start { [weak self] snapshot in
-            self?.showAppBandwidth(snapshot)
-        }
         idQ.async { [weak self] in self?.refreshIdentity() }
         let t = Timer(timeInterval: BandwidthTracker.sampleInterval, repeats: true) { [weak self] _ in self?.tick() }
         RunLoop.main.add(t, forMode: .common)
-        probeQ.async { [weak self] in self?.probeLoop() }
+        liveProbes.receive = { [weak self] epoch, event in self?.receiveProbe(epoch: epoch, event: event) }
         // Common modes: keep firing while the menu is open.
         addTimer(identityInterval) { [weak self] in self?.idQ.async { self?.refreshIdentity() } }
         addTimer(logInterval) { [weak self] in self?.flushLog() }
@@ -223,6 +249,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDelegate {
         observeSleepAndWake()
         startPathMonitor()
         watchdog.start()
+        updateTitle()
         heartbeat()
     }
 
@@ -271,12 +298,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDelegate {
         DiagLog.shared.info("heartbeat", String(format: "uptime=%.2fh", (now - launchedAt) / 3600)
             + " fds=\(ResourceUsage.openFileDescriptors().map(String.init) ?? "?")"
             + " threads=\(ResourceUsage.threadCount().map(String.init) ?? "?") footprint=\(mb)MB"
-            + " last_cycle=\(sinceCycle) ago\(cpuText) \(Diagnostics.shared.summary)"
+            + " last_probe=\(sinceCycle) ago\(cpuText) \(Diagnostics.shared.summary)"
             + " network=\(identity.network ?? "-") type=\(identity.type)")
         // The probe loop has no unbounded waits, so a long silence while awake means a bug.
         let quiet = now - max(lastCycleAt ?? launchedAt, lastWakeAt)
         if quiet > 120 {
-            DiagLog.shared.error("probe", "no completed probe cycle for \(Int(quiet))s while awake", throttleKey: "probe-stall")
+            DiagLog.shared.error("probe", "no probe results for \(Int(quiet))s while awake", throttleKey: "probe-stall")
         }
     }
 
@@ -289,6 +316,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDelegate {
             guard let self else { return }
             DiagLog.shared.info("power", "wake")
             self.lastWakeAt = BandwidthClock.now()
+            self.reconnects.wake()
             // Wi-Fi takes a few seconds to rejoin; that is not loss on the network we measure.
             self.restartHealth(reason: "wake")
             self.idQ.async { [weak self] in self?.refreshIdentity() }
@@ -309,7 +337,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDelegate {
             let summary = "\(path.status) [\(ifaces)]" + (path.isExpensive ? " expensive" : "")
                 + (path.isConstrained ? " constrained" : "")
             DispatchQueue.main.async { [weak self] in
-                guard let self, summary != self.lastPathSummary else { return }
+                guard let self else { return }
+                self.reconnects.observe(connected: path.status == .satisfied)
+                self.updateTitle()
+                guard summary != self.lastPathSummary else { return }
                 let first = self.lastPathSummary == nil
                 self.lastPathSummary = summary
                 DiagLog.shared.info("network", "path \(summary)")
@@ -317,6 +348,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDelegate {
                 self.identityLock.lock(); self.pathGeneration &+= 1; self.identityLock.unlock()
                 self.bumpEpoch()
                 self.health.settle()
+                self.localHealth.settle()
                 self.idQ.async { [weak self] in self?.refreshIdentity() }
             }
         }
@@ -348,6 +380,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDelegate {
     func restartHealth(reason: String) {
         bumpEpoch()
         health.reset(); healthDisplay.reset()
+        recentTrouble = RecentTrouble()
+        localHealth.reset(); localHealthDisplay.reset(); localHealth.settle()
         health.settle()
         lastInternetChecks = nil; lastCaptive = nil
         updateTitle()
@@ -356,7 +390,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDelegate {
     /// Publishes the smoothed score and logs every visible change.
     @discardableResult
     func publishHealth() -> Bool {
-        guard healthDisplay.publish() else { return false }
+        let localChanged = localHealthDisplay.publish()
+        if localChanged, let h = localHealthDisplay.shown {
+            DiagLog.shared.info("local-health", localHealth.menuTitle(router: identity.localRouter?.address, report: h))
+        }
+        guard healthDisplay.publish() else { return localChanged }
         if let h = healthDisplay.shown {
             DiagLog.shared.info("health", "\(h.score)% loss=\(String(format: "%.3f", h.loss))"
                 + " jitter=\(h.jitterMs.map { String(format: "%.1f", $0) } ?? "-")"
@@ -392,29 +430,58 @@ class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDelegate {
     }
 
     func refreshIdentity() {
+        let epoch = snapshotProbeContext().epoch
         let new = resolveIdentity()
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            let changed = !new.sameNetwork(as: self.identity)
-            if !changed, new.network != self.identity.network || new.bssid != self.identity.bssid {
-                DiagLog.shared.info("network", "same link now identified as network=\(new.network ?? "-") bssid=\(new.bssid ?? "-")")
+            // Discovery may take seconds (SSID permission and helper fallbacks). A path
+            // change during that work invalidates its result just like an old probe reply.
+            guard epoch == self.snapshotProbeContext().epoch else {
+                self.idQ.async { [weak self] in self?.refreshIdentity() }
+                return
             }
-            if changed {
-                DiagLog.shared.info("network", "identity iface=\(new.iface ?? "-") type=\(new.type)"
-                    + " network=\(new.network ?? "-") bssid=\(new.bssid ?? "-") router=\(new.router ?? "-")"
-                    + " rssi=\(new.rssi.map(String.init) ?? "-") channel=\(new.channel.map(String.init) ?? "-")")
-                let counters = readCounters(); let now = BandwidthClock.now()
-                self.flushLog(at: now)
-                self.peakItem?.title = "Peak this connection: —"
-                self.bandwidth.resetConnection(counters: counters, at: now)
-                self.resetAppBandwidth(at: now)
-                self.recentLats = []
-                self.lastLatMs = nil; self.lastLatSrc = nil; self.lastLatAt = nil
-                self.restartHealth(reason: "network change")
-            }
-            self.setIdentity(new)
-            if changed { self.updateTitle() }
+            self.applyIdentity(new)
         }
+    }
+
+    /// Initial discovery establishes a baseline; only subsequent changes clear measurements.
+    func applyIdentity(_ new: Identity) {
+        if !hasResolvedIdentity {
+            setIdentity(new)
+            hasResolvedIdentity = true
+            let now = BandwidthClock.now()
+            bandwidth = BandwidthTracker(counters: readCounters(), at: now)
+            winStart = now
+            health.settle(at: now); localHealth.settle(at: now)
+            startAppBandwidth()
+            speedActionItem?.isEnabled = true
+            DiagLog.shared.info("network", "initial identity iface=\(new.iface ?? "-") type=\(new.type) router=\(new.router ?? "-")")
+            updateTitle()
+            return
+        }
+        let changed = !new.sameNetwork(as: identity)
+        if !changed, new.network != identity.network || new.bssid != identity.bssid {
+            DiagLog.shared.info("network", "same link now identified as network=\(new.network ?? "-") bssid=\(new.bssid ?? "-")")
+        }
+        if changed {
+            DiagLog.shared.info("network", "identity iface=\(new.iface ?? "-") type=\(new.type)"
+                + " network=\(new.network ?? "-") bssid=\(new.bssid ?? "-") router=\(new.router ?? "-")"
+                + " rssi=\(new.rssi.map(String.init) ?? "-") channel=\(new.channel.map(String.init) ?? "-")")
+            let counters = readCounters(); let now = BandwidthClock.now()
+            flushLog(at: now)
+            peakItem?.readoutTitle = "Peak this connection: —"
+            bandwidth.resetConnection(counters: counters, at: now)
+            resetAppBandwidth(at: now)
+            recentLats = []
+            lastLatMs = nil; lastLatSrc = nil; lastLatAt = nil
+            restartHealth(reason: "network change")
+        }
+        setIdentity(new)
+        if changed { updateTitle() }
+    }
+
+    func startAppBandwidth() {
+        appBandwidthMonitor.start { [weak self] snapshot in self?.showAppBandwidth(snapshot) }
     }
 
     func resetWindow(at: TimeInterval = BandwidthClock.now()) {
@@ -431,7 +498,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDelegate {
     }
 
     func tick(counters: Counters? = readCounters(), at: TimeInterval = BandwidthClock.now()) {
-        topAppsItem?.title = appBandwidthDisplay.title(at: at)
+        updateSpeedTestRow(at: at)
+        guard hasResolvedIdentity else { return }
+        speedActionItem?.title = speedActionTitle()
+        speedActionItem?.toolTip = speedBudgetDescription()
+        liveProbes.poll(identity: identity, epoch: snapshotProbeContext().epoch, paused: speedTestRunning, now: at)
+        topAppsItem?.readoutTitle = appBandwidthDisplay.title(at: at)
+        updateTitle() // Expire recent trouble and the five-minute reconnect count even while idle.
         switch bandwidth.record(counters, at: at) {
         case .gap(let endedAt):
             resetAppBandwidth(at: at)
@@ -445,38 +518,67 @@ class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDelegate {
         case .sampled:
             break
         }
+        // Age-based weights change even between probe completions.
+        healthDisplay.add(health.report(now: at))
+        localHealthDisplay.add(localHealth.report(now: at))
         if publishHealth() { updateTitle() }
-        peakItem?.title = "Peak this connection: \(fmtRate(bandwidth.peak.down))↓ / \(fmtRate(bandwidth.peak.up))↑"
+        peakItem?.readoutTitle = "Peak this connection: \(fmtRate(bandwidth.peak.down))↓ / \(fmtRate(bandwidth.peak.up))↑"
     }
 
     func showAppBandwidth(_ snapshot: AppBandwidthSnapshot?, at: TimeInterval = BandwidthClock.now()) {
         appBandwidthDisplay.record(snapshot, at: at)
-        topAppsItem?.title = appBandwidthDisplay.title(at: at)
+        connectionDisplay.record(snapshot?.connections, at: at)
+        topAppsItem?.readoutTitle = appBandwidthDisplay.title(at: at)
     }
 
     func resetAppBandwidth(at: TimeInterval = BandwidthClock.now()) {
         appBandwidthMonitor.reset()
         appBandwidthDisplay.restart(at: at)
-        topAppsItem?.title = appBandwidthDisplay.title(at: at)
+        connectionDisplay = ConnectionDisplay()
+        topAppsItem?.readoutTitle = appBandwidthDisplay.title(at: at)
     }
 
     func updateTitle() {
+        guard hasResolvedIdentity else {
+            statusRenderer?.render(lat: "…", health: StatusBarRenderer.calibratingText,
+                                   down: "0B", up: "0B", showThroughput: false, calibrating: true)
+            healthItem?.readoutTitle = "Connection health: identifying network…"
+            localHealthItem?.readoutTitle = "Local health: identifying network…"
+            rateItem?.readoutTitle = "Throughput: waiting for network…"
+            topAppsItem?.readoutTitle = "Top apps: waiting for network…"
+            return
+        }
         let lat: String
+        let displayedLatency: Double?
         let report = health.report() == nil ? nil : healthDisplay.shown
         var calibrating = false
         if let at = lastLatAt, Date().timeIntervalSince(at) <= staleAfter,
            let m = finiteNonNeg(median(recentLats) ?? lastLatMs ?? .nan) {
+            displayedLatency = m
             let n = Int(m.rounded())
             // ~ marks a non-ICMP approximation (HTTP trace)
             lat = lastLatSrc == LatencySource.icmp.rawValue ? "\(n)ms" : "~\(n)ms"
             calibrating = report == nil
-        } else { lat = "✕" }
-        let healthText = report.map { "\($0.score)%" } ?? (calibrating ? StatusBarRenderer.calibratingText : "")
+        } else { lat = "✕"; displayedLatency = nil }
+        let recent = recentTrouble.labels()
+        let baseHealth = report.map { "\($0.score)%" } ?? (calibrating ? StatusBarRenderer.calibratingText : "")
+        let healthText = recent.isEmpty ? baseHealth : "\(baseHealth) ⚠"
+        let reconnectCount = reconnects.count()
+        reconnectsItem?.isHidden = reconnectCount < 3
+        reconnectsItem?.readoutTitle = "\(reconnectCount) reconnects in past 5 mins"
         statusRenderer?.render(lat: lat, health: healthText,
                                down: fmtRate(bandwidth.display.down), up: fmtRate(bandwidth.display.up),
                                showThroughput: showThroughput, calibrating: calibrating)
-        healthItem?.title = healthMenuTitle(report)
-        rateItem?.title = "Throughput: \(fmtRate(bandwidth.display.down))↓ / \(fmtRate(bandwidth.display.up))↑"
+        // Share the live five-round median with the menu bar, without health-report smoothing.
+        var displayedReport = report
+        displayedReport?.latencyMs = displayedLatency
+        displayedReport?.latencySources = displayedLatency == nil ? []
+            : (lastLatSrc == LatencySource.icmp.rawValue ? [.icmp] : [.http])
+        healthItem?.readoutTitle = healthMenuTitle(displayedReport)
+        localHealthItem?.readoutTitle = localHealth.menuTitle(router: identity.localRouter?.address,
+            report: localHealth.report() == nil ? nil : localHealthDisplay.shown)
+        localHealthItem?.toolTip = identity.localRouter.map { "Router: \($0.address) on \($0.interface). Same scoring thresholds as internet health." }
+        rateItem?.readoutTitle = "Throughput: \(fmtRate(bandwidth.display.down))↓ / \(fmtRate(bandwidth.display.up))↑"
     }
 
     @objc func toggleThroughput(_ sender: NSMenuItem) {
@@ -491,72 +593,81 @@ class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDelegate {
         if !h.internetReachable {
             return "Connection health: 0% (internet sites unreachable)"
         }
-        var parts = [String(format: "loss %.0f%%", h.loss * 100)]
+        var parts: [String] = []
+        let sources = [LatencySource.icmp, .http].filter { h.latencySources.contains($0) }
+            .map { $0 == .icmp ? "ICMP" : "HTTPS" }
+        if !sources.isEmpty { parts.append(sources.joined(separator: "/")) }
+        parts.append(String(format: "loss %.0f%%", h.loss * 100))
         if let j = h.jitterMs { parts.append(String(format: "jitter %.0fms", j)) }
         if let l = h.latencyMs { parts.append(String(format: "latency %.0fms", l)) }
         if h.websitesFailing { parts.append("websites failed, rechecking") }
         return "Connection health: \(h.score)% (\(parts.joined(separator: ", ")))"
     }
 
-    func probeLoop() {
-        // Probe-thread state for the website-check cadence.
-        var previous: WanProbe?
-        var lastWebsites = InternetStatus.unknown
-        var cyclesSinceWebCheck = 0
-        var lastEpoch = -1
-        while true {
-            let started = Date()
-            autoreleasepool {
-                let context = snapshotProbeContext()
-                let probeIdentity = context.identity
-                let checkWebsites = Latency.websiteCheckDue(cyclesSinceCheck: cyclesSinceWebCheck,
-                                                            lastWebsites: lastWebsites, previous: previous,
-                                                            networkChanged: context.epoch != lastEpoch)
-                let r = Latency.measure(gateway: probeIdentity.router, checkWebsites: checkWebsites)
-                previous = r; lastEpoch = context.epoch
-                if checkWebsites {
-                    cyclesSinceWebCheck = 0
-                    if r.internet != .unknown { lastWebsites = r.internet }
-                } else {
-                    cyclesSinceWebCheck += 1
-                }
-                let seconds = Date().timeIntervalSince(started)
-                Diagnostics.shared.count(.probeCycles)
-                DispatchQueue.main.async { [weak self] in
-                    guard let self else { return }
-                    self.cycleCount += 1
-                    self.lastCycleAt = BandwidthClock.now()
-                    let sameNetwork = self.snapshotProbeContext().epoch == context.epoch
-                        && self.identity.sameNetwork(as: probeIdentity)
-                    // Our own speed test saturates the link; that is not the network's normal state.
-                    let current = sameNetwork && !self.speedTestRunning
-                    let recorded = current ? self.health.record(r) : nil
-                    let discarded = sameNetwork ? "discarded(speed test)" : "discarded(network changed)"
-                    DiagLog.shared.info("probe", "cycle \(self.cycleCount) \(String(format: "%.2fs", seconds))"
-                        + " \(recorded?.rawValue ?? discarded) \(r.logLine)")
-                    guard current else { Diagnostics.shared.count(.discardedCycles); return }
-                    // Unmeasured probes are excluded from the logged loss, like from health.
-                    let measuredEchoes = r.verdicts.contains { $0 != .unmeasured }
-                    if measuredEchoes || r.ms != nil {
-                        self.winTotal += r.total; self.winRejected += r.rejected; self.winFailed += r.failed
-                    }
-                    if !r.internetChecks.isEmpty { self.lastInternetChecks = r.internetChecks }
-                    self.lastCaptive = r.captive
-                    self.healthDisplay.add(self.health.report())
-                    self.publishHealth()
-                    if let m = r.ms { self.noteLatency(m, src: r.source?.rawValue) }
-                    if let g = r.gatewayMs, let g = finiteNonNeg(g) {
-                        self.winGW.append(g)
-                        if self.winGW.count > Self.maxWinSamples {
-                            self.winGW.removeFirst(self.winGW.count - Self.maxWinSamples)
-                        }
-                    }
-                    self.updateTitle()
-                }
-            }
-            let wait = probeInterval - Date().timeIntervalSince(started)
-            if wait > 0 { Thread.sleep(forTimeInterval: wait) }
+    /// All callbacks arrive on the main thread; old-network and speed-test results are discarded.
+    func receiveProbe(epoch: Int, event: LiveProbes.Event) {
+        guard epoch == snapshotProbeContext().epoch, !speedTestRunning else {
+            Diagnostics.shared.count(.discardedCycles); return
         }
+        let now = HealthTracker.now()
+        lastCycleAt = now
+        switch event {
+        case .wan(let slot, let started, let outcome, let gatewayMs):
+            let verdict = LiveProbes.verdict(outcome, gatewayMs: gatewayMs)
+            let recorded = health.recordTarget(slot: slot, verdict: verdict, started: started, at: now)
+            recentTrouble.record(verdict, target: "wan-\(slot)", label: "network", at: now)
+            if case .wan(let ms) = verdict {
+                lastLatMs = ms; lastLatAt = Date(); lastLatSrc = LatencySource.icmp.rawValue
+                recentLats = health.latencyReadings(now: now)
+                pushLatency(ms, src: LatencySource.icmp.rawValue, into: &winLats,
+                            source: &winLatSrc, limit: Self.maxWinSamples)
+            }
+            if verdict != .unmeasured {
+                winTotal += 1
+                if verdict == .noReply { winFailed += 1 }
+                if verdict == .onPath { winRejected += 1 }
+            }
+            Diagnostics.shared.count(.probeCycles)
+            DiagLog.shared.info("probe", "target \(Latency.icmpTargets[slot]) \(outcome) verdict=\(verdict) recorded=\(recorded)")
+        case .router(let result):
+            if localHealth.method != result.method { localHealthDisplay.reset() }
+            localHealth.record(result.outcome, method: result.method)
+            localHealthDisplay.add(localHealth.report())
+            let verdict: Latency.EchoVerdict
+            switch result.outcome {
+            case .reply(let r):
+                verdict = .wan(r.ms); winGW.append(r.ms)
+                if winGW.count > Self.maxWinSamples { winGW.removeFirst() }
+            case .lost: verdict = .noReply
+            case .unmeasured: verdict = .unmeasured
+            }
+            recentTrouble.record(verdict, target: "router-\(result.method.rawValue)", label: "router", at: now)
+            DiagLog.shared.info("probe", "router \(result.method.rawValue) \(verdict)")
+        case .websites(let checks):
+            health.recordWeb(checks)
+            if !checks.isEmpty {
+                lastInternetChecks = checks
+                if !checks.values.contains(true) { recentTrouble.websitesFailed(at: now) }
+            }
+            DiagLog.shared.info("probe", "websites \(checks)")
+        case .portal(let portal):
+            health.recordPortal(portal == .portal)
+            lastCaptive = portal == .portal
+            DiagLog.shared.info("probe", "portal \(portal)")
+        case .fallback(let ms):
+            health.recordFallback(ms)
+            // A fallback that overlapped an ICMP recovery must not replace newer ping latency.
+            let freshPing = lastLatSrc == LatencySource.icmp.rawValue
+                && lastLatAt.map { Date().timeIntervalSince($0) < 10 } == true
+            if !freshPing {
+                if let ms { noteLatency(ms, src: LatencySource.http.rawValue) }
+                recentTrouble.record(ms.map { .wan($0) } ?? .noReply, target: "http", label: "network", at: now)
+            }
+            DiagLog.shared.info("probe", "fallback \(ms.map(String.init(describing:)) ?? "failed")")
+        }
+        healthDisplay.add(health.report())
+        publishHealth()
+        updateTitle()
     }
 
     func flushLog(at: TimeInterval = BandwidthClock.now(), resetAt: TimeInterval? = nil) {
@@ -566,12 +677,24 @@ class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDelegate {
         let latMs = median(winLats); let latMin = winLats.min(); let latMax = winLats.max()
         let loss = winTotal > 0 ? min(1, Double(winFailed + winRejected) / Double(winTotal)) : (winLats.isEmpty ? 1.0 : 0.0)
         let rates = bandwidth.window.average
-        let obj = buildSampleJSON(id: identity, secs: secs, latMs: latMs, latMin: latMin, latMax: latMax,
+        let snapshotAt = HealthTracker.now()
+        let report = health.report(now: snapshotAt)
+        let transport = health.transportReport(now: snapshotAt)
+        let local = localHealth.report(now: snapshotAt)
+        let webFresh = health.hasFreshWebCheck(now: snapshotAt)
+        let diagnostics = HealthStatsSnapshot(report: report, transport: transport, local: local,
+            reconnects5m: reconnects.count(now: snapshotAt),
+            recentTrouble: recentTrouble.labels(now: snapshotAt), webChecksFresh: webFresh)
+        var obj = buildSampleJSON(id: identity, secs: secs, latMs: latMs, latMin: latMin, latMax: latMax,
                                   latSrc: winLatSrc, gwMs: median(winGW), loss: winLats.isEmpty ? 1.0 : loss,
                                   rejected: winRejected, down: rates.down, up: rates.up,
                                   downPeak: bandwidth.window.peak.down, upPeak: bandwidth.window.peak.up,
-                                  health: health.report() == nil ? nil : healthDisplay.shown?.score,
-                                  internetChecks: lastInternetChecks, captive: lastCaptive)
+                                  health: report == nil ? nil : healthDisplay.shown?.score,
+                                  internetChecks: lastInternetChecks, captive: lastCaptive,
+                                  localHealth: local == nil ? nil : localHealthDisplay.shown,
+                                  localMethod: local == nil ? nil : localHealth.method)
+        obj.merge(diagnostics.json) { _, new in new }
+        obj["connections"] = connectionDisplay.fresh(at: snapshotAt)?.json as Any? ?? NSNull()
         if let line = jsonLine(obj) { appendStatsLine(line) }
     }
 
@@ -614,22 +737,33 @@ class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDelegate {
         ])
     }
 
+    func updateSpeedTestRow(at now: TimeInterval = BandwidthClock.now()) {
+        speedItem?.isHidden = !speedTestRunning && !(speedResultExpiresAt.map { now < $0 } ?? false)
+    }
+
     func speedActionTitle() -> String {
         if speedTestRunning { return "Cancel speed test" }
-        if pathIsLowData { return "Run speed test (up to \(SpeedTestConfig.lowDataBudget / 1_000_000) MB, Low Data Mode)" }
-        return "Run speed test (\(SpeedTestConfig.standardBudget / 1_000_000) MB, up to \(SpeedTestConfig.fastLinkBudget / 1_000_000) on fast links)"
+        if Date() < speedTestCooldownUntil {
+            return "Wait \(Int(ceil(speedTestCooldownUntil.timeIntervalSinceNow)))s before retesting"
+        }
+        return pathIsLowData ? "Run speed test (Low Data Mode)" : "Run speed test"
+    }
+
+    func speedBudgetDescription() -> String {
+        if pathIsLowData { return "Uses up to \(SpeedTestConfig.lowDataBudget / 1_000_000) MB in Low Data Mode." }
+        return "Uses \(SpeedTestConfig.standardBudget / 1_000_000) MB, up to \(SpeedTestConfig.fastLinkBudget / 1_000_000) MB on fast links."
     }
 
     @objc func runSpeedTest() {
+        guard hasResolvedIdentity else { return }
         if speedTestRunning {
             speedControl?.cancel()
-            speedItem?.title = "Cancelling…"
+            speedItem?.readoutTitle = "Cancelling…"
             return
         }
         let now = Date()
         if now < speedTestCooldownUntil {
-            let left = Int(ceil(speedTestCooldownUntil.timeIntervalSince(now)))
-            speedItem?.title = "Wait \(left)s before retesting"
+            speedActionItem?.title = speedActionTitle()
             return
         }
         let lowData = pathIsLowData
@@ -637,9 +771,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDelegate {
         let control = SpeedTestControl()
         speedControl = control
         speedTestRunning = true
+        speedResultExpiresAt = nil
+        updateSpeedTestRow()
         bumpEpoch()
         speedActionItem?.title = speedActionTitle()
-        speedItem?.title = "Measuring latency…"
+        speedItem?.readoutTitle = "Measuring latency…"
         let testIdentity = identity
         identityLock.lock(); let testPath = pathGeneration; identityLock.unlock()
         // Path changes are seen at once; identity changes (a new SSID or router) a poll later.
@@ -658,10 +794,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDelegate {
                 DispatchQueue.main.async { [weak self] in
                     guard let self, self.speedControl === control, !control.isCancelled else { return }
                     switch p {
-                    case .latency: self.speedItem?.title = "Measuring latency…"
+                    case .latency: self.speedItem?.readoutTitle = "Measuring latency…"
                     case .transfer(let direction, let mbps):
                         let rate = mbps.map { $0 < 10 ? String(format: " %.1f Mbps", $0) : String(format: " %.0f Mbps", $0) } ?? ""
-                        self.speedItem?.title = "Testing \(direction.rawValue)…\(rate)"
+                        self.speedItem?.readoutTitle = "Testing \(direction.rawValue)…\(rate)"
                     }
                 }
             })
@@ -678,7 +814,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDelegate {
                 let status = result.status
                 self.speedTestCooldownUntil = Date().addingTimeInterval(
                     status == "ok" ? Self.speedCooldown : status == "cancelled" ? 0 : Self.speedFailureCooldown)
-                self.speedItem?.title = result.title
+                self.speedItem?.readoutTitle = result.title
+                self.speedResultExpiresAt = BandwidthClock.now() + 300
+                self.updateSpeedTestRow()
+                self.speedActionItem?.title = self.speedActionTitle()
                 DiagLog.shared.info("speedtest", "\(status) \(result.title) | \(result.detail)")
                 func phase(_ p: SpeedPhaseResult?, _ key: String) -> [String: Any] {
                     [

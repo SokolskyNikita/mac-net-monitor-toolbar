@@ -69,7 +69,7 @@ final class StatusBarRenderer {
         let item = statusItem
         guard let button = item.button else { return }
         lastStatus = (lat, health, down, up)
-        var fields = [(lat, "999ms"), (health, "100%")]
+        var fields = [(lat, "999ms"), (health, health.contains("⚠") ? "100% ⚠" : "100%")]
         if showThroughput { fields += [(down + "↓", "999K↓"), (up + "↑", "999K↑")] }
         func width(_ s: String) -> CGFloat { (s as NSString).size(withAttributes: Self.statusAttrs).width }
         let slots = fields.map { max(width($0.0), width($0.1)) }
@@ -86,7 +86,7 @@ final class StatusBarRenderer {
                 edge += slot
                 let x = edge - width(s)
                 (s as NSString).draw(at: NSPoint(x: x, y: 2), withAttributes: Self.statusAttrs)
-                if s == Self.calibratingText {
+                if s == Self.calibratingText || s.hasPrefix(Self.calibratingText + " ") {
                     Self.drawSpinner(center: NSPoint(x: x - width("0"), y: 9), angle: angle)
                 }
                 edge += Self.statusGap

@@ -34,26 +34,25 @@ import Testing
         #expect(!result.reachedTarget)
     }
 
-    @Test func combinesSameNamesAcrossPathsAndPIDsBeforeSelectingTheTopThree() {
+    @Test func combinesOnlyMatchingCallerIdentitiesBeforeRanking() {
         let result = top([
-            AppBandwidthUsage(id: "/usr/bin/curl", name: "curl", downBytes: 10, upBytes: 5),
-            AppBandwidthUsage(id: "/opt/homebrew/bin/curl", name: "curl", downBytes: 15, upBytes: 0),
-            AppBandwidthUsage(id: "pid:123", name: " curl ", downBytes: 0, upBytes: 15),
-            app("Browser", 35), app("Other", 20),
+            AppBandwidthUsage(id: "caller:a", name: "Chrome", downBytes: 20, upBytes: 10),
+            AppBandwidthUsage(id: "caller:a", name: "Chrome", downBytes: 20, upBytes: 0),
+            AppBandwidthUsage(id: "caller:b", name: "Chrome", downBytes: 30, upBytes: 0),
+            app("Other", 20),
         ])
-        #expect(result.apps.map(\.name) == ["curl", "Browser"])
-        #expect(result.apps.first?.downBytes == 25)
-        #expect(result.apps.first?.upBytes == 20)
+        #expect(result.apps.map(\.id) == ["caller:a", "caller:b"])
+        #expect(result.apps.first?.downBytes == 40)
+        #expect(result.apps.first?.upBytes == 10)
         #expect(result.share == 0.8)
-        #expect(result.title == "Top apps (~80%): curl, Browser")
     }
 
-    @Test func groupsNamesIgnoringCaseButNotJustTheirTruncatedPrefix() {
+    @Test func sameNamesAndTruncatedPrefixesNeverMergeDifferentIdentities() {
         let result = top([app("CURL", 25), app("curl", 25),
                           app("A very long application one", 25), app("A very long application two", 25)])
         #expect(result.apps.count == 3)
-        #expect(result.apps.first?.downBytes == 50)
-        #expect(result.share == 1)
+        #expect(result.apps.first?.downBytes == 25)
+        #expect(result.share == 0.75)
     }
 
     @Test func mismatchedCountersNeverReportOverOneHundredPercent() {
@@ -92,31 +91,35 @@ import Testing
 @Suite @MainActor struct TopBandwidthAppsIntegrationTests {
     @Test func transientFailureAndConnectionResetKeepTheLastListUntilRecovery() {
         let app = AppDelegate()
-        app.topAppsItem = NSMenuItem()
+        app.hasResolvedIdentity = true
+        app.speedTestRunning = true // Exercise the display without launching network probes.
+        app.topAppsItem = MenuReadoutItem(title: "", style: .compact)
         let snapshot = AppBandwidthSnapshot(apps: [
             AppBandwidthUsage(id: "browser", name: "Browser", downBytes: 90, upBytes: 10)
         ], totalBytes: 100, seconds: 10)
         app.showAppBandwidth(snapshot, at: 0)
-        #expect(app.topAppsItem?.title == "Top apps (~100%): Browser")
+        #expect(app.topAppsItem?.readoutTitle == "Top apps (~100%): Browser")
         app.showAppBandwidth(nil, at: 6)
-        #expect(app.topAppsItem?.title == "Top apps (~100%): Browser")
+        #expect(app.topAppsItem?.readoutTitle == "Top apps (~100%): Browser")
         app.resetAppBandwidth(at: 10)
-        #expect(app.topAppsItem?.title == "Top apps (last sample) (~100%): Browser")
+        #expect(app.topAppsItem?.readoutTitle == "Top apps (last sample) (~100%): Browser")
         app.showAppBandwidth(snapshot, at: 15)
-        #expect(app.topAppsItem?.title == "Top apps (last sample) (~100%): Browser")
+        #expect(app.topAppsItem?.readoutTitle == "Top apps (last sample) (~100%): Browser")
         app.tick(counters: nil, at: 20)
-        #expect(app.topAppsItem?.title == "Top apps (~100%): Browser")
+        #expect(app.topAppsItem?.readoutTitle == "Top apps (~100%): Browser")
         #expect(app.topAppsItem?.toolTip == nil)
     }
 
     @Test func aStalledCollectorKeepsABoundedLastSampleThenBecomesUnavailable() {
         let app = AppDelegate()
-        app.topAppsItem = NSMenuItem()
+        app.hasResolvedIdentity = true
+        app.speedTestRunning = true // Exercise the display without launching network probes.
+        app.topAppsItem = MenuReadoutItem(title: "", style: .compact)
         app.showAppBandwidth(AppBandwidthSnapshot(apps: [], totalBytes: 0, seconds: 5), at: 0)
         app.tick(counters: nil, at: 16)
-        #expect(app.topAppsItem?.title == "Top apps (last sample): no traffic")
+        #expect(app.topAppsItem?.readoutTitle == "Top apps (last sample): no traffic")
         app.tick(counters: nil, at: 61)
-        #expect(app.topAppsItem?.title == "Top apps: unavailable")
+        #expect(app.topAppsItem?.readoutTitle == "Top apps: unavailable")
     }
 }
 

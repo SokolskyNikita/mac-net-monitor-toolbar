@@ -25,6 +25,8 @@
 //   This is a relative-stability heuristic, not a real-time application's jitter guarantee.
 // - Latency is the window median. Latency caps at a 70% penalty: a stable, lossless satellite
 //   link is slow, not broken.
+// - Loss, jitter and median latency use age weights 1/sqrt(max(1, ageSeconds)) over 60s.
+//   Jitter deltas use the newer reply's age. Outlier detection still uses actual packet counts.
 // - Scores are computed every probe cycle over the last minute, then averaged over 10 seconds
 //   for display so the menu bar does not flicker between neighbouring values.
 // - Outage: when every ordinary HTTPS check fails, health is 0% once the failure is confirmed:
@@ -68,6 +70,8 @@ struct HealthReport: Equatable {
     var internetReachable: Bool = true
     /// The latest website checks failed but the outage is not confirmed yet.
     var websitesFailing: Bool = false
+    /// Sources contributing to the displayed RTT, including a smoothed source transition.
+    var latencySources: Set<LatencySource> = []
 }
 
 struct HealthCurve {
@@ -121,13 +125,15 @@ enum Health {
     // MARK: - Scoring
 
     /// Nil until calibrated, except a confirmed outage immediately reports zero.
-    static func evaluate(_ samples: [HealthSample]) -> HealthReport? {
+    static func evaluate(_ samples: [HealthSample], now: TimeInterval? = nil) -> HealthReport? {
+        let now = now ?? samples.map(\.at).max() ?? 0
+        let samples = samples.filter { $0.at.isFinite && now - $0.at <= window && $0.at <= now + 1 }
         guard !samples.isEmpty else { return nil }
         let outage = confirmedOutage(samples)
         guard samples.count >= minCycles || outage else { return nil }
-        let loss = lossRate(samples)
-        let jitter = jitterMs(samples)
-        let latency = latencyMs(samples)
+        let loss = lossRate(samples, now: now)
+        let jitter = jitterMs(samples, now: now)
+        let latency = latencyMs(samples, now: now)
         let keep = (1 - lossCurve.penalty(loss))
             * (1 - jitterPenalty(jitter ?? 0, latencyMs: latency))
             * (1 - latencyCurve.penalty(latency ?? 0))
@@ -136,7 +142,8 @@ enum Health {
         let failing = samples.last(where: { $0.internet != .unknown })?.internet == .unreachable
         return HealthReport(score: min(100, max(0, score)), loss: loss, jitterMs: jitter,
                             latencyMs: latency, internetReachable: !outage,
-                            websitesFailing: failing && !outage)
+                            websitesFailing: failing && !outage,
+                            latencySources: Set(samples.last(where: { $0.ms != nil })?.source.map { [$0] } ?? []))
     }
 
     /// The latest judged website check failed, and either that cycle corroborates it or the
@@ -155,17 +162,29 @@ enum Health {
         return jitterCurve.penalty(jitter / scale)
     }
 
-    static func lossRate(_ samples: [HealthSample]) -> Double {
+    /// Relative weight; ages under one second are capped to avoid a singularity at zero.
+    static func recencyWeight(age: TimeInterval) -> Double {
+        guard age.isFinite, age <= window else { return 0 }
+        return 1 / sqrt(max(1, age))
+    }
+
+    static func lossRate(_ samples: [HealthSample], now: TimeInterval) -> Double {
         guard !samples.isEmpty else { return 0 }
-        struct Tally { var lost = 0, sent = 0; var rate: Double { Double(lost) / Double(sent) } }
+        struct Tally {
+            var lost = 0, sent = 0
+            var lostWeight = 0.0, sentWeight = 0.0
+            var rate: Double { Double(lost) / Double(sent) }
+        }
         let slots = samples.map(\.targets.count).max() ?? 0
         var tallies: [Tally] = []
         for slot in 0..<slots {
             var t = Tally(), answered = false
             for s in samples where s.targets.indices.contains(slot) {
+                let weight = recencyWeight(age: now - s.at)
                 switch s.targets[slot] {
-                case .wan: t.sent += 1; answered = true
-                case .noReply: t.sent += 1; t.lost += 1
+                case .wan: t.sent += 1; t.sentWeight += weight; answered = true
+                case .noReply:
+                    t.sent += 1; t.lost += 1; t.sentWeight += weight; t.lostWeight += weight
                 case .onPath, .unmeasured: break
                 }
             }
@@ -187,9 +206,12 @@ enum Health {
                       binomialUpperTail(k: worst.lost, n: worst.sent, p: p) < lossOutlierPValue else { break }
                 kept = rest
             }
-            return pooled(kept)
+            let weight = kept.reduce(0) { $0 + $1.sentWeight }
+            return weight > 0 ? kept.reduce(0) { $0 + $1.lostWeight } / weight : 0
         }
-        return Double(samples.filter { $0.ms == nil }.count) / Double(samples.count)
+        let weight = samples.reduce(0) { $0 + recencyWeight(age: now - $1.at) }
+        let lostWeight = samples.filter { $0.ms == nil }.reduce(0) { $0 + recencyWeight(age: now - $1.at) }
+        return weight > 0 ? lostWeight / weight : 0
     }
 
     /// P(X ≥ k) for X ~ Binomial(n, p).
@@ -207,35 +229,50 @@ enum Health {
 
     /// Mean absolute change between consecutive RTTs to the same host, top ~10% trimmed.
     /// Without ICMP replies, falls back to consecutive same-source published RTTs.
-    static func jitterMs(_ samples: [HealthSample]) -> Double? {
-        var deltas: [Double] = []
+    static func jitterMs(_ samples: [HealthSample], now: TimeInterval) -> Double? {
+        var deltas: [(value: Double, weight: Double)] = []
         if samples.last(where: { $0.ms != nil })?.source == .icmp {
             let slots = samples.map(\.targets.count).max() ?? 0
             for slot in 0..<slots {
                 var previous: Double?
                 for s in samples where s.targets.indices.contains(slot) {
                     guard case .wan(let ms) = s.targets[slot], ms.isFinite else { continue }
-                    if let previous { deltas.append(abs(ms - previous)) }
+                    if let previous { deltas.append((abs(ms - previous), recencyWeight(age: now - s.at))) }
                     previous = ms
                 }
             }
         }
         if deltas.isEmpty {
-            let rtts = samples.compactMap { s in s.ms.map { (ms: $0, source: s.source) } }
+            let rtts = samples.compactMap { s in s.ms.map { (ms: $0, source: s.source, at: s.at) } }
             for (a, b) in zip(rtts, rtts.dropFirst()) where a.source == b.source {
-                deltas.append(abs(b.ms - a.ms))
+                deltas.append((abs(b.ms - a.ms), recencyWeight(age: now - b.at)))
             }
         }
         guard !deltas.isEmpty else { return nil }
-        deltas.sort()
+        deltas.sort { $0.value < $1.value }
         let kept = deltas.dropLast(Int((Double(deltas.count) * jitterTrim).rounded()))
-        return kept.reduce(0, +) / Double(kept.count)
+        let weight = kept.reduce(0) { $0 + $1.weight }
+        return weight > 0 ? kept.reduce(0) { $0 + $1.value * $1.weight } / weight : nil
     }
 
-    /// Median RTT from the most recent source, matching what the menu bar shows.
-    static func latencyMs(_ samples: [HealthSample]) -> Double? {
+    /// Recency-weighted median RTT from the most recent source. The menu-bar RTT keeps its
+    /// separate five-reading median; this value is the latency input to connection health.
+    static func latencyMs(_ samples: [HealthSample], now: TimeInterval) -> Double? {
         guard let latest = samples.last(where: { $0.ms != nil }) else { return nil }
-        return median(samples.filter { $0.source == latest.source }.compactMap(\.ms))
+        let values = samples.filter { $0.source == latest.source }.compactMap { s -> (value: Double, weight: Double)? in
+            guard let ms = s.ms else { return nil }
+            return (ms, recencyWeight(age: now - s.at))
+        }.filter { $0.weight > 0 }.sorted { $0.value < $1.value }
+        let half = values.reduce(0) { $0 + $1.weight } / 2
+        var cumulative = 0.0
+        for (i, entry) in values.enumerated() {
+            cumulative += entry.weight
+            if abs(cumulative - half) < 1e-12, i + 1 < values.count {
+                return (entry.value + values[i + 1].value) / 2
+            }
+            if cumulative > half { return entry.value }
+        }
+        return values.last?.value
     }
 }
 
@@ -280,7 +317,7 @@ struct HealthTracker {
 
     /// Cycles older than `Health.window` are ignored, so a long sleep does not leave stale history.
     func report(now: TimeInterval = HealthTracker.now()) -> HealthReport? {
-        Health.evaluate(samples.filter { Self.isCurrent($0, now: now) })
+        Health.evaluate(samples.filter { Self.isCurrent($0, now: now) }, now: now)
     }
 
     private static func isCurrent(_ s: HealthSample, now: TimeInterval) -> Bool {
@@ -334,6 +371,7 @@ struct HealthDisplay {
                             jitterMs: avg(reports.compactMap(\.jitterMs)),
                             latencyMs: avg(reports.compactMap(\.latencyMs)),
                             internetReachable: reports.last?.internetReachable ?? false,
-                            websitesFailing: reports.last?.websitesFailing ?? false)
+                            websitesFailing: reports.last?.websitesFailing ?? false,
+                            latencySources: reports.reduce(into: Set<LatencySource>()) { $0.formUnion($1.latencySources) })
     }
 }
