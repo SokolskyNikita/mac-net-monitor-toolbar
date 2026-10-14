@@ -4,7 +4,7 @@ import Foundation
 /// A bounded JSONL log. Ordinary appends do constant filesystem work; compaction reads only
 /// the retained tail in bounded chunks and atomically replaces the original file.
 final class StatsLog {
-    static let maxBytes = 100_000_000
+    static let maxBytes = Configuration.logging.statsMaxBytes
 
     enum LogError: Error {
         case invalidEntry
@@ -17,8 +17,12 @@ final class StatsLog {
     private let chunkSize: Int
     private let lock = NSLock()
 
+    convenience init(config: LoggingConfig) {
+        self.init(maxBytes: config.statsMaxBytes, retainedBytes: config.statsRetainedBytes)
+    }
+
     init(maxBytes: Int = StatsLog.maxBytes, retainedBytes: Int? = nil, chunkSize: Int = 64 * 1024) {
-        let retained = retainedBytes ?? (maxBytes - maxBytes / 10)
+        let retained = retainedBytes ?? Configuration.logging.retainedStatsBytes(maxBytes: maxBytes)
         precondition(maxBytes > 0 && retained > 0 && retained <= maxBytes && chunkSize > 0)
         limit = UInt64(maxBytes)
         self.retainedBytes = UInt64(retained)
@@ -173,35 +177,5 @@ final class StatsLog {
 
     private func posixError(_ code: Int32 = errno) -> NSError {
         NSError(domain: NSPOSIXErrorDomain, code: Int(code))
-    }
-}
-
-/// End-of-window diagnostic snapshot. UI filtering never removes evidence from the log.
-struct HealthStatsSnapshot {
-    var report: HealthReport?
-    var transport: HealthReport?
-    var local: HealthReport?
-    var reconnects5m: Int
-    var recentTrouble: [String]
-    var webChecksFresh: Bool
-
-    var json: [String: Any] {
-        func number<T>(_ value: T?) -> Any { value.map { $0 as Any } ?? NSNull() }
-        return [
-            "health_raw": number(report?.score),
-            "health_loss": number(report?.loss),
-            "health_jitter_ms": number(report?.jitterMs),
-            "health_latency_ms": number(report?.latencyMs),
-            "health_internet_reachable": number(report?.internetReachable),
-            "health_websites_failing": number(report?.websitesFailing),
-            "transport_health": number(transport?.score),
-            "local_health_raw": number(local?.score),
-            "health_window_s": Health.window,
-            "health_weighting": "inverse_sqrt_age",
-            "health_weight_min_age_s": 1,
-            "reconnects_5m": reconnects5m,
-            "recent_trouble": recentTrouble,
-            "internet_checks_fresh": webChecksFresh
-        ]
     }
 }

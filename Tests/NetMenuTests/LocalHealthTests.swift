@@ -24,7 +24,7 @@ import Testing
         #expect(tracker.report(now: 2) == nil)
         #expect(tracker.menuTitle(router: "::1", report: nil).contains("not responding"))
         tracker.record(.reply(.init(ms: 4, hops: nil)), at: 3)
-        let lostWeight = 1 / sqrt(3.0) + 1 / sqrt(2.0) + 1
+        let lostWeight = exp2(-3.0 / 15) + exp2(-2.0 / 15) + exp2(-1.0 / 15)
         #expect(abs((tracker.report(now: 3)?.loss ?? 0) - lostWeight / (lostWeight + 1)) < 1e-12)
         for i in 4...65 { tracker.record(.lost, at: Double(i)) }
         #expect(tracker.report(now: 65)?.score == 0)

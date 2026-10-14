@@ -17,8 +17,8 @@ final class DiagLog: @unchecked Sendable {
     static let defaultDirectory = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first
         .map { $0.appendingPathComponent("Logs/NetMenu", isDirectory: true) }
         ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Logs/NetMenu", isDirectory: true)
-    static let defaultMaxFileBytes = 10_000_000
-    static let defaultArchives = 2
+    static let defaultMaxFileBytes = Configuration.logging.diagnosticMaxFileBytes
+    static let defaultArchives = Configuration.logging.diagnosticArchives
     static let maxLineBytes = 8192
 
     enum Level: Int, Comparable {
@@ -27,6 +27,7 @@ final class DiagLog: @unchecked Sendable {
         var label: String { ["DEBUG", "INFO", "WARN", "ERROR"][rawValue] }
     }
 
+    private let config: LoggingConfig
     private let queue = DispatchQueue(label: "netmenu.diaglog", qos: .utility, autoreleaseFrequency: .workItem)
     private let osLog = Logger(subsystem: "me.sokolsky.netmenu", category: "diagnostics")
     private let stateLock = NSLock()
@@ -46,11 +47,17 @@ final class DiagLog: @unchecked Sendable {
     }()
 
     init(directory: URL = DiagLog.defaultDirectory, maxFileBytes: Int = DiagLog.defaultMaxFileBytes,
-         archives: Int = DiagLog.defaultArchives) {
+         archives: Int = DiagLog.defaultArchives, config: LoggingConfig = Configuration.logging) {
+        self.config = config
         precondition(maxFileBytes > DiagLog.maxLineBytes && archives >= 0)
         self.directory = directory
         self.maxFileBytes = UInt64(maxFileBytes)
         self.archives = archives
+    }
+
+    convenience init(directory: URL = DiagLog.defaultDirectory, config: LoggingConfig) {
+        self.init(directory: directory, maxFileBytes: config.diagnosticMaxFileBytes,
+                  archives: config.diagnosticArchives, config: config)
     }
 
     var fileURL: URL { directory.appendingPathComponent("NetMenu.log") }
@@ -78,11 +85,11 @@ final class DiagLog: @unchecked Sendable {
         if let key = throttleKey {
             stateLock.lock()
             let last = throttled[key] ?? -.infinity
-            let allowed = now.timeIntervalSince1970 - last >= 60
+            let allowed = now.timeIntervalSince1970 - last >= config.diagnosticThrottleInterval
             if allowed { throttled[key] = now.timeIntervalSince1970 }
             stateLock.unlock()
             guard allowed else { Diagnostics.shared.count(.throttledLogLines); return }
-            text += " (repeats suppressed for 60s)"
+            text += " (repeats suppressed for \(Int(config.diagnosticThrottleInterval))s)"
         }
         if level >= .warn {
             let type: OSLogType = level == .error ? .error : .default
@@ -134,7 +141,7 @@ final class DiagLog: @unchecked Sendable {
         }
         // After a failed open, retry at most every 5s rather than on every line.
         let now = ProcessInfo.processInfo.systemUptime
-        guard now - lastOpenAttempt >= 5 else { return false }
+        guard now - lastOpenAttempt >= config.diagnosticOpenRetryInterval else { return false }
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let d = Darwin.open(fileURL.path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, mode_t(0o644))
         guard d >= 0 else { lastOpenAttempt = now; return false }

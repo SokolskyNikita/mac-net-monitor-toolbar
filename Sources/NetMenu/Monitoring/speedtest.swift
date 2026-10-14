@@ -41,53 +41,6 @@ enum SpeedDirection: String {
     case download, upload
 }
 
-struct SpeedTestConfig {
-    /// Normal total payload budget.
-    var budgetBytes: Int
-    /// Hard ceiling, reachable only on links at or above `fastLinkMbps`.
-    var maxBudgetBytes: Int
-    var fastLinkMbps = 150.0
-    /// Download may use at most this share; upload gets everything download leaves.
-    var maxDownloadShare = 0.625
-    var initialStreams = 4
-    var maxStreams = 4
-    var parallelAboveMbps = 5.0
-    var warmup: TimeInterval = 1
-    var maxWarmup: TimeInterval = 3
-    /// Of the phase budget; measurement never starts later than when this share has arrived.
-    var latestWarmupShare = 0.5
-    var minSteady: TimeInterval = 2
-    var maxPhase: TimeInterval = 12
-    /// No byte at all for this long ends the phase.
-    var stallTimeout: TimeInterval = 8
-    var stabilityTolerance = 0.10
-    var requestTarget: TimeInterval = 0.75
-    var uploadRequestTarget: TimeInterval = 0.4
-    var maxRequestTarget: TimeInterval = 4
-    var initialRequest = 65_536
-    var minRequest = 16_384
-    var maxRequest = 8_000_000
-    var requestTimeout: TimeInterval = 15
-    var latencyProbeInterval: TimeInterval = 0.4
-    var idleLatencySamples = 5
-    var latencyTimeout: TimeInterval = 3
-    var tick: TimeInterval = 0.1
-
-    static let standardBudget = 32_000_000
-    static let fastLinkBudget = 64_000_000
-    static let lowDataBudget = 8_000_000
-    static let standard = SpeedTestConfig(budgetBytes: standardBudget, maxBudgetBytes: fastLinkBudget)
-    static let lowData = SpeedTestConfig(budgetBytes: lowDataBudget, maxBudgetBytes: lowDataBudget)
-
-    var downloadBudget: Int { Int(Double(budgetBytes) * maxDownloadShare) }
-    var maxDownloadBudget: Int { Int(Double(maxBudgetBytes) * maxDownloadShare) }
-
-    /// Upload gets what download left of the normal budget, but never less than its own share.
-    func uploadBudget(downloadUsed: Int) -> Int {
-        min(maxBudgetBytes - downloadUsed, max(budgetBytes - downloadBudget, budgetBytes - downloadUsed))
-    }
-}
-
 /// Thread-safe stop switch shared with the UI.
 final class SpeedTestControl: @unchecked Sendable {
     private let lock = NSLock()
@@ -222,6 +175,10 @@ struct SpeedPhaseResult {
     var elapsed = 0.0
 }
 
+enum SpeedTestStatus: String {
+    case ok, partial, failed, cancelled
+}
+
 struct SpeedTestResult {
     var download: SpeedPhaseResult?
     var upload: SpeedPhaseResult?
@@ -241,30 +198,38 @@ struct SpeedTestResult {
         return e
     }
 
-    var status: String {
-        if networkChanged { return "failed" }
-        if download?.mbps == nil && upload?.mbps == nil { return cancelled ? "cancelled" : "failed" }
-        return errors.isEmpty && download?.mbps != nil && upload?.mbps != nil ? "ok" : "partial"
+    var status: SpeedTestStatus {
+        if networkChanged { return .failed }
+        if download?.mbps == nil && upload?.mbps == nil { return cancelled ? .cancelled : .failed }
+        return errors.isEmpty && download?.mbps != nil && upload?.mbps != nil ? .ok : .partial
     }
 
     var loadedLatencyMs: Double? {
         [download?.loadedLatencyMs, upload?.loadedLatencyMs].compactMap { $0 }.max()
     }
 
-    var title: String {
-        if networkChanged { return "Test stopped — network changed" }
-        if status == "cancelled" { return "Speed test cancelled" }
+    var title: String { menuReadout.title }
+
+    var menuReadout: MenuReadout {
+        if networkChanged { return .detail(.result, "Test stopped — network changed") }
+        if status == .cancelled { return .detail(.result, "Speed test cancelled") }
         let reason = [download, upload].compactMap { $0 }.compactMap { p in
             p.error.map { "\(p.direction.rawValue): \($0)" }
         }.joined(separator: "; ")
-        if status == "failed" { return "Test failed — \(reason.isEmpty ? "no data" : reason)" }
+        if status == .failed {
+            let text = "Test failed — \(reason.isEmpty ? "no data" : reason)"
+            // Error strings may contain a direction prefix; this is explanatory detail, not a row type.
+            return .detail(.result, text)
+        }
         let rates = "\(Self.rate(download))↓ / \(Self.rate(upload))↑ Mbps"
         var latency = ""
         if let idle = idleLatencyMs {
             latency = " · \(Int(idle.rounded()))ms"
             if let loaded = loadedLatencyMs { latency += ", \(Int(loaded.rounded()))ms loaded" }
         }
-        return status == "ok" ? "Last test: \(rates)\(latency)" : "Partial test: \(rates) (\(reason))"
+        let heading = status == .ok ? "Last test" : "Partial test"
+        let detail = status == .ok ? "\(rates)\(latency)" : "\(rates) (\(reason))"
+        return MenuReadout(kind: .result, heading: heading, detail: detail, title: heading + ": " + detail)
     }
 
     /// Full breakdown for the diagnostic log and `--speedtest`.

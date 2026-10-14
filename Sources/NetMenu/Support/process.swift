@@ -41,7 +41,7 @@ struct ProcResult {
 
 /// Run a helper with a wall-clock timeout. Pipes drain on side queues so large stdout can't
 /// deadlock, and every descriptor is closed before returning.
-func runProcess(_ path: String, _ args: [String], timeout: TimeInterval = 10) -> ProcResult {
+func runProcess(_ path: String, _ args: [String], timeout: TimeInterval = Configuration.reliability.helperTimeout) -> ProcResult {
     guard FileManager.default.isExecutableFile(atPath: path) else {
         return ProcResult(outcome: .launchFailed("\(path) is not executable"), stdout: "")
     }
@@ -89,16 +89,16 @@ func runProcess(_ path: String, _ args: [String], timeout: TimeInterval = 10) ->
         let timedOut = p.isRunning
         if timedOut {
             Diagnostics.shared.count(.processTimeout)
-            terminateProcess(p, grace: 1.0)
+            terminateProcess(p, grace: Configuration.reliability.helperTerminateGrace)
         }
         // Foundation keeps every Process (with its pipes, handles and a dispatch queue) alive until
         // its exit is reaped by waitUntilExit; polling isRunning alone leaked ~1 KB per helper,
         // ~250 MB a month. It returns at once for a process that has already exited.
         if !p.isRunning { p.waitUntilExit() }
-        let readersDone = group.wait(timeout: .now() + 2) == .success
+        let readersDone = group.wait(timeout: .now() + Configuration.reliability.helperDrainTimeout) == .success
         if !readersDone {
             // A grandchild may still hold the write end; the reader exits when it closes.
-            DiagLog.shared.warn("process", "\(path) output still open 2s after exit", throttleKey: "reader")
+            DiagLog.shared.warn("process", "\(path) output still open after drain deadline", throttleKey: "reader")
         }
         box.lock.lock(); let data = box.data, err = box.err; box.lock.unlock()
         let stdout = String(decoding: data, as: UTF8.self)
@@ -117,7 +117,7 @@ func runProcess(_ path: String, _ args: [String], timeout: TimeInterval = 10) ->
 /// in Top apps rather than as the user's own `curl`. Bounded by count and age.
 final class HelperPIDs: @unchecked Sendable {
     static let shared = HelperPIDs()
-    static let maxAge: TimeInterval = 600
+    static let maxAge = Configuration.reliability.helperHistoryLifetime
     static let maxCount = 4096
     private let lock = NSLock()
     private var started: [Int32: TimeInterval] = [:]
@@ -139,7 +139,7 @@ final class HelperPIDs: @unchecked Sendable {
 }
 
 /// Compatibility wrapper: stdout, or nil when the helper could not run (or failed, if required).
-func runProc(_ path: String, _ args: [String], timeout: TimeInterval = 10, requireSuccess: Bool = false) -> String? {
+func runProc(_ path: String, _ args: [String], timeout: TimeInterval = Configuration.reliability.helperTimeout, requireSuccess: Bool = false) -> String? {
     let r = runProcess(path, args, timeout: timeout)
     guard r.launched else { return nil }
     if requireSuccess && !r.succeeded { return nil }
@@ -154,7 +154,7 @@ func terminateProcess(_ p: Process, grace: TimeInterval) {
     while p.isRunning, Date() < killAt { Thread.sleep(forTimeInterval: 0.02) }
     if p.isRunning {
         _ = Darwin.kill(p.processIdentifier, SIGKILL)
-        let reapBy = Date().addingTimeInterval(1)
+        let reapBy = Date().addingTimeInterval(Configuration.reliability.helperReapGrace)
         while p.isRunning, Date() < reapBy { Thread.sleep(forTimeInterval: 0.02) }
     }
 }

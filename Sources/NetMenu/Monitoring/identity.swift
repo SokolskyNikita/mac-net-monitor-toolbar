@@ -1,6 +1,13 @@
 import Foundation
 import CoreWLAN
 
+private enum InterfaceKind {
+    static let vpnPrefixes = ["utun", "ipsec", "ppp"]
+    static let tetherPortFragments = ["iPhone", "iPad", "Bluetooth"]
+    static func isVPN(_ name: String) -> Bool { vpnPrefixes.contains(where: name.hasPrefix) }
+    static func isTether(_ port: String) -> Bool { tetherPortFragments.contains(where: port.contains) }
+}
+
 private let ssidRe = try? NSRegularExpression(pattern: #"^\s*SSID : (.+)$"#, options: .anchorsMatchLines)
 
 struct Identity: Equatable {
@@ -35,7 +42,7 @@ func parseRoute() -> (iface: String?, gateway: String?) {
 
 private let portsLock = NSLock()
 private var cachedPorts: (at: TimeInterval, map: [String: String])?
-private let portsMaxAge: TimeInterval = 300
+private let portsMaxAge = Configuration.monitoring.portsCacheLifetime
 
 /// Interface → hardware port names rarely change; re-read them every 5 minutes, or at once when
 /// `iface` is missing (a newly attached adapter or tethered phone).
@@ -45,7 +52,7 @@ func hardwarePorts(including iface: String? = nil) -> [String: String] {
     let cached = cachedPorts
     portsLock.unlock()
     // VPN interfaces are never hardware ports, so their absence is not a reason to re-read.
-    let expected = iface.map { !["utun", "ipsec", "ppp"].contains(where: $0.hasPrefix) } ?? false
+    let expected = iface.map { !InterfaceKind.isVPN($0) } ?? false
     if let cached, now - cached.at < portsMaxAge, !expected || iface.map({ cached.map[$0] != nil }) == true {
         return cached.map
     }
@@ -73,7 +80,7 @@ func isRedactedSSID(_ ssid: String) -> Bool {
 }
 
 func ssidIpconfig(_ iface: String) -> String? {
-    guard let out = runProc("/usr/sbin/ipconfig", ["getsummary", iface], timeout: 5),
+    guard let out = runProc("/usr/sbin/ipconfig", ["getsummary", iface], timeout: Configuration.monitoring.ipconfigTimeout),
           let re = ssidRe else { return nil }
     let range = NSRange(out.startIndex..., in: out)
     guard let m = re.firstMatch(in: out, range: range), let r = Range(m.range(at: 1), in: out) else { return nil }
@@ -84,7 +91,7 @@ func ssidIpconfig(_ iface: String) -> String? {
 private let profilerLock = NSLock()
 private var profilerFailedAt: TimeInterval?
 /// system_profiler takes ~5s and, without Location access, only returns "<redacted>".
-private let profilerRetryAfter: TimeInterval = 600
+private let profilerRetryAfter = Configuration.monitoring.profilerRetryInterval
 
 func ssidProfiler(_ iface: String) -> String? {
     let now = BandwidthClock.now()
@@ -99,7 +106,7 @@ func ssidProfiler(_ iface: String) -> String? {
 
 private func ssidProfilerUncached(_ iface: String) -> String? {
     // system_profiler can be huge/slow — timeout + async pipe drain in runProc avoids hangs.
-    guard let out = runProc("/usr/sbin/system_profiler", ["SPAirPortDataType", "-json"], timeout: 12),
+    guard let out = runProc("/usr/sbin/system_profiler", ["SPAirPortDataType", "-json"], timeout: Configuration.monitoring.profilerTimeout),
           let data = out.data(using: .utf8),
           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
           let arr = json["SPAirPortDataType"] as? [[String: Any]], let root = arr.first,
@@ -137,9 +144,9 @@ func resolveIdentity() -> Identity {
     let ports = hardwarePorts(including: iface); let port = ports[iface] ?? ""
     var type = NetType.ethernet, network: String? = port.isEmpty ? iface : port
     var bssid: String?, rssi: Int?, noise: Int?, txRate: Double?, channel: Int?
-    let isVPN = iface.hasPrefix("utun") || iface.hasPrefix("ipsec") || iface.hasPrefix("ppp")
+    let isVPN = InterfaceKind.isVPN(iface)
     if port == PortName.wifi || port == PortName.airPort { type = NetType.wifi }
-    else if port.contains("iPhone") || port.contains("iPad") || port.contains("Bluetooth") { type = NetType.tether }
+    else if InterfaceKind.isTether(port) { type = NetType.tether }
     else if isVPN { type = NetType.vpn; network = PortName.vpn }
     let wifiIf: String? = {
         if type == NetType.wifi { return iface }
@@ -170,9 +177,9 @@ func resolveIdentitySample() -> Identity {
     }
     let ports = hardwarePorts(including: iface); let port = ports[iface] ?? ""
     var type = NetType.ethernet, network: String? = port.isEmpty ? iface : port
-    let isVPN = iface.hasPrefix("utun") || iface.hasPrefix("ipsec") || iface.hasPrefix("ppp")
+    let isVPN = InterfaceKind.isVPN(iface)
     if port == PortName.wifi || port == PortName.airPort { type = NetType.wifi }
-    else if port.contains("iPhone") || port.contains("iPad") || port.contains("Bluetooth") { type = NetType.tether; network = port }
+    else if InterfaceKind.isTether(port) { type = NetType.tether; network = port }
     else if isVPN { type = NetType.vpn; network = PortName.vpn }
     else { type = NetType.ethernet; network = port.isEmpty ? iface : port }
     let wifiIf: String? = type == NetType.wifi ? iface : (type == NetType.vpn ? ports.first(where: { $0.value == PortName.wifi || $0.value == PortName.airPort })?.key : nil)

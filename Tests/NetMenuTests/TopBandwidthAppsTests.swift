@@ -93,20 +93,20 @@ import Testing
         let app = AppDelegate()
         app.hasResolvedIdentity = true
         app.speedTestRunning = true // Exercise the display without launching network probes.
-        app.topAppsItem = MenuReadoutItem(title: "", style: .compact)
+        app.topAppsItem = MenuReadoutItem(readout: .row(.topApps, value: ""))
         let snapshot = AppBandwidthSnapshot(apps: [
             AppBandwidthUsage(id: "browser", name: "Browser", downBytes: 90, upBytes: 10)
         ], totalBytes: 100, seconds: 10)
         app.showAppBandwidth(snapshot, at: 0)
-        #expect(app.topAppsItem?.readoutTitle == "Top apps (~100%): Browser")
+        #expect(app.topAppsItem?.content.title == "Top apps (~100%): Browser")
         app.showAppBandwidth(nil, at: 6)
-        #expect(app.topAppsItem?.readoutTitle == "Top apps (~100%): Browser")
+        #expect(app.topAppsItem?.content.title == "Top apps (~100%): Browser")
         app.resetAppBandwidth(at: 10)
-        #expect(app.topAppsItem?.readoutTitle == "Top apps (last sample) (~100%): Browser")
+        #expect(app.topAppsItem?.content.title == "Top apps (last sample) (~100%): Browser")
         app.showAppBandwidth(snapshot, at: 15)
-        #expect(app.topAppsItem?.readoutTitle == "Top apps (last sample) (~100%): Browser")
+        #expect(app.topAppsItem?.content.title == "Top apps (last sample) (~100%): Browser")
         app.tick(counters: nil, at: 20)
-        #expect(app.topAppsItem?.readoutTitle == "Top apps (~100%): Browser")
+        #expect(app.topAppsItem?.content.title == "Top apps (~100%): Browser")
         #expect(app.topAppsItem?.toolTip == nil)
     }
 
@@ -114,12 +114,12 @@ import Testing
         let app = AppDelegate()
         app.hasResolvedIdentity = true
         app.speedTestRunning = true // Exercise the display without launching network probes.
-        app.topAppsItem = MenuReadoutItem(title: "", style: .compact)
+        app.topAppsItem = MenuReadoutItem(readout: .row(.topApps, value: ""))
         app.showAppBandwidth(AppBandwidthSnapshot(apps: [], totalBytes: 0, seconds: 5), at: 0)
         app.tick(counters: nil, at: 16)
-        #expect(app.topAppsItem?.readoutTitle == "Top apps (last sample): no traffic")
+        #expect(app.topAppsItem?.content.title == "Top apps (last sample): no traffic")
         app.tick(counters: nil, at: 61)
-        #expect(app.topAppsItem?.readoutTitle == "Top apps: unavailable")
+        #expect(app.topAppsItem?.content.title == "Top apps: unavailable")
     }
 }
 

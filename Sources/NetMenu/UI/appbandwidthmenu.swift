@@ -55,13 +55,16 @@ struct TopBandwidthApps {
 
     var reachedTarget: Bool { !apps.isEmpty && share >= Self.targetShare }
 
-    var title: String {
+    var title: String { readout().title }
+
+    func readout(stale: Bool = false) -> MenuReadout {
+        let context = stale ? " (last sample)" : ""
         guard !apps.isEmpty else {
-            return totalBytes > 0 ? "Top apps: no attributed traffic" : "Top apps: no traffic"
+            return .row(.topApps, value: totalBytes > 0 ? "no attributed traffic" : "no traffic", context: context)
         }
         let names = apps.map { Self.menuName($0.name) }.joined(separator: ", ")
         // Round down so 79.9% never appears to have reached the 80% target.
-        return "Top apps (~\(Int(floor(share * 100)))%): \(names)"
+        return .row(.topApps, value: names, qualifier: " (~\(Int(floor(share * 100)))%)", context: context)
     }
 
     static func cleanName(_ name: String) -> String {
@@ -91,16 +94,18 @@ struct TopBandwidthApps {
 
 /// Keep a useful list through transient sampler failures without presenting old data as live.
 struct AppBandwidthDisplay {
+    let config: MonitoringConfig
+    init(config: MonitoringConfig = Configuration.monitoring) { self.config = config }
     static let updateInterval = AppBandwidthMonitor.sampleInterval
-    static let freshFor: TimeInterval = 15
-    static let retainFor: TimeInterval = 60
-    static let initialFailureLimit = 3
+    static let freshFor = Configuration.monitoring.appFreshFor
+    static let retainFor = Configuration.monitoring.appRetainFor
+    static let initialFailureLimit = Configuration.monitoring.appInitialFailureLimit
 
     private var last: TopBandwidthApps?
     private var sampledAt: TimeInterval?
     private var failures = 0
     private var restarting = false
-    private var publishedTitle = "Top apps: measuring…"
+    private var published = MenuReadout.row(.topApps, value: "measuring…")
     private var publishedAt: TimeInterval?
 
     mutating func record(_ snapshot: AppBandwidthSnapshot?, at: TimeInterval) {
@@ -115,41 +120,43 @@ struct AppBandwidthDisplay {
                 return
             }
         }
-        failures = min(failures + 1, Self.initialFailureLimit)
+        failures = min(failures + 1, config.appInitialFailureLimit)
     }
 
     mutating func restart(at: TimeInterval) {
         failures = 0
         restarting = true
         // Waking after a long sleep is normal calibration, not a collector failure.
-        if let sampledAt, at - sampledAt > Self.retainFor || at < sampledAt {
+        if let sampledAt, at - sampledAt > config.appRetainFor || at < sampledAt {
             last = nil
             self.sampledAt = nil
         }
     }
 
     /// Gate every visible change, including retry/recovery labels, to the same ten-second cadence.
-    mutating func title(at: TimeInterval) -> String {
-        let nextTitle = currentTitle(at: at)
+    mutating func title(at: TimeInterval) -> String { readout(at: at).title }
+
+    mutating func readout(at: TimeInterval) -> MenuReadout {
+        let next = currentReadout(at: at)
         // Unchanged timer ticks must not move the deadline and delay a newly completed window.
-        guard nextTitle != publishedTitle else { return publishedTitle }
-        if let publishedAt, at >= publishedAt, at - publishedAt < Self.updateInterval {
-            return publishedTitle
+        guard next != published else { return published }
+        if let publishedAt, at >= publishedAt, at - publishedAt < config.appSampleInterval {
+            return published
         }
-        publishedTitle = nextTitle
+        published = next
         publishedAt = at
-        return publishedTitle
+        return published
     }
 
-    private func currentTitle(at: TimeInterval) -> String {
+    private func currentReadout(at: TimeInterval) -> MenuReadout {
         if let last, let sampledAt {
             let age = at - sampledAt
-            guard age >= 0, age <= Self.retainFor else { return "Top apps: unavailable" }
-            if restarting || failures > 0 || age > Self.freshFor {
-                return "Top apps (last sample)" + last.title.dropFirst("Top apps".count)
+            guard age >= 0, age <= config.appRetainFor else { return .row(.topApps, value: "unavailable") }
+            if restarting || failures > 0 || age > config.appFreshFor {
+                return last.readout(stale: true)
             }
-            return last.title
+            return last.readout()
         }
-        return failures >= Self.initialFailureLimit ? "Top apps: unavailable" : "Top apps: measuring…"
+        return .row(.topApps, value: failures >= config.appInitialFailureLimit ? "unavailable" : "measuring…")
     }
 }

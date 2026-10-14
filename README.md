@@ -6,7 +6,7 @@
 
 A macOS menu bar app that shows live internet latency, connection health, throughput and top bandwidth users, with a speed test and a per-minute history log.
 
-NetMenu is built for unreliable networks such as hotels, airports, planes and phone hotspots. It discards fake low pings answered by captive portals and in-flight proxies. It also checks that ordinary websites load, since ping can work while web access is blocked. There are no accounts or analytics; apart from its probes and the speed tests you start, nothing leaves your Mac.
+NetMenu is built for unreliable networks such as hotels, airports, planes and phone hotspots. It filters suspected local ping replies from captive portals and in-flight proxies. It also checks that ordinary websites load, since ping can work while web access is blocked. There are no accounts or analytics; monitoring history and app-usage details stay on your Mac. Network requests are limited to its probes, supporting DNS lookups and the speed tests you start.
 
 <img src="docs/images/mac-net-monitor-screenshot.png" alt="NetMenu menu showing latency, connection health, throughput and top bandwidth apps" width="395">
 
@@ -22,7 +22,7 @@ brew trust sokolskynikita/netmenu
 brew install --cask netmenu
 ```
 
-The `brew trust` line is required on Homebrew 7 and later, which refuse casks from untrusted third-party taps (`Refusing to load cask ... from untrusted tap`). If you installed NetMenu on an older Homebrew, run that line once before your next upgrade.
+The [`brew trust` command](https://docs.brew.sh/Manpage) allows Homebrew to load this third-party tap. Run it if installation or upgrading reports `Refusing to load cask ... from untrusted tap`. Older Homebrew versions without this command can skip it.
 
 ```bash
 brew update && brew upgrade --cask netmenu      # update
@@ -37,7 +37,7 @@ Download `NetMenu-<version>.zip` from the [latest release](https://github.com/So
 
 ### First launch
 
-NetMenu isn't notarized yet, so macOS may block it the first time you open it. Click **Open Anyway** in **System Settings → Privacy & Security**, or run:
+Builds are signed ad hoc unless a release is configured with an Apple Developer ID certificate. If your downloaded build isn't notarized, macOS may block it the first time you open it. Click **Open Anyway** in **System Settings → Privacy & Security**, or run:
 
 ```bash
 xattr -dr com.apple.quarantine /Applications/NetMenu.app
@@ -47,8 +47,8 @@ macOS may also ask for two optional permissions:
 
 | Permission | Used only for | If denied |
 | --- | --- | --- |
-| Location | Reading the Wi‑Fi network name | Network name is missing from the stats log |
-| Local Network | Checking your router’s health and latency | Local health and router latency may be unavailable |
+| Location | Reading the Wi‑Fi network name and access point (SSID/BSSID) | The log may use a generic network label and omit the access point |
+| Local Network (macOS 15+) | Checking your router’s health and latency | Local router health and latency may be unavailable |
 
 ## What you see
 
@@ -56,22 +56,23 @@ The menu bar shows **latency** and **connection health**, for example `9ms │ 1
 
 | Latency | Meaning |
 | --- | --- |
-| `24ms` | Round trip to the internet, from the fastest of several ping targets. Fake replies from hotel or in-flight equipment are ignored. |
+| `24ms` | Median of the latest five successful ping rounds, using the fastest trusted target in each round. Suspected local replies from hotel or in-flight equipment are ignored. |
 | `~180ms` | Ping is blocked on this network, so this is the time to load a small web page instead. |
-| `✕` | Nothing trustworthy got through for a minute. |
+| `✕` | No trustworthy latency measurement is available yet, or the last one is over a minute old. |
 
-**Connection health** is a score for the last minute, with newer measurements weighted more heavily (`1 / sqrt(age in seconds)`, capped at 1 for the newest second). A connection good enough for an HD video call (latency up to 150ms, jitter up to 40ms, packet loss up to 2%) scores 100%. Worse loss, jitter or latency pulls it down, and one bad factor is enough. A spinner shows for the first few seconds while it calibrates. If websites stop loading, health drops to **0%** and the menu says **internet sites unreachable**, even if ping still works.
+**Connection health** estimates interactive usability over the last minute, with newer measurements weighted more heavily (a 15-second half-life). It combines latency and jitter into an estimated delay budget, then applies a packet-loss penalty. For example, 20ms latency with 50ms jitter and no loss scores 100%; 5% loss on that connection scores 50%. This is a network-health heuristic, not a measured Zoom call-quality rating. A spinner shows for the first few seconds while it calibrates. A confirmed website outage drops health to **0%** and the menu says **internet sites unreachable**, even if ping still works.
 
 The menu adds:
 
-- **Connection health** with its loss, jitter and latency
+- **Internet health** with its probe type, loss, jitter and round-trip time (RTT)
 - A brief menu-bar warning for recent loss, latency spikes, jitter or web-access failures
 - **N reconnects in past 5 mins**, shown after at least three completed reconnects
-- **Local health** to your router, with the same score and packet loss, plus jitter and latency rounded to the nearest millisecond. Supports IPv4 and IPv6 routers behind a VPN. If ping fails, it can use direct DNS, TCP or IPv4 DHCP INFORM replies instead. The row names the protocol; a router that answers none shows unavailable.
-- **Throughput**: current download and upload rate, averaged over 5 seconds. Turn on **Show throughput in menu bar** to show it next to health too.
+- **Local router** health, with the same score and packet loss, plus jitter and RTT rounded to the nearest millisecond. Supports IPv4 and IPv6 routers behind a VPN. If ping fails, it can use direct DNS, TCP or IPv4 DHCP INFORM replies instead. The row names the protocol; a router that answers none shows unavailable.
+- **Traffic**: current download and upload rate, averaged over 5 seconds. Turn on **Options → Show throughput in menu bar** to show it next to health too.
 - **Top apps**: the apps using the most bandwidth over the last 10 seconds, up to three, with their share of all traffic, such as `Top apps (~81%): Firefox`
-- **Peak this connection**: the highest rates since you joined this network. It resets when you switch networks or access points.
+- **Peak**: the highest rates since you joined this network. It resets when NetMenu detects a change of network or access point.
 - **Speed test** results and controls
+- **Wi-Fi scans**: a warning when repeated scans from the Wi-Fi settings page overlap slow router pings. **Quit System Settings to stop scans** quits the entire Settings app when clicked; Wi-Fi stays connected. Detection depends on readable macOS Wi-Fi logs. See [Wi-Fi scan warnings](docs/HOW-IT-WORKS.md#wi-fi-scan-warnings) for its limits.
 
 For exactly how each number is measured, see [How NetMenu works](docs/HOW-IT-WORKS.md).
 
@@ -92,7 +93,7 @@ A result with `≥`, such as **≥480↓**, means the connection was still speed
 ## Your data
 
 - **Stats history.** Once a minute NetMenu records latency, health, throughput and Wi‑Fi details to a file on your Mac, plus every speed test. Open it with **Diagnostics → Open stats file**. It's capped at 100 MB.
-- **Diagnostic log.** A detailed log for troubleshooting, capped at 30 MB (about three days). Open it with **Diagnostics → Open diagnostic log**. If NetMenu shows something that doesn't look right, this log has the details to explain it.
+- **Diagnostic log.** A detailed log for troubleshooting, rotating at 10 MB with two older files retained. Open it with **Diagnostics → Open diagnostic log**. If NetMenu shows something that doesn't look right, this log has the details to explain it.
 
 Both stay on your Mac. Formats are described in [Logs](docs/LOGS.md).
 

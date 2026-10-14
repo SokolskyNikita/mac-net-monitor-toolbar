@@ -3,6 +3,46 @@ import Testing
 @testable import NetMenu
 
 @Suite struct LiveMonitoringTests {
+    @Test @MainActor func routerTransportReceivesContextAndDoesNotBlockWAN() async throws {
+        let gate = DispatchSemaphore(value: 0)
+        defer { gate.signal() }
+        let target = LocalRouter(interface: "en0", address: "192.0.2.1")
+        let transport = LiveProbes.Transport(ping: { _, _ in .reply(.init(ms: 20, hops: 12)) },
+            website: { _ in .init(outcome: .ok, seconds: 0) }, portal: { .internet }, fallback: { 30 },
+            local: { router, epoch in
+                #expect(router == target)
+                #expect(epoch == 7)
+                _ = gate.wait(timeout: .now() + 5)
+                return .init(method: .dns, outcome: .reply(.init(ms: 4, hops: nil)))
+            })
+        let probes = LiveProbes(transport: transport)
+        var wanReplies = 0
+        var localReply: LocalProbeResult?
+        probes.receive = { epoch, event in
+            #expect(epoch == 7)
+            if case .wan = event { wanReplies += 1 }
+            if case .router(let result) = event { localReply = result }
+        }
+        let identity = Identity(iface: "en0", type: NetType.wifi, network: nil, bssid: nil,
+            router: target.address, rssi: nil, noise: nil, txRate: nil, channel: nil, localRouter: target)
+        probes.poll(identity: identity, epoch: 7, paused: false)
+        for _ in 0..<100 {
+            if wanReplies == 5 { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(wanReplies == 5)
+        #expect(localReply == nil)
+        gate.signal()
+        for _ in 0..<100 {
+            if localReply != nil { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(localReply?.method == .dns)
+        if case .reply(let reply) = localReply?.outcome {
+            #expect(reply.ms == 4)
+        } else { Issue.record("Expected the injected router reply") }
+    }
+
     @Test func partialRepliesDoNotManufactureCalibrationOrLoss() {
         var health = LiveHealthTracker()
         for slot in 0..<5 { health.recordTarget(slot: slot, verdict: .wan(20), started: 0, at: 0.1) }
@@ -87,9 +127,16 @@ import Testing
         recent.record(.unmeasured, target: "unknown", label: "network", at: 0)
         #expect(recent.labels(now: 0).isEmpty)
         recent.record(.wan(20), target: "a", label: "network", at: 1)
-        recent.record(.wan(300), target: "a", label: "network", at: 2)
+        recent.record(.wan(400), target: "a", label: "network", at: 2)
         #expect(recent.labels(now: 2).contains("network latency"))
         #expect(recent.labels(now: 2).contains("network jitter"))
+    }
+
+    @Test func lowLatencyHasRoomForJitterWithoutWarning() {
+        var recent = RecentTrouble()
+        recent.record(.wan(20), target: "a", label: "network", at: 0)
+        recent.record(.wan(70), target: "a", label: "network", at: 1)
+        #expect(recent.labels(now: 1).isEmpty)
     }
 
     @Test func reconnectsExcludeStartupDuplicatesWakeAndExpiredEvents() {

@@ -30,7 +30,7 @@ struct ProcessAncestry {
               let entry = entries[current] {
             let identity = AppBandwidthProcessGrouper.identity(processName: processName, pid: current,
                                                                executablePath: entry.path)
-            if identity.id.hasPrefix("app:") { return identity }
+            if identity.isApplication { return identity }
             guard let parent = entries[entry.parent], parent.started <= entry.started else { break }
             current = entry.parent
         }
@@ -64,16 +64,17 @@ struct ProcessAncestry {
 
 /// Explicit bundle aliases only; names never serve as aggregation keys.
 enum AppMenuNames {
+    private static let aliases = [
+        "com.google.Chrome": "Chrome", "org.mozilla.firefox": "Firefox",
+        "com.microsoft.edgemac": "Edge", "com.microsoft.VSCode": "VS Code",
+        "com.microsoft.teams": "Teams", "com.microsoft.teams2": "Teams",
+        "com.microsoft.Outlook": "Outlook", "com.microsoft.Word": "Word",
+        "com.microsoft.Excel": "Excel", "com.microsoft.Powerpoint": "PowerPoint",
+        "us.zoom.xos": "Zoom", "com.googlecode.iterm2": "iTerm",
+        "com.docker.docker": "Docker",
+    ]
+
     static func shortName(bundleID: String?, fallback: String) -> String {
-        let aliases = [
-            "com.google.Chrome": "Chrome", "org.mozilla.firefox": "Firefox",
-            "com.microsoft.edgemac": "Edge", "com.microsoft.VSCode": "VS Code",
-            "com.microsoft.teams": "Teams", "com.microsoft.teams2": "Teams",
-            "com.microsoft.Outlook": "Outlook", "com.microsoft.Word": "Word",
-            "com.microsoft.Excel": "Excel", "com.microsoft.Powerpoint": "PowerPoint",
-            "us.zoom.xos": "Zoom", "com.googlecode.iterm2": "iTerm",
-            "com.docker.docker": "Docker",
-        ]
         return bundleID.flatMap { aliases[$0] } ?? fallback
     }
 }

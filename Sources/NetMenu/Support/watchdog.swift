@@ -8,13 +8,7 @@ import AppKit
 import Foundation
 
 final class Watchdog: @unchecked Sendable {
-    struct Limits {
-        var maxFileDescriptors = 1000
-        var maxThreads = 300
-        var maxFootprintBytes: UInt64 = 1_500_000_000
-        var mainHang: TimeInterval = 120
-        var minUptime: TimeInterval = 30 * 60
-    }
+    typealias Limits = ReliabilityConfig
 
     struct Reading {
         var fileDescriptors: Int?
@@ -24,7 +18,7 @@ final class Watchdog: @unchecked Sendable {
         var fileLimit: UInt64? = nil
     }
 
-    static let interval: TimeInterval = 60
+    static let interval = Configuration.reliability.watchdogInterval
 
     private let limits: Limits
     private let queue = DispatchQueue(label: "netmenu.watchdog", qos: .utility, autoreleaseFrequency: .workItem)
@@ -35,11 +29,12 @@ final class Watchdog: @unchecked Sendable {
     private let startedAt = BandwidthClock.now()
     private var relaunching = false
 
-    init(limits: Limits = Limits()) { self.limits = limits }
+    init(limits: Limits = Configuration.reliability) { self.limits = limits }
 
     func start() {
         let t = DispatchSource.makeTimerSource(queue: queue)
-        t.schedule(deadline: .now() + Self.interval, repeating: Self.interval, leeway: .seconds(5))
+        t.schedule(deadline: .now() + limits.watchdogInterval, repeating: limits.watchdogInterval,
+                   leeway: .milliseconds(Int(limits.watchdogLeeway * 1000)))
         t.setEventHandler { [weak self] in self?.tick() }
         t.resume()
         timer = t
@@ -63,7 +58,7 @@ final class Watchdog: @unchecked Sendable {
         lock.lock()
         // The timer does not fire during sleep; a long gap means we just woke, so the main
         // thread's last reply is stale for that reason alone. Start a fresh measurement.
-        let woke = now - lastTick > Self.interval * 2
+        let woke = now - lastTick > limits.watchdogInterval * 2
         lastTick = now
         if woke { mainRepliedAt = now }
         let unresponsive = now - mainRepliedAt
@@ -102,7 +97,7 @@ final class Watchdog: @unchecked Sendable {
             return
         }
         DiagLog.shared.error("watchdog", "relaunching: \(reason)")
-        let opened = runProcess("/usr/bin/open", ["-n", bundle.path], timeout: 15).succeeded
+        let opened = runProcess("/usr/bin/open", ["-n", bundle.path], timeout: limits.relaunchTimeout).succeeded
         DiagLog.shared.flush()
         guard opened else {
             DiagLog.shared.error("watchdog", "relaunch failed; continuing")
@@ -114,7 +109,7 @@ final class Watchdog: @unchecked Sendable {
         if mainResponsive {
             DispatchQueue.main.async { NSApp.terminate(nil) }
             // terminate can be vetoed or stall; the new copy is already running.
-            queue.asyncAfter(deadline: .now() + 10) { _exit(0) }
+            queue.asyncAfter(deadline: .now() + limits.restartExitGrace) { _exit(0) }
         } else {
             _exit(0)
         }

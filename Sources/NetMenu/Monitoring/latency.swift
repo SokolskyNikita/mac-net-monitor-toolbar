@@ -98,22 +98,22 @@ enum Latency {
 
     static let icmpTargets = [Host.cloudflareDNS, Host.cloudflareDNS2, Host.googleDNS, Host.quad9, Host.google]
     /// Satellite RTT is often 600–2000ms; a 1s cap dropped real replies.
-    static let icmpTimeoutMs = 8000
-    static let gatewayTimeoutMs = 1000
-    static let captiveWait: TimeInterval = 4
-    static let httpWait: TimeInterval = 15
-    static let internetWait: TimeInterval = 8
+    static let icmpTimeoutMs = Configuration.monitoring.icmpTimeoutMs
+    static let gatewayTimeoutMs = Configuration.monitoring.localTimeoutMs
+    static let captiveWait = Configuration.monitoring.captiveTimeout
+    static let httpWait = Configuration.monitoring.httpTimeout
+    static let internetWait = Configuration.monitoring.websiteTimeout
     /// Upper bound for the parallel phase: the slowest ping plus process-kill slack.
-    static let cycleWait: TimeInterval = 14
+    static let cycleWait = Configuration.monitoring.cycleTimeout
 
     /// Echoes from this few hops out are the portal or onboard router, not the target.
-    static let maxLocalHops = 3
+    static let maxLocalHops = Configuration.monitoring.maxLocalHops
 
     // MARK: - Measurement cycle
 
     /// While everything answers, the website and captive checks (two HTTPS handshakes and three
     /// helper processes) run every this many cycles; any sign of trouble makes them run every cycle.
-    static let websiteCheckEvery = 5
+    static let websiteCheckEvery = Configuration.monitoring.websiteCheckEvery
 
     /// Pure: whether the next cycle should fetch the websites and the captive check.
     static func websiteCheckDue(cyclesSinceCheck: Int, lastWebsites: InternetStatus, previous: WanProbe?,
@@ -301,10 +301,10 @@ enum Latency {
         let r = runProcess("/usr/bin/curl", [
             "-q", "-sS", "--proto", "=https", "--max-time", String(Int(internetWait)),
             "--max-redirs", "0", "--max-filesize", "65536",
-            "-H", "Cache-Control: no-cache", "-H", "Accept-Encoding: identity",
+            "-H", HTTPHeader.cacheControlArgument, "-H", HTTPHeader.acceptEncodingArgument,
             "-o", bodyURL.path, "-w", "%{http_code}",
             site.url + "?netmenu=" + UUID().uuidString
-        ], timeout: internetWait + 2)
+        ], timeout: internetWait + Configuration.reliability.probeCompletionAllowance)
         let seconds = Date().timeIntervalSince(t0)
         func check(_ outcome: InternetCheck.Outcome) -> InternetCheck { InternetCheck(outcome: outcome, seconds: seconds) }
         switch r.outcome {
@@ -380,7 +380,8 @@ enum Latency {
 
     /// One `/sbin/ping` process.
     static func subprocessPing(_ host: String, timeoutMs: Int) -> PingOutcome {
-        let procTimeout = max(3.0, Double(timeoutMs) / 1000 + 2)
+        let procTimeout = max(Configuration.monitoring.pingHelperMinTimeout,
+                              Double(timeoutMs) / 1000 + Configuration.reliability.probeCompletionAllowance)
         let r = runProcess("/sbin/ping", ["-c", "1", "-W", String(timeoutMs), "-s", "16", host], timeout: procTimeout)
         switch r.outcome {
         case .launchFailed(let why): return .unmeasured(why)
@@ -409,7 +410,7 @@ enum Latency {
     /// Portal and onboard responders sit a few hops out, or answer about as fast as the gateway.
     static func isOnPathEcho(ms: Double, hops: Int, gatewayMs: Double?) -> Bool {
         if hops <= maxLocalHops { return true }
-        if let gw = gatewayMs, ms <= gw + 15, hops <= 6 { return true }
+        if let gw = gatewayMs, ms <= gw + Configuration.monitoring.gatewayEchoToleranceMs, hops <= Configuration.monitoring.gatewayEchoMaxHops { return true }
         return false
     }
 
@@ -454,7 +455,7 @@ enum Latency {
             "-o", bodyURL.path,
             "-w", "%{http_code}",
             captiveURL
-        ], timeout: captiveWait + 2) else { return .unknown }
+        ], timeout: captiveWait + Configuration.reliability.probeCompletionAllowance) else { return .unknown }
         let status = Int(out.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
         return classifyPortal(status: status, body: readPrefix(of: bodyURL, bytes: 2048))
     }
@@ -494,12 +495,12 @@ enum Latency {
         return URLSession(configuration: c)
     }()
 
+    private static let tracePath = "/cdn-cgi/trace"
+    private static let traceEndpoints = ["https://\(Host.cloudflareDNS)", "https://cloudflare.com"]
+
     /// Time to a verified Cloudflare trace body — a local SYN-ACK or MITM handshake cannot produce one.
     static func httpProbe() -> Double? {
-        let urls = [
-            "https://\(Host.cloudflareDNS)/cdn-cgi/trace?n=\(UUID().uuidString)",
-            "https://cloudflare.com/cdn-cgi/trace?n=\(UUID().uuidString)"
-        ]
+        let urls = traceEndpoints.map { "\($0)\(tracePath)?n=\(UUID().uuidString)" }
         for url in urls {
             if let ms = httpTrace(url) { return ms }
         }
@@ -516,8 +517,8 @@ enum Latency {
         var req = URLRequest(url: u)
         req.cachePolicy = .reloadIgnoringLocalCacheData
         req.timeoutInterval = httpWait
-        req.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
-        req.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+        req.setValue(HTTPHeader.identityEncoding, forHTTPHeaderField: HTTPHeader.acceptEncoding)
+        req.setValue(HTTPHeader.noCache, forHTTPHeaderField: HTTPHeader.cacheControl)
 
         let t0 = Date()
         let sem = DispatchSemaphore(value: 0)
@@ -528,7 +529,7 @@ enum Latency {
             sem.signal()
         }
         task.resume()
-        if sem.wait(timeout: .now() + httpWait + 2) == .timedOut {
+        if sem.wait(timeout: .now() + httpWait + Configuration.reliability.probeCompletionAllowance) == .timedOut {
             task.cancel()
             return nil
         }

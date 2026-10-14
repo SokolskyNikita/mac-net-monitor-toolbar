@@ -1,33 +1,100 @@
 import AppKit
 
+/// Semantic row types select layout; display wording is never used as a type tag.
+enum MenuReadoutKind {
+    case health, local, traffic, peak, topApps, connections, connectionApps, message, result, warning
+
+    var isHealth: Bool { self == .health || self == .local }
+    var isDetailed: Bool { self == .result || self == .warning }
+    var isStacked: Bool { self == .connections || self == .connectionApps }
+    var usesProportionalValue: Bool { self == .topApps || self == .connectionApps }
+    var label: String {
+        switch self {
+        case .health: return "Connection health"
+        case .local: return "Local health"
+        case .traffic: return "Throughput"
+        case .peak: return "Peak this connection"
+        case .topApps: return "Top apps"
+        case .connections: return "Connections"
+        case .connectionApps: return "Top conn. consumers"
+        case .result: return "Speed test"
+        case .warning: return "⚠ Wi-Fi scans"
+        case .message: return ""
+        }
+    }
+    var heading: String {
+        switch self {
+        case .health: return "Internet health"
+        case .local: return "Local router"
+        case .traffic: return "Traffic"
+        case .peak: return "Peak"
+        default: return label
+        }
+    }
+}
+
+/// Full text remains available to CLI callers, accessibility and tooltips.
+struct MenuReadout: Equatable {
+    var kind: MenuReadoutKind
+    var heading: String
+    var value: String = ""
+    var detail: String = ""
+    var score: Int? = nil
+    var title: String
+
+    static func row(_ kind: MenuReadoutKind, value: String, qualifier: String = "", context: String = "") -> Self {
+        Self(kind: kind, heading: kind.heading + qualifier, value: value,
+             title: kind.label + context + qualifier + ": " + value)
+    }
+
+    static func message(_ text: String) -> Self {
+        Self(kind: .message, heading: text, title: text)
+    }
+
+    static func detail(_ kind: MenuReadoutKind, _ text: String) -> Self {
+        Self(kind: kind, heading: kind.heading, detail: text,
+             title: kind == .result ? text : kind.label + ": " + text)
+    }
+
+    static func health(_ kind: MenuReadoutKind, score: Int? = nil, parts: [String] = [], status: String = "measuring…") -> Self {
+        guard let score else {
+            return Self(kind: kind, heading: kind.heading, value: "—", detail: status,
+                        title: kind.label + ": " + status)
+        }
+        return Self(kind: kind, heading: kind.heading, value: "\(score)%",
+                    detail: parts.joined(separator: ", ").replacingOccurrences(of: ", ", with: " · ")
+                        .replacingOccurrences(of: "latency ", with: "RTT "),
+                    score: score, title: "\(kind.label): \(score)% (\(parts.joined(separator: ", ")))")
+    }
+}
+
 /// Read-only content with normal contrast, rather than the disabled-command appearance.
 /// Keep native titles empty: AppKit otherwise sizes the menu for their unwrapped text.
 /// The custom view retains the full description for accessibility and tooltips.
 final class MenuReadoutItem: NSMenuItem {
-    enum Style { case health, local, compact, result }
     private var readout: MenuReadoutView?
 
-    init(title: String, style: Style) {
-        self.readoutTitle = title
+    init(readout: MenuReadout) {
+        self.content = readout
         super.init(title: "", action: nil, keyEquivalent: "")
-        let content = MenuReadoutView(style: style)
-        readout = content
+        let content = MenuReadoutView()
+        self.readout = content
         view = content
         isEnabled = false
-        content.update(title)
+        content.update(readout)
     }
 
     required init(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
-    var readoutTitle: String {
+    var content: MenuReadout {
         didSet {
-            readout?.update(readoutTitle)
+            readout?.update(content)
             if let toolTip { readout?.toolTip = toolTip }
         }
     }
 
     override var toolTip: String? {
-        didSet { readout?.toolTip = toolTip ?? readoutTitle }
+        didSet { readout?.toolTip = toolTip ?? content.title }
     }
 }
 
@@ -39,15 +106,14 @@ final class MenuReadoutView: NSView {
         }
         return NSColor(calibratedRed: 0.65, green: 0.32, blue: 0.02, alpha: 1)
     }
-    private let style: MenuReadoutItem.Style
+    private var kind = MenuReadoutKind.message
     private let heading = NSTextField(labelWithString: "")
     private let value = NSTextField(labelWithString: "")
     private let detail = NSTextField(wrappingLabelWithString: "")
-    private var lastTitle: String?
+    private var lastReadout: MenuReadout?
     private var stacked = false
 
-    init(style: MenuReadoutItem.Style) {
-        self.style = style
+    init() {
         super.init(frame: NSRect(x: 0, y: 0, width: Self.width, height: 22))
         for label in [heading, value, detail] {
             label.isSelectable = false
@@ -72,59 +138,43 @@ final class MenuReadoutView: NSView {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     override var isFlipped: Bool { true }
 
-    func update(_ title: String) {
-        guard title != lastTitle else { return }
-        lastTitle = title
-        toolTip = title
-        setAccessibilityLabel(title)
-        let split = title.range(of: ": ")
-        let name = split.map { String(title[..<$0.lowerBound]) } ?? ""
-        let body = split.map { String(title[$0.upperBound...]) } ?? title
+    func update(_ content: MenuReadout) {
+        guard content != lastReadout else { return }
+        lastReadout = content
+        kind = content.kind
+        stacked = kind.isStacked
+        toolTip = content.title
+        setAccessibilityLabel(content.title)
+        heading.stringValue = content.heading
+        value.stringValue = content.value
+        detail.stringValue = content.detail
+        heading.font = .systemFont(ofSize: 12, weight: .medium)
+        heading.textColor = .secondaryLabelColor
         value.textColor = .labelColor
-        switch style {
-        case .health, .local:
-            heading.stringValue = style == .health ? "Internet health" : "Local router"
+        value.alignment = stacked ? .left : .right
+        value.maximumNumberOfLines = stacked ? 2 : 1
+        value.lineBreakMode = stacked ? .byWordWrapping : .byTruncatingTail
+        detail.font = .systemFont(ofSize: 11)
+        detail.textColor = .secondaryLabelColor
+        if kind.isHealth {
             heading.font = .systemFont(ofSize: 13, weight: .semibold)
             heading.textColor = .labelColor
             value.font = .monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
-            if let percent = body.firstIndex(of: "%"), let score = Int(body[..<percent]) {
-                value.stringValue = "\(score)%"
-                value.textColor = score < 95 ? Self.warningColor : .labelColor
-                let rest = String(body[body.index(after: percent)...]).trimmingCharacters(in: .whitespaces)
-                detail.stringValue = rest.trimmingCharacters(in: CharacterSet(charactersIn: "()"))
-                    .replacingOccurrences(of: ", ", with: " · ")
-                    .replacingOccurrences(of: "latency ", with: "RTT ")
-            } else {
-                value.stringValue = "—"
-                detail.stringValue = body
-            }
-        case .compact:
-            let names = ["Throughput": "Traffic", "Peak this connection": "Peak", "Top apps": "Top apps"]
-            heading.stringValue = split == nil ? title : (names[name] ?? (name.hasPrefix("Top apps") ? "Top apps" : name))
-            value.stringValue = split == nil ? "" : body
-            if name.hasPrefix("Top apps"), let suffix = name.range(of: " (~") {
-                heading.stringValue += " " + name[suffix.lowerBound...].trimmingCharacters(in: .whitespaces)
-            }
-            // Application names should use proportional text; reserve tabular digits for measurements.
-            value.font = (name.hasPrefix("Top apps") || name.hasPrefix("Top conn.")) ? .systemFont(ofSize: 12) : .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
-            detail.stringValue = ""
-            stacked = name == "Connections" || name.hasPrefix("Top conn. consumers")
-            value.alignment = stacked ? .left : .right
-            value.maximumNumberOfLines = stacked ? 2 : 1
-            value.lineBreakMode = stacked ? .byWordWrapping : .byTruncatingTail
-        case .result:
-            heading.stringValue = name.isEmpty ? "Speed test" : name
-            value.stringValue = ""
-            detail.stringValue = body
+            if let score = content.score, score < 95 { value.textColor = Self.warningColor }
+        } else if kind.isDetailed {
             detail.font = .systemFont(ofSize: 12, weight: .medium)
             detail.textColor = .labelColor
+            if kind == .warning { heading.textColor = Self.warningColor }
+        } else {
+            value.font = kind.usesProportionalValue ? .systemFont(ofSize: 12)
+                : .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
         }
         // Reserve a second line only when the text actually wraps.
         let textWidth = Self.width - 28
         let height: CGFloat
-        if style == .health || style == .local {
+        if kind.isHealth {
             height = 28 + textHeight(detail, width: textWidth)
-        } else if style == .result {
+        } else if kind.isDetailed {
             height = 36 + textHeight(detail, width: textWidth)
         } else if stacked {
             height = 24 + textHeight(value, width: textWidth)
@@ -143,11 +193,11 @@ final class MenuReadoutView: NSView {
     override func layout() {
         super.layout()
         let inset: CGFloat = 14, contentWidth = bounds.width - 2 * inset
-        if style == .health || style == .local {
+        if kind.isHealth {
             heading.frame = NSRect(x: inset, y: 3, width: contentWidth - 70, height: 20)
             value.frame = NSRect(x: bounds.width - inset - 65, y: 0, width: 65, height: 24)
             detail.frame = NSRect(x: inset, y: 24, width: contentWidth, height: bounds.height - 28)
-        } else if style == .result {
+        } else if kind.isDetailed {
             heading.frame = NSRect(x: inset, y: 8, width: contentWidth, height: 16)
             value.frame = .zero
             detail.frame = NSRect(x: inset, y: 26, width: contentWidth, height: bounds.height - 36)

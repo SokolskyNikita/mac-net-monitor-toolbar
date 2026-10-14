@@ -37,6 +37,8 @@ final class StatusBarRenderer {
     private let statusItem: NSStatusItem
     private var statusWidth = StableWidth()
     private var showThroughput = false
+    private var calibrating = false
+    private var hasWarning = false
     private var spinnerTimer: Timer?
     private var spinnerPhase = 0
     private var lastStatus = (lat: "✕", health: "", down: "0B", up: "0B")
@@ -52,12 +54,14 @@ final class StatusBarRenderer {
     }
 
     func render(lat: String, health: String, down: String, up: String,
-                showThroughput: Bool, calibrating: Bool) {
+                showThroughput: Bool, calibrating: Bool, hasWarning: Bool = false) {
         if self.showThroughput != showThroughput {
             // Hiding should narrow the item now, not after the usual shrink delay.
             statusWidth = StableWidth()
         }
         self.showThroughput = showThroughput
+        self.calibrating = calibrating
+        self.hasWarning = hasWarning
         setSpinning(calibrating)
         paintStatus(lat: lat, health: health, down: down, up: up)
     }
@@ -69,13 +73,14 @@ final class StatusBarRenderer {
         let item = statusItem
         guard let button = item.button else { return }
         lastStatus = (lat, health, down, up)
-        var fields = [(lat, "999ms"), (health, health.contains("⚠") ? "100% ⚠" : "100%")]
+        var fields = [(lat, "999ms"), (health, hasWarning ? "100% ⚠" : "100%")]
         if showThroughput { fields += [(down + "↓", "999K↓"), (up + "↑", "999K↑")] }
         func width(_ s: String) -> CGFloat { (s as NSString).size(withAttributes: Self.statusAttrs).width }
         let slots = fields.map { max(width($0.0), width($0.1)) }
         let content = ceil(slots.reduce(0, +) + Self.statusGap * CGFloat(fields.count - 1))
         let w = CGFloat(statusWidth.fit(Double(content), now: BandwidthClock.now()))
         let angle = CGFloat(spinnerPhase % 12) * 30
+        let calibrating = self.calibrating
         let img = NSImage(size: NSSize(width: w, height: 18), flipped: false) { _ in
             var edge = w - content
             for (i, ((s, _), slot)) in zip(fields, slots).enumerated() {
@@ -86,7 +91,7 @@ final class StatusBarRenderer {
                 edge += slot
                 let x = edge - width(s)
                 (s as NSString).draw(at: NSPoint(x: x, y: 2), withAttributes: Self.statusAttrs)
-                if s == Self.calibratingText || s.hasPrefix(Self.calibratingText + " ") {
+                if i == 1 && calibrating {
                     Self.drawSpinner(center: NSPoint(x: x - width("0"), y: 9), angle: angle)
                 }
                 edge += Self.statusGap

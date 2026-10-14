@@ -4,22 +4,27 @@ import Foundation
 /// Website evidence has its own history so a single failed check cannot become two failures
 /// merely because more ping replies arrived.
 struct LiveHealthTracker {
+    let config: HealthConfig
+    let monitoring: MonitoringConfig
+    init(config: HealthConfig = Configuration.health, monitoring: MonitoringConfig = Configuration.monitoring) {
+        self.config = config; self.monitoring = monitoring
+    }
     private var rounds: [TimeInterval: HealthSample] = [:]
     private var fallbackSamples: [HealthSample] = []
     private var web: [(at: TimeInterval, reachable: Bool)] = []
     private var portalAt: TimeInterval?
     private var settleUntil: TimeInterval?
 
-    mutating func reset() { self = Self() }
-    mutating func settle(at now: TimeInterval = HealthTracker.now()) { settleUntil = now + Health.settleLimit }
+    mutating func reset() { self = Self(config: config, monitoring: monitoring) }
+    mutating func settle(at now: TimeInterval = HealthTracker.now()) { settleUntil = now + config.settleLimit }
     private mutating func accept(success: Bool, at now: TimeInterval) -> Bool {
         if let until = settleUntil {
             guard success || now >= until else { return false }
             settleUntil = nil
         }
-        rounds = rounds.filter { now - $0.key <= Health.window }
-        fallbackSamples.removeAll { now - $0.at > Health.window }
-        web.removeAll { now - $0.at > Health.window }
+        rounds = rounds.filter { now - $0.key <= config.window }
+        fallbackSamples.removeAll { now - $0.at > config.window }
+        web.removeAll { now - $0.at > config.window }
         return true
     }
 
@@ -56,29 +61,29 @@ struct LiveHealthTracker {
     }
 
     func hasFreshWebCheck(now: TimeInterval = HealthTracker.now()) -> Bool {
-        web.last.map { now - $0.at <= 30 } ?? false
+        web.last.map { now - $0.at <= monitoring.websiteFreshFor } ?? false
     }
 
     func transportReport(now: TimeInterval = HealthTracker.now()) -> HealthReport? {
-        let samples = rounds.values.filter { now - $0.at <= Health.window }.sorted { $0.at < $1.at }
-        let http = fallbackSamples.filter { now - $0.at <= Health.window }
+        let samples = rounds.values.filter { now - $0.at <= config.window }.sorted { $0.at < $1.at }
+        let http = fallbackSamples.filter { now - $0.at <= config.window }
         let lastWAN = samples.last(where: { $0.ms != nil })?.at
         let lastHTTPS = http.last(where: { $0.ms != nil })?.at
         // ICMP filtering must not look like loss when independent HTTPS probes work,
         // including when a previously pingable network starts filtering ICMP.
-        let useHTTPS = lastWAN == nil || (lastHTTPS.map { $0 > lastWAN! } == true && now - lastWAN! > 10)
-        return Health.evaluate(useHTTPS && !http.isEmpty ? http : samples, now: now)
+        let useHTTPS = lastWAN == nil || (lastHTTPS.map { $0 > lastWAN! } == true && now - lastWAN! > monitoring.wanFreshFor)
+        return Health.evaluate(useHTTPS && !http.isEmpty ? http : samples, now: now, config: config)
     }
 
     func report(now: TimeInterval = HealthTracker.now()) -> HealthReport? {
         var result = transportReport(now: now)
         let samples = Array(rounds.values)
         let http = fallbackSamples
-        let checks = web.filter { now - $0.at <= 30 }
+        let checks = web.filter { now - $0.at <= monitoring.websiteFreshFor }
         if let last = checks.last, !last.reachable {
-            let portal = portalAt.map { now - $0 <= 30 } ?? false
-            let noWAN = !samples.contains { now - $0.at <= 10 && $0.ms != nil }
-            let fallbackFailed = http.last.map { now - $0.at <= 20 && $0.ms == nil } ?? false
+            let portal = portalAt.map { now - $0 <= monitoring.websiteFreshFor } ?? false
+            let noWAN = !samples.contains { now - $0.at <= monitoring.wanFreshFor && $0.ms != nil }
+            let fallbackFailed = http.last.map { now - $0.at <= monitoring.fallbackFailureFreshFor && $0.ms == nil } ?? false
             let confirmed = portal || (noWAN && fallbackFailed) || checks.dropLast().last?.reachable == false
             if confirmed {
                 if result == nil { result = HealthReport(score: 0, loss: 0, jitterMs: nil, latencyMs: nil) }
@@ -89,21 +94,26 @@ struct LiveHealthTracker {
     }
 
     func latencyReadings(now: TimeInterval = HealthTracker.now()) -> [Double] {
-        rounds.values.filter { now - $0.at <= staleAfter }.sorted { $0.at < $1.at }
-            .compactMap(\.ms).suffix(displayLatWindow).map { $0 }
+        rounds.values.filter { now - $0.at <= monitoring.latencyStaleAfter }.sorted { $0.at < $1.at }
+            .compactMap(\.ms).suffix(monitoring.displayLatencyReadings).map { $0 }
     }
 }
 
 /// Short-lived evidence is independent of calibration and the smoothed quality score.
 struct RecentTrouble {
+    let config: MonitoringConfig
+    let health: HealthConfig
+    init(config: MonitoringConfig = Configuration.monitoring, health: HealthConfig = Configuration.health) {
+        self.config = config; self.health = health
+    }
     private var events: [String: TimeInterval] = [:]
     private var previous: [String: Double] = [:]
     mutating func record(_ verdict: Latency.EchoVerdict, target: String, label: String,
                          at now: TimeInterval = HealthTracker.now()) {
         switch verdict {
         case .wan(let ms):
-            if Health.latencyCurve.penalty(ms) > 0.05 { events["\(label) latency"] = now }
-            if let old = previous[target], Health.jitterPenalty(abs(ms - old), latencyMs: max(ms, old)) > 0.05 {
+            if Health.latencyPenalty(ms, config: health) > config.recentTroublePenalty { events["\(label) latency"] = now }
+            if let old = previous[target], Health.jitterPenalty(abs(ms - old), latencyMs: max(ms, old), config: health) > config.recentTroublePenalty {
                 events["\(label) jitter"] = now
             }
             previous[target] = ms
@@ -112,16 +122,18 @@ struct RecentTrouble {
             if previous[target] != nil { events["\(label) loss"] = now }
         case .onPath, .unmeasured: break
         }
-        events = events.filter { now - $0.value < 10 }
+        events = events.filter { now - $0.value < config.recentTroubleDuration }
     }
     mutating func websitesFailed(at now: TimeInterval = HealthTracker.now()) { events["web access"] = now }
     func labels(now: TimeInterval = HealthTracker.now()) -> [String] {
-        events.filter { now - $0.value < 10 }.keys.sorted()
+        events.filter { now - $0.value < config.recentTroubleDuration }.keys.sorted()
     }
 }
 
 /// Count completed connectivity recoveries, not startup, wakes, or metadata-only path updates.
 struct ReconnectHistory {
+    let config: MonitoringConfig
+    init(config: MonitoringConfig = Configuration.monitoring) { self.config = config }
     private var wasConnected: Bool?
     private var disconnected = false
     private var recoveries: [TimeInterval] = []
@@ -131,8 +143,8 @@ struct ReconnectHistory {
             if !before && connected && disconnected { recoveries.append(now); disconnected = false }
         }
         wasConnected = connected
-        recoveries.removeAll { now - $0 >= 300 }
+        recoveries.removeAll { now - $0 >= config.reconnectWindow }
     }
     mutating func wake() { wasConnected = nil; disconnected = false }
-    func count(now: TimeInterval = HealthTracker.now()) -> Int { recoveries.filter { now - $0 < 300 }.count }
+    func count(now: TimeInterval = HealthTracker.now()) -> Int { recoveries.filter { now - $0 < config.reconnectWindow }.count }
 }

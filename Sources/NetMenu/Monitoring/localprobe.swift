@@ -23,6 +23,8 @@ struct LocalProbeResult {
 /// Discover alternatives only after three failures, at most once every 30 seconds.
 /// Locking also protects against a late result after the WAN phase's outer deadline.
 final class LocalProbeSession {
+    private let config: MonitoringConfig
+    init(config: MonitoringConfig = Configuration.monitoring) { self.config = config }
     private let lock = NSLock()
     private var router: LocalRouter?
     private var epoch: Int?
@@ -44,8 +46,8 @@ final class LocalProbeSession {
             return .init(method: method, outcome: outcome)
         }
         failures += 1
-        if now >= nextDiscovery, selected == nil || failures >= 3 {
-            nextDiscovery = now + 30
+        if now >= nextDiscovery, selected == nil || failures >= config.localFailureLimit {
+            nextDiscovery = now + config.localDiscoveryInterval
             for candidate in LocalProbeMethod.allCases where candidate != method {
                 let fallback = probe(candidate, router)
                 if case .reply = fallback {
@@ -62,7 +64,7 @@ final class LocalProbeSession {
 /// TCP sends no application data, and DHCPINFORM neither requests nor renews a lease.
 /// Never broadcast, talk to an off-router DHCP/DNS server, or reuse the OS DHCP socket.
 enum LocalProtocols {
-    static let timeoutMs = 1000
+    static let timeoutMs = Configuration.monitoring.localTimeoutMs
 
     static func probe(_ method: LocalProbeMethod, _ router: LocalRouter) -> Latency.PingOutcome {
         switch method {

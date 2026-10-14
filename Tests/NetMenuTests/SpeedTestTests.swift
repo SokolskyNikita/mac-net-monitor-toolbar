@@ -156,12 +156,12 @@ private func fastConfig(budget: Int = 4_000_000, maxBudget: Int? = nil) -> Speed
     @Test func titles() {
         var r = SpeedTestResult(download: phase(.download, 268.4), upload: phase(.upload, 4.26), idleLatencyMs: 9.4)
         r.download?.loadedLatencyMs = 41; r.upload?.loadedLatencyMs = 30
-        #expect(r.status == "ok")
+        #expect(r.status == .ok)
         #expect(r.title == "Last test: 268↓ / 4.3↑ Mbps · 9ms, 41ms loaded")
         r.download = phase(.download, 480, lower: true)
         #expect(r.title.hasPrefix("Last test: ≥480↓"))
         r.upload = phase(.upload, nil, error: "timed out")
-        #expect(r.status == "partial")
+        #expect(r.status == .partial)
         #expect(r.title == "Partial test: ≥480↓ / —↑ Mbps (upload: timed out)")
         let failed = SpeedTestResult(download: phase(.download, nil, error: "offline"))
         #expect(failed.title == "Test failed — download: offline")
@@ -184,7 +184,7 @@ private func fastConfig(budget: Int = 4_000_000, maxBudget: Int? = nil) -> Speed
         #expect(r.idleLatencyMs == 12)
         // Stopped on stability long before spending the budget.
         #expect(r.bytesReserved < 40_000_000)
-        #expect(r.status == "ok")
+        #expect(r.status == .ok)
     }
 
     @Test func slowHighLatencyLinkIsMeasuredWithinTheDeadline() {
@@ -240,7 +240,7 @@ private func fastConfig(budget: Int = 4_000_000, maxBudget: Int? = nil) -> Speed
         #expect(r.download?.error == "network changed")
         #expect(r.upload == nil)
         #expect(r.networkChanged)
-        #expect(r.status == "failed")
+        #expect(r.status == .failed)
         #expect(r.title == "Test stopped — network changed")
     }
 
@@ -252,7 +252,7 @@ private func fastConfig(budget: Int = 4_000_000, maxBudget: Int? = nil) -> Speed
                                     isCurrentNetwork: { !phasesDone },
                                     progress: { if case .transfer(.upload, let mbps) = $0, mbps != nil { phasesDone = true } })
         #expect(flipped.networkChanged)
-        #expect(flipped.status == "failed")
+        #expect(flipped.status == .failed)
     }
 
     @Test func fastLinkIsMeasuredOnItsSteadyPartNotItsRamp() {
@@ -283,7 +283,7 @@ private func fastConfig(budget: Int = 4_000_000, maxBudget: Int? = nil) -> Speed
         link.stallAfterBytes = 0
         let r = SpeedTest.run(config: fastConfig(), makeTransport: { SimTransport(link) })
         #expect(r.download?.error == "no data received")
-        #expect(r.status == "failed")
+        #expect(r.status == .failed)
     }
 
     @Test func permanentServerErrorIsReportedNotRetriedForever() {

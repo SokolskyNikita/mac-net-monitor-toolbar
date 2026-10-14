@@ -7,7 +7,8 @@ import Foundation
 final class URLSessionSpeedTransport: NSObject, SpeedTransport, URLSessionDataDelegate, @unchecked Sendable {
     /// Upload responses are tiny; anything larger is not the speed test server.
     static let responseLimit = 16_384
-    static let latencyPath = "/__down?bytes=0"
+    static let latencyPath = "\(URLPart.speedDownPath)?\(URLPart.bytesQuery)0"
+    private static let payloadMIMEType = "application/octet-stream"
 
     private var session: URLSession!
     private let lock = NSLock()
@@ -60,7 +61,7 @@ final class URLSessionSpeedTransport: NSObject, SpeedTransport, URLSessionDataDe
         let task: URLSessionTask
         if direction == .upload {
             request.httpMethod = HTTPMethod.post
-            request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
+            request.setValue(Self.payloadMIMEType, forHTTPHeaderField: "Content-Type")
             // Random bytes: a compressing middlebox cannot inflate the result.
             task = session.uploadTask(with: request, from: Self.randomData(size))
         } else {
@@ -104,8 +105,8 @@ final class URLSessionSpeedTransport: NSObject, SpeedTransport, URLSessionDataDe
         var r = URLRequest(url: url)
         r.timeoutInterval = timeout
         r.cachePolicy = .reloadIgnoringLocalCacheData
-        r.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
-        r.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
+        r.setValue(HTTPHeader.noCache, forHTTPHeaderField: HTTPHeader.cacheControl)
+        r.setValue(HTTPHeader.identityEncoding, forHTTPHeaderField: HTTPHeader.acceptEncoding)
         return r
     }
 
@@ -170,7 +171,7 @@ final class URLSessionSpeedTransport: NSObject, SpeedTransport, URLSessionDataDe
         guard let p = current(dataTask) else { completionHandler(.cancel); return }
         if let http = response as? HTTPURLResponse {
             if !(200..<300).contains(http.statusCode) { p.failure = SpeedTestError.httpStatus(http.statusCode) }
-            else if p.direction == .download && http.mimeType != "application/octet-stream" {
+            else if p.direction == .download && http.mimeType != Self.payloadMIMEType {
                 p.failure = SpeedTestError.invalidResponse
             }
             p.serverMs = Self.serverTimingMs(http.value(forHTTPHeaderField: "Server-Timing"))

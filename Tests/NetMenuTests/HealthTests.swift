@@ -23,54 +23,55 @@ private func score(_ samples: [HealthSample]) -> Int {
     Health.evaluate(samples)?.score ?? -1
 }
 
-@Suite struct HealthCurveTests {
-    let curve = HealthCurve(half: 30, steepness: 2, max: 0.8)
-
-    @Test func halfPointIsHalfOfMax() {
-        #expect(abs(curve.penalty(30) - 0.4) < 1e-9)
+@Suite struct DelayBudgetModelTests {
+    @Test func agreedCalibrationExamples() {
+        // RTT, jitter (ms), loss (fraction), rounded health from the approved model.
+        let cases: [(Double, Double, Double, Int)] = [
+            (20, 50, 0, 100), (100, 50, 0, 100), (300, 50, 0, 87),
+            (600, 50, 0, 37), (20, 50, 0.03, 71), (300, 50, 0.05, 43),
+            (20, 0, 0.01, 100), (20, 0, 0.05, 50), (20, 0, 1, 0),
+            (220, 0, 0, 100), (620, 0, 0, 50)
+        ]
+        for (rtt, jitter, loss, expected) in cases {
+            #expect(Int(Health.rawScore(loss: loss, jitterMs: jitter, latencyMs: rtt).rounded()) == expected)
+        }
     }
 
-    @Test func zeroNegativeAndNaNCostNothing() {
-        #expect(curve.penalty(0) == 0)
-        #expect(curve.penalty(-5) == 0)
-        #expect(curve.penalty(.nan) == 0)
+    @Test func jitterConsumesTheSameBudgetAsOneWayDelay() {
+        #expect(Health.rawScore(loss: 0, jitterMs: 100, latencyMs: 200)
+                == Health.rawScore(loss: 0, jitterMs: 0, latencyMs: 400))
+        #expect(Health.jitterPenalty(50, latencyMs: 20) == 0)
+        #expect(Health.jitterPenalty(50, latencyMs: 600) > 0.3)
+        #expect(Health.jitterPenalty(0, latencyMs: 600) == 0)
     }
 
-    @Test func saturatesAtMax() {
-        #expect(curve.penalty(.infinity) == 0.8)
-        #expect(curve.penalty(100_000) < 0.8)
-        #expect(curve.penalty(100_000) > 0.79)
-    }
-
-    @Test func fullPointReachesMaxExactly() {
-        #expect(Health.lossCurve.penalty(1) == 1)
-        #expect(Health.lossCurve.penalty(0.99) < 1)
-        #expect(abs(Health.lossCurve.penalty(0.07) - 0.5) < 0.01)
-    }
-
-    @Test func freeZoneCostsNothingAndHalfIsMeasuredPastIt() {
-        let c = HealthCurve(free: 40, half: 25, steepness: 2, max: 0.8)
-        #expect(c.penalty(40) == 0)
-        #expect(c.penalty(40.001) > 0)
-        #expect(abs(c.penalty(65) - 0.4) < 1e-9)
-    }
-
-    @Test func isMonotonic() {
-        let xs = stride(from: 0.0, through: 500, by: 5).map(curve.penalty)
-        #expect(zip(xs, xs.dropFirst()).allSatisfy { $0 <= $1 })
+    @Test func worseningAnyInputCannotImproveHealth() {
+        let loss = stride(from: 0.0, through: 1, by: 0.01).map {
+            Health.rawScore(loss: $0, jitterMs: 50, latencyMs: 300)
+        }
+        let jitter = stride(from: 0.0, through: 1000, by: 10).map {
+            Health.rawScore(loss: 0.03, jitterMs: $0, latencyMs: 300)
+        }
+        let latency = stride(from: 0.0, through: 2000, by: 10).map {
+            Health.rawScore(loss: 0.03, jitterMs: 50, latencyMs: $0)
+        }
+        for values in [loss, jitter, latency] {
+            #expect(values.allSatisfy { $0.isFinite && $0 >= 0 && $0 <= 100 })
+            #expect(zip(values, values.dropFirst()).allSatisfy { $0 >= $1 })
+        }
     }
 }
 
 @Suite struct HealthScoreTests {
     @Test(arguments: [600.0, 650.0, 700.0])
-    func modestSatelliteJitterHasNoExtraPenalty(baseline: Double) {
+    func satelliteJitterConsumesDelayBudget(baseline: Double) {
         let steady = (0..<20).map { _ in cycle(baseline) }
         let varying = (0..<20).map { cycle(baseline + ($0 % 2 == 0 ? -50 : 50)) }
         let report = try! #require(Health.evaluate(varying))
         #expect(report.jitterMs == 100)
         #expect(report.latencyMs == baseline)
-        #expect(report.score == score(steady))
-        #expect(report.score >= 50 && report.score <= 56)
+        #expect(report.score < score(steady))
+        #expect(report.score == [600.0: 23, 650.0: 18, 700.0: 13][baseline])
     }
 
     @Test func largeRelativeSatelliteJitterStillHurts() {
@@ -78,10 +79,10 @@ private func score(_ samples: [HealthSample]) -> Int {
         let moderate = (0..<20).map { cycle($0 % 2 == 0 ? 550 : 750) }
         let severe = (0..<20).map { cycle($0 % 2 == 0 ? 450 : 850) }
         #expect(score(moderate) < score(steady) - 15)
-        #expect(score(severe) < score(moderate) - 15)
+        #expect(score(severe) < score(moderate))
     }
 
-    @Test func satelliteJitterAllowanceDoesNotMaskBlockedInternet() {
+    @Test func delayBudgetDoesNotMaskBlockedInternet() {
         let samples = (0..<20).map {
             cycle($0 % 2 == 0 ? 600 : 700, internetReachable: false)
         }
@@ -148,8 +149,8 @@ private func score(_ samples: [HealthSample]) -> Int {
         #expect(score(trace.map { cycle($0) }) == 100)
     }
 
-    @Test func linkAtZoomLimitsIsPerfect() {
-        // Zoom: latency ≤150ms, jitter ≤40ms, loss ≤2%.
+    @Test func twoPercentLossHasAMildPenalty() {
+        // Within the free delay budget, 2% loss incurs one point of excess loss.
         let samples = (0..<20).map { i in
             let ms: Double = i % 2 == 0 ? 125 : 160
             return cycle(ms, targets: [i < 2 ? .noReply : .wan(ms), .wan(ms), .wan(ms), .wan(ms), .wan(ms)])
@@ -157,27 +158,27 @@ private func score(_ samples: [HealthSample]) -> Int {
         let r = try! #require(Health.evaluate(samples))
         #expect(abs(r.loss - 0.02) < 1e-9)
         #expect(r.jitterMs == 35)
-        #expect(r.score == 100)
+        #expect(r.score == 84)
     }
 
     @Test func oscillatingLatencyIsBad() {
-        let flapping = (0..<20).map { cycle($0 % 2 == 0 ? 15 : 100) }
+        let flapping = (0..<20).map { cycle($0 % 2 == 0 ? 100 : 500) }
         let r = try! #require(Health.evaluate(flapping))
-        #expect(r.jitterMs == 85)
+        #expect(r.jitterMs == 400)
         #expect(r.score < 45)
     }
 
     @Test func oscillationIsWorseThanSteadyLinkWithSameMedian() {
-        let flapping = (0..<20).map { cycle($0 % 2 == 0 ? 15 : 100) }
-        let steady = (0..<20).map { _ in cycle(57.5) }
-        #expect(score(steady) == 100)
+        let flapping = (0..<20).map { cycle($0 % 2 == 0 ? 100 : 500) }
+        let steady = (0..<20).map { _ in cycle(300) }
+        #expect(score(steady) == 97)
         #expect(score(flapping) + 50 < score(steady))
     }
 
-    @Test func singleSpikeIsTrimmed() {
+    @Test func singleSpikeContributesToJitterWithinFreeDelayBudget() {
         var samples = (0..<20).map { _ in cycle(15) }
         samples[10] = cycle(900)
-        #expect(Health.evaluate(samples)?.jitterMs == 0)
+        #expect(abs((Health.evaluate(samples)?.jitterMs ?? 0) - 1770.0 / 19) < 1e-9)
         #expect(score(samples) == 100)
     }
 
@@ -194,19 +195,19 @@ private func score(_ samples: [HealthSample]) -> Int {
         #expect(s >= 45 && s <= 65)
     }
 
-    @Test func lossPastZoomLimitScoresLower() {
+    @Test func lossPastOnePercentScoresLower() {
         func withLoss(_ lostEchoes: Int) -> Int { score(spreadLoss(lostEchoes)) }
         #expect(withLoss(0) == 100)
-        #expect(withLoss(2) == 100)
+        #expect(withLoss(1) == 100)
         let scores = [2, 3, 5, 10, 15].map(withLoss)
         #expect(zip(scores, scores.dropFirst()).allSatisfy { $0 > $1 })
     }
 
-    @Test func sevenPercentLossRoughlyHalvesScore() {
-        // 7 of 100 echoes lost across all hosts: 5 points past Zoom's 2% limit.
-        let r = try! #require(Health.evaluate(spreadLoss(7)))
-        #expect(abs(r.loss - 0.07) < 1e-9)
-        #expect(r.score >= 45 && r.score <= 52)
+    @Test func fivePercentLossHalvesScore() {
+        // 5 of 100 echoes lost across all hosts: four points past the 1% allowance.
+        let r = try! #require(Health.evaluate(spreadLoss(5)))
+        #expect(abs(r.loss - 0.05) < 1e-9)
+        #expect(r.score == 50)
     }
 
     @Test func targetThatNeverAnswersIsNotLoss() {
@@ -305,38 +306,6 @@ private func score(_ samples: [HealthSample]) -> Int {
         }
         let s = score(awful)
         #expect(s >= 0 && s <= 5)
-    }
-}
-
-@Suite struct RelativeJitterTests {
-    @Test(arguments: [0.0, 50.0, 150.0, 200.0])
-    func fastLinksKeepExistingPenalties(latency: Double) {
-        for jitter in [0.0, 40, 60, 85, 100, 400] {
-            #expect(Health.jitterPenalty(jitter, latencyMs: latency) == Health.jitterCurve.penalty(jitter))
-        }
-    }
-
-    @Test func sameRelativeVariationHasSamePenaltyOnSlowLinks() {
-        let expected = Health.jitterPenalty(200, latencyMs: 650)
-        #expect(expected > 0.3 && expected < 0.4)
-        #expect(abs(Health.jitterPenalty(400, latencyMs: 1300) - expected) < 1e-9)
-    }
-
-    @Test func penaltyGrowsWithJitterAndFallsWithBaseline() {
-        let byJitter = stride(from: 0.0, through: 1000, by: 10).map {
-            Health.jitterPenalty($0, latencyMs: 650)
-        }
-        #expect(zip(byJitter, byJitter.dropFirst()).allSatisfy { $0 <= $1 })
-        let byLatency = stride(from: 0.0, through: 1000, by: 10).map {
-            Health.jitterPenalty(100, latencyMs: $0)
-        }
-        #expect(zip(byLatency, byLatency.dropFirst()).allSatisfy { $0 >= $1 })
-    }
-
-    @Test func unavailableOrInvalidBaselineKeepsAbsolutePenalty() {
-        for baseline: Double? in [nil, -1, .nan, .infinity] {
-            #expect(Health.jitterPenalty(100, latencyMs: baseline) == Health.jitterCurve.penalty(100))
-        }
     }
 }
 

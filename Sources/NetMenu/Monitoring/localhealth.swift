@@ -1,17 +1,19 @@
 import Foundation
 
-/// Router-only samples use the same loss, jitter and latency curves as WAN health.
+/// Router-only samples use the same loss and delay-budget model as WAN health.
 /// No HTTPS verdict participates; a router that has never answered may simply filter our probes.
 struct LocalHealthTracker {
+    let config: HealthConfig
+    init(config: HealthConfig = Configuration.health) { self.config = config }
     private var samples: [HealthSample] = []
     private var hasAnswered = false
     private(set) var method: LocalProbeMethod = .icmp
     private var settleUntil: TimeInterval?
     private(set) var unavailableReason: String?
 
-    mutating func reset() { self = LocalHealthTracker() }
+    mutating func reset() { self = LocalHealthTracker(config: config) }
     mutating func settle(at now: TimeInterval = HealthTracker.now()) {
-        settleUntil = now + Health.settleLimit
+        settleUntil = now + config.settleLimit
     }
 
     mutating func record(_ outcome: Latency.PingOutcome, method: LocalProbeMethod = .icmp, at: TimeInterval = HealthTracker.now()) {
@@ -19,7 +21,7 @@ struct LocalHealthTracker {
             samples.removeAll(); hasAnswered = false
             unavailableReason = nil; self.method = method
         }
-        samples.removeAll { at - $0.at > Health.window }
+        samples.removeAll { at - $0.at > config.window }
         let ms: Double?
         switch outcome {
         case .unmeasured:
@@ -39,18 +41,20 @@ struct LocalHealthTracker {
 
     func report(now: TimeInterval = HealthTracker.now()) -> HealthReport? {
         guard hasAnswered else { return nil }
-        return Health.evaluate(samples.filter { now - $0.at <= Health.window && $0.at <= now + 1 }, now: now)
+        return Health.evaluate(samples.filter { now - $0.at <= config.window && $0.at <= now + 1 }, now: now, config: config)
     }
 
-    func menuTitle(router: String?, report: HealthReport?) -> String {
-        guard router != nil else { return "Local health: unavailable (no local router)" }
+    func menuTitle(router: String?, report: HealthReport?) -> String { menuReadout(router: router, report: report).title }
+
+    func menuReadout(router: String?, report: HealthReport?) -> MenuReadout {
+        guard router != nil else { return .health(.local, status: "unavailable (no local router)") }
         guard let h = report else {
-            return unavailableReason.map { "Local health: unavailable (\($0))" } ?? "Local health: measuring…"
+            return .health(.local, status: unavailableReason.map { "unavailable (\($0))" } ?? "measuring…")
         }
         var parts = [method.label, String(format: "loss %.0f%%", h.loss * 100)]
         if let j = h.jitterMs { parts.append(String(format: "jitter %.0fms", j)) }
         if let l = h.latencyMs { parts.append(String(format: "latency %.0fms", l)) }
-        return "Local health: \(h.score)% (\(parts.joined(separator: ", ")))"
+        return .health(.local, score: h.score, parts: parts)
     }
 }
 

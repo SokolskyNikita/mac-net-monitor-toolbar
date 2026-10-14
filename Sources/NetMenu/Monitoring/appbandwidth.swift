@@ -46,8 +46,8 @@ enum AppBandwidthParser {
             let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
             return trimmed.isEmpty ? nil : trimmed
         }
-        let header = output.components(separatedBy: .newlines).first { $0.hasPrefix(",interface,state,") }
-        let columns = header.map { Array($0.components(separatedBy: ",").dropFirst().dropLast()) } ?? ["bytes_in", "bytes_out"]
+        let header = output.components(separatedBy: .newlines).first { $0.hasPrefix(NettopFormat.headerPrefix) }
+        let columns = header.map { Array($0.components(separatedBy: ",").dropFirst().dropLast()) } ?? NettopFormat.byteColumns
         var rows: [NetTopProcessCounters] = []
         for line in intervalLines {
             // A process can disappear between nettop's sample and PID attribution, and some
@@ -66,17 +66,17 @@ enum AppBandwidthParser {
                 .trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
                 .lowercased()
         }
-        return columns.contains("bytes_in") && columns.contains("bytes_out")
+        return columns.contains(NettopFormat.bytesIn) && columns.contains(NettopFormat.bytesOut)
     }
 
     private static func parseRow(_ line: String, columns: [String]) -> NetTopProcessCounters? {
-        guard !["tcp4 ", "tcp6 ", "udp4 ", "udp6 "].contains(where: line.hasPrefix) else { return nil }
+        guard !NettopFormat.socketPrefixes.contains(where: line.hasPrefix) else { return nil }
         var fields = line.split(separator: ",", omittingEmptySubsequences: false)
         // nettop emits a trailing delimiter after each data row.
         if fields.last?.isEmpty == true { fields.removeLast() }
         guard fields.count >= columns.count + 1,
-              let inIndex = columns.firstIndex(of: "bytes_in"),
-              let outIndex = columns.firstIndex(of: "bytes_out") else { return nil }
+              let inIndex = columns.firstIndex(of: NettopFormat.bytesIn),
+              let outIndex = columns.firstIndex(of: NettopFormat.bytesOut) else { return nil }
         let values = Array(fields.suffix(columns.count))
         guard let bytesIn = UInt64(values[inIndex].trimmingCharacters(in: .whitespaces)),
               let bytesOut = UInt64(values[outIndex].trimmingCharacters(in: .whitespaces)) else { return nil }
@@ -98,6 +98,15 @@ enum AppBandwidthParser {
 }
 
 struct AppBandwidthProcessIdentity: Equatable {
+    private static let applicationPrefix = "app:"
+    private static let executablePrefix = "exec:"
+    private static let processPrefix = "process:"
+
+    var isApplication: Bool { id.hasPrefix(Self.applicationPrefix) }
+    static func applicationID(path: String) -> String { applicationPrefix + path }
+    static func executableID(path: String) -> String { executablePrefix + path }
+    static func processID(name: String, pid: Int32) -> String { "\(processPrefix)\(name.lowercased()):\(pid)" }
+
     let id: String
     let name: String
 }
@@ -123,7 +132,7 @@ enum AppBandwidthProcessGrouper {
                     ?? nonEmpty(bundle?.object(forInfoDictionaryKey: "CFBundleName") as? String)
                 let fallbackName = URL(fileURLWithPath: bundlePath).deletingPathExtension().lastPathComponent
                 return AppBandwidthProcessIdentity(
-                    id: "app:\(bundlePath)",
+                    id: AppBandwidthProcessIdentity.applicationID(path: bundlePath),
                     // A helper may have a localizedName such as "Codex (Service)". The owning
                     // outer bundle's own metadata or directory name is the stable display name.
                     name: AppMenuNames.shortName(bundleID: bundle?.bundleIdentifier,
@@ -133,7 +142,7 @@ enum AppBandwidthProcessGrouper {
 
             let executableName = URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
             return AppBandwidthProcessIdentity(
-                id: "exec:\(path)",
+                id: AppBandwidthProcessIdentity.executableID(path: path),
                 name: runningName ?? nonEmpty(executableName) ?? processName
             )
         }
@@ -141,7 +150,7 @@ enum AppBandwidthProcessGrouper {
         let fallback = runningName ?? processName
         // Without a path we cannot know whether equal or truncated nettop names belong to the
         // same executable, so keep the pid in the key to avoid merging unrelated processes.
-        return AppBandwidthProcessIdentity(id: "process:\(fallback.lowercased()):\(pid)", name: fallback)
+        return AppBandwidthProcessIdentity(id: AppBandwidthProcessIdentity.processID(name: fallback, pid: pid), name: fallback)
     }
 
     static func aggregate(_ rows: [NetTopProcessCounters],
@@ -190,9 +199,9 @@ enum AppBandwidthProcessGrouper {
 /// optional physical-interface delta. Attribution is approximate because the samplers start at
 /// slightly different times; process totals remain available when interface counters cannot be read.
 final class AppBandwidthMonitor {
-    static let sampleInterval: TimeInterval = 10
-    private static let commandTimeout = sampleInterval + 5
-    private static let maxSampleSeconds = sampleInterval + 5
+    static let sampleInterval = Configuration.monitoring.appSampleInterval
+    private static let commandTimeout = Configuration.monitoring.appCommandTimeout
+    private static let maxSampleSeconds = Configuration.monitoring.appMaxSampleSeconds
 
     private let condition = NSCondition()
     private var generation = 0
@@ -252,7 +261,7 @@ final class AppBandwidthMonitor {
             } else {
                 failures += 1
                 deliver(nil, generation: token)
-                let backoff = min(30.0, pow(2.0, Double(min(failures - 1, 5))))
+                let backoff = min(Configuration.monitoring.appRetryMaxDelay, pow(2.0, Double(min(failures - 1, Configuration.monitoring.appRetryMaxExponent))))
                 guard wait(seconds: backoff, generation: token) else { break }
             }
         }
@@ -308,7 +317,7 @@ final class AppBandwidthMonitor {
         // nettop accumulates all bytes between the baseline and the second sample. A ten-second
         // interval ranks the whole window, rather than publishing a delayed five-second reading.
         process.arguments = ["-L", "2", "-n", "-x", "-d", "-s", String(Int(Self.sampleInterval)),
-                             "-J", "interface,state,bytes_in,bytes_out,packets_in,packets_out", "-t", "wifi", "-t", "wired", "-c"]
+                             "-J", NettopFormat.requestedColumns, "-t", "wifi", "-t", "wired", "-c"]
         let inputPipe = Pipe()
         let outputPipe = Pipe()
         let errorPipe = Pipe()
@@ -373,7 +382,7 @@ final class AppBandwidthMonitor {
         }
         if process.isRunning { terminateAndWait(process) }
         if !process.isRunning { process.waitUntilExit() }
-        _ = drainGroup.wait(timeout: .now() + 2)
+        _ = drainGroup.wait(timeout: .now() + Configuration.reliability.helperDrainTimeout)
         detach(process, generation: token)
 
         // terminationStatus raises an Objective-C exception while the process is still running.
@@ -438,7 +447,7 @@ final class AppBandwidthMonitor {
     }
 
     private func terminateAndWait(_ process: Process) {
-        terminateProcess(process, grace: 1.0)
+        terminateProcess(process, grace: Configuration.reliability.helperTerminateGrace)
     }
 
 }

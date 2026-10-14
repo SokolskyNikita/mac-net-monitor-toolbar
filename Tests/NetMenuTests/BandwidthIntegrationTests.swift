@@ -27,10 +27,9 @@ private final class BandwidthLoggingApp: AppDelegate {
     @Test func gapLogsCompletedSamplesBeforeClearingAndRebasesTheNextWindow() throws {
         let app = BandwidthLoggingApp()
         app.bandwidth = BandwidthTracker(counters: counters(0, 0), at: 0)
-        app.winStart = 0
-        app.winLats = [10, 20]
-        app.winLatSrc = LatencySource.icmp.rawValue
-        app.winFailed = 1; app.winTotal = 10
+        app.probeStats = ProbeStatsWindow(at: 0)
+        for _ in 0..<9 { app.probeStats.recordWAN(.wan(15)) }
+        app.probeStats.recordWAN(.noReply)
         app.tick(counters: counters(900, 90), at: 1)
         app.tick(counters: counters(1_300, 130), at: 5)
 
@@ -45,12 +44,12 @@ private final class BandwidthLoggingApp: AppDelegate {
         #expect(beforeGap["up_peak_Bps"] as? Double == 90)
         #expect(beforeGap["lat_ms"] as? Double == 15)
         #expect(beforeGap["loss"] as? Double == 0.1)
-        #expect(beforeGap["health_weighting"] as? String == "inverse_sqrt_age")
+        #expect(beforeGap["health_weighting"] as? String == "exponential_age")
         #expect(beforeGap["reconnects_5m"] as? Int == 0)
         #expect(beforeGap["health_raw"] is NSNull)
-        #expect(app.winLats.isEmpty)
-        #expect(app.winTotal == 0)
-        #expect(app.winStart == 20)
+        #expect(app.probeStats.latencies.isEmpty)
+        #expect(app.probeStats.total == 0)
+        #expect(app.probeStats.startedAt == 20)
         #expect(app.bandwidth.window.sampleCount == 0)
         #expect(app.displayedRates.last == BandwidthRates())
 
@@ -70,7 +69,7 @@ private final class BandwidthLoggingApp: AppDelegate {
     @Test func gapPreservesEvenAShortCompletedInterval() throws {
         let app = BandwidthLoggingApp()
         app.bandwidth = BandwidthTracker(counters: counters(0, 0), at: 0)
-        app.winStart = 0
+        app.probeStats = ProbeStatsWindow(at: 0)
         app.tick(counters: counters(250, 125), at: 0.25)
         app.tick(counters: counters(50_000, 50_000), at: 10)
 
@@ -79,6 +78,6 @@ private final class BandwidthLoggingApp: AppDelegate {
         #expect(logged["secs"] as? Double == 0.25)
         #expect(logged["down_Bps"] as? Double == 1_000)
         #expect(logged["up_Bps"] as? Double == 500)
-        #expect(app.winStart == 10)
+        #expect(app.probeStats.startedAt == 10)
     }
 }

@@ -222,7 +222,7 @@ import Testing
         var samples: [Double] = []
         var src: String?
         for (ms, s) in pairs {
-            pushLatency(ms, src: s, into: &samples, source: &src, limit: displayLatWindow)
+            pushLatency(ms, src: s, into: &samples, source: &src, limit: Configuration.monitoring.displayLatencyReadings)
         }
         return median(samples)
     }
@@ -241,13 +241,13 @@ import Testing
     }
 
     @Test func sameSourceKeepsWindowCapped() {
-        let pairs = (1...(displayLatWindow + 3)).map { (Double($0), "icmp") }
+        let pairs = (1...(Configuration.monitoring.displayLatencyReadings + 3)).map { (Double($0), "icmp") }
         var samples: [Double] = []
         var src: String?
         for (ms, s) in pairs {
-            pushLatency(ms, src: s, into: &samples, source: &src, limit: displayLatWindow)
+            pushLatency(ms, src: s, into: &samples, source: &src, limit: Configuration.monitoring.displayLatencyReadings)
         }
-        #expect(samples.count == displayLatWindow)
+        #expect(samples.count == Configuration.monitoring.displayLatencyReadings)
         #expect(samples.first == 4)
     }
 }

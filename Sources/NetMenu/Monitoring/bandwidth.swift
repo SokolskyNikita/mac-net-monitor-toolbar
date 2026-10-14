@@ -145,11 +145,11 @@ struct BandwidthWindow {
         return BandwidthRates(down: downBytes / seconds, up: upBytes / seconds)
     }
 
-    mutating func add(_ rates: BandwidthRates, seconds: TimeInterval) {
+    mutating func add(_ rates: BandwidthRates, seconds: TimeInterval, minPeakInterval: TimeInterval = Configuration.monitoring.bandwidthMinPeakInterval) {
         guard seconds.isFinite, seconds > 0 else { return }
         downBytes += rates.down * seconds; upBytes += rates.up * seconds
         self.seconds += seconds; sampleCount += 1
-        if seconds >= BandwidthTracker.minPeakInterval {
+        if seconds >= minPeakInterval {
             peak.down = max(peak.down, rates.down)
             peak.up = max(peak.up, rates.up)
         }
@@ -159,12 +159,12 @@ struct BandwidthWindow {
 /// Owns live rates, five-second display averaging, connection peaks, and logging aggregates.
 /// Callers supply snapshots and monotonic times so calculations can be tested without I/O.
 struct BandwidthTracker {
-    static let sampleInterval: TimeInterval = 1
-    static let displayInterval: TimeInterval = 5
-    static let maxSampleInterval: TimeInterval = 5
+    static let sampleInterval = Configuration.monitoring.bandwidthSampleInterval
+    static let displayInterval = Configuration.monitoring.bandwidthDisplayInterval
+    static let maxSampleInterval = Configuration.monitoring.bandwidthMaxSampleInterval
     /// Peaks are one-second rates. A tick that lands early after a late one spans a fraction of
     /// a second and can catch a sub-second burst, so it counts toward averages but not peaks.
-    static let minPeakInterval: TimeInterval = 0.75
+    static let minPeakInterval = Configuration.monitoring.bandwidthMinPeakInterval
 
     enum Update: Equatable {
         case sampled
@@ -175,6 +175,7 @@ struct BandwidthTracker {
         case ignored
     }
 
+    let config: MonitoringConfig
     private(set) var current = BandwidthRates()
     private(set) var display = BandwidthRates()
     private(set) var peak = BandwidthRates()
@@ -184,7 +185,8 @@ struct BandwidthTracker {
     private var displayWindow = BandwidthWindow()
     private var displayedAt: TimeInterval
 
-    init(counters: Counters? = nil, at: TimeInterval = BandwidthClock.now()) {
+    init(counters: Counters? = nil, at: TimeInterval = BandwidthClock.now(), config: MonitoringConfig = Configuration.monitoring) {
+        self.config = config
         previous = counters
         previousAt = at
         displayedAt = at
@@ -207,7 +209,7 @@ struct BandwidthTracker {
         previous = counters; previousAt = at
         // Rebase after sleep or an invalid interval. Preserve completed log samples until
         // the caller flushes them, but stop displaying a rate from before the gap.
-        if !dt.isFinite || dt <= 0 || dt > Self.maxSampleInterval {
+        if !dt.isFinite || dt <= 0 || dt > config.bandwidthMaxSampleInterval {
             current = BandwidthRates(); display = BandwidthRates()
             displayWindow = BandwidthWindow(); displayedAt = at
             return .gap(endedAt: endedAt)
@@ -218,14 +220,14 @@ struct BandwidthTracker {
             rate.isFinite && rate >= 0 && rate <= 1e13 ? rate : 0
         }
         current = BandwidthRates(down: sanitize(down), up: sanitize(up))
-        if dt >= Self.minPeakInterval {
+        if dt >= config.bandwidthMinPeakInterval {
             peak.down = max(peak.down, current.down)
             peak.up = max(peak.up, current.up)
         }
-        window.add(current, seconds: dt)
-        displayWindow.add(current, seconds: dt)
+        window.add(current, seconds: dt, minPeakInterval: config.bandwidthMinPeakInterval)
+        displayWindow.add(current, seconds: dt, minPeakInterval: config.bandwidthMinPeakInterval)
 
-        if at - displayedAt >= Self.displayInterval {
+        if at - displayedAt >= config.bandwidthDisplayInterval {
             display = displayWindow.average
             displayWindow = BandwidthWindow(); displayedAt = at
             return .displayUpdated
@@ -239,7 +241,7 @@ struct BandwidthTracker {
 
     /// The caller flushes the old connection's log before clearing all measurement state.
     mutating func resetConnection(counters: Counters?, at: TimeInterval) {
-        self = BandwidthTracker(counters: counters, at: at)
+        self = BandwidthTracker(counters: counters, at: at, config: config)
     }
 }
 
