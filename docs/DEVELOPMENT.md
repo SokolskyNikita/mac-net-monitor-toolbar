@@ -2,7 +2,7 @@
 
 ## Building from source
 
-Requires macOS 14 or later and the Xcode Command Line Tools (`xcode-select --install`). The full Xcode app is optional. Tests use Swift Testing, so install a toolchain that includes it (Swift 6 or later); `Package.swift` declares Swift tools version 5.9 but does not supply the Testing library.
+Requires macOS 14 or later, Python 3 (for the build-cache helper), and the Xcode Command Line Tools (`xcode-select --install`). The full Xcode app is optional. Tests use Swift Testing, so install a toolchain that includes it (Swift 6 or later); `Package.swift` declares Swift tools version 5.9 but does not supply the Testing library.
 
 ```bash
 git clone https://github.com/SokolskyNikita/mac-net-monitor-toolbar.git
@@ -12,17 +12,30 @@ make run
 
 | Command | What it does |
 | --- | --- |
-| `make build` | Build the universal binary to `build/NetMenu` |
-| `make app` | Build, bundle and sign `NetMenu.app` (ad hoc unless `SIGN_ID` is set) |
+| `make build` | Incrementally build the optimized universal binary to `build/NetMenu` |
+| `make app` | Build and update `NetMenu.app`; copy changed files and sign only when needed (ad hoc unless `SIGN_ID` is set) |
 | `make run` | `make app`, then open it |
 | `make test` | Run the Swift Testing suites, including local socket and process integration tests |
+| `make test-build` | Test compiler-cache invalidation and build/sign a tiny Swift fixture to check the Makefile |
 | `make check` | Build, run `./build/NetMenu --sample`, print its output and validate its final JSON line with Python 3 |
 | `make dist` | Build and sign the app, then package `dist/NetMenu-<version>.zip` and print its SHA-256 |
 | `make notarize` | Package, submit for notarization, staple the app and rebuild the zip; requires a signing identity and stored notary credentials |
 | `make icon` | Generate `Resources/AppIcon.icns` from the icon script when needed |
 | `make clean` | Remove `build/`, `.build/`, `NetMenu.app/` and `dist/` |
 
-The default build targets both `arm64` and `x86_64`, with macOS 14.0 as the deployment target. `ARCHS`, `MIN_OS`, `SWIFT_FLAGS`, `SWIFT_TEST_FLAGS` and `SIGN_ID` can be overridden on the make command line. `make check` performs real internet probes; it is separate from the test suite.
+The default build targets both `arm64` and `x86_64`, with macOS 14.0 as the deployment target. `ARCHS`, `MIN_OS`, `SWIFT_FLAGS`, `SWIFT_TEST_FLAGS`, `SWIFTC`, `SWIFT_JOBS`, `MACOS_SDK` and `SIGN_ID` can be overridden on the make command line. `make check` performs real internet probes; it is separate from the test suite.
+
+## Incremental app builds
+
+`make app` retains optimized object files and Swift dependency records under `build/objects/<architecture>/`. It passes all source files to the [Swift driver's incremental compilation mode](https://github.com/swiftlang/swift/blob/main/docs/Driver.md#incremental-builds), which decides which files and dependents must be rebuilt. Four compiler jobs run in parallel by default (`SWIFT_JOBS=4`); `-O` optimization and both release architectures remain the defaults. This avoids maintaining a hand-written Swift dependency graph or changing the app to a debug build.
+
+The cache helper tracks compiler identity/version, SDK identity, deployment target, compiler flags and the source-file list. Compiler/SDK/flag changes discard incompatible objects; adding, removing or renaming a source and deleting cached outputs trigger a rebuild. Changing `ARCHS` rebuilds the combined binary even if the selected architecture's binary is older. Unchanged builds skip compilation, copying and signing. Resource-only changes update and re-sign the bundle without recompiling Swift. Changing `SIGN_ID` triggers signing again. A rebuilt executable is copied into place atomically so an already-running instance can finish using its old binary.
+
+Build steps check input timestamps with nanosecond precision through `scripts/run-if-stale.py`. The bundled macOS make 3.81 compares whole seconds, so relying on its timestamp checks alone can miss rapid edits or cache changes.
+
+For a local-only build, `make app ARCHS=arm64` or `make app ARCHS=x86_64` builds just that architecture. Run ordinary `make app` afterward to restore the default universal app. Keep the default architectures for `make dist` and releases. `make clean` removes the incremental caches as well as the generated artifacts; it is unnecessary for ordinary edits or configuration changes.
+
+On the development Mac, with the SDK cache already warm, an optimized universal rebuild went from 38.4 seconds to 14.8 seconds. A one-line UI implementation edit took 1.9 seconds and rebuilt only that file for each architecture; an unchanged build took 0.5 seconds. These are illustrative local timings, not CI guarantees. First-time SDK imports and edits to widely used declarations can take longer.
 
 ## Command-line modes
 
@@ -50,7 +63,7 @@ Discovers the physical IPv4 or IPv6 router, including behind a VPN, and prints t
 NetMenu.app/Contents/MacOS/NetMenu --local-probe
 ```
 
-Tries ICMP, nonrecursive DNS, TCP 443/80 and IPv4 DHCP INFORM once each against the physical router. Prints response times, timeouts, and unavailable reasons. No lease is renewed or configuration applied. This diagnostic intentionally checks all protocols even if ICMP works; normal monitoring stops at the selected protocol.
+Tries ICMP, nonrecursive DNS, TCP 443/80 and IPv4 DHCP INFORM once each against the physical router. Prints response times, timeouts, and unavailable reasons. No lease is renewed or configuration applied. This diagnostic intentionally checks all protocols even if ICMP works; normal monitoring uses the selected protocol with occasional background trials of higher-priority methods.
 
 CLI results are printed to standard output; these modes do not append sample or speed-test records to `stats.jsonl`.
 
@@ -68,7 +81,7 @@ Sources/NetMenu/
 Resources/      App metadata and icon
 Tests/          Swift Testing suites
 docs/           User and developer documentation, screenshots
-scripts/        Icon generation and Homebrew release helpers
+scripts/        Incremental build helpers/tests, icon generation and Homebrew release helpers
 Casks/          Homebrew cask
 ```
 

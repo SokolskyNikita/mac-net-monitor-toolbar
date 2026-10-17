@@ -59,7 +59,7 @@ import Testing
         #expect(obj["health_latency_ms"] as? Double == 45)
         #expect(obj["health_weighting"] as? String == "exponential_age")
         #expect(obj["health_window_s"] as? Double == 60)
-        #expect(obj["health_model"] as? String == "delay_budget_v1")
+        #expect(obj["health_model"] as? String == "delay_budget_v2")
         #expect(obj["health_weight_half_life_s"] as? Double == 15)
         #expect(obj["health_weight_min_age_s"] == nil)
         #expect(obj["recent_trouble"] as? [String] == ["network loss"])

@@ -67,6 +67,17 @@ struct MonitoringConfig {
     var localFailureLimit = 3
     /// Minimum spacing between attempts to discover another working router protocol.
     var localDiscoveryInterval: TimeInterval = 30
+    /// Background preferred-protocol retry delays; the last delay repeats indefinitely.
+    var localRetryDelays: [TimeInterval] = [30, 60, 120, 300]
+    /// Variation in background retry deadlines to avoid synchronized probing.
+    var localRetryJitter = 0.20
+    /// Spacing between confirmation probes after a preferred protocol first answers.
+    var localConfirmationInterval: TimeInterval = 1
+    /// Successful trial probes required before promotion, including the first reply.
+    var localConfirmationCount = 3
+    /// A promoted protocol rolls back after two consecutive failures during this period.
+    var localProbationInterval: TimeInterval = 15
+    var localProbationFailureLimit = 2
     /// How long a latency, jitter, loss or web-access warning stays visible.
     var recentTroubleDuration: TimeInterval = 10
     /// Minimum fractional health penalty that triggers a latency or jitter warning (0.05 = 5%).
@@ -117,7 +128,9 @@ struct HealthConfig {
     /// Minimum measured cycles before showing health; confirmed outages bypass calibration.
     var minCycles = 3
     /// Identifier written to stats logs; change it when scoring calibration changes.
-    var model = "delay_budget_v1"
+    var model = "delay_budget_v2"
+    /// Divide transport health by this when IPv4 is unavailable but IPv6 websites work.
+    var ipv6OnlyScoreDivisor = 3.0
     /// Sample weight halves for each interval of this age within the health window.
     var recencyHalfLife: TimeInterval = 15
     /// Fixed processing delay added to RTT/2 and jitter in the delay budget, in milliseconds.

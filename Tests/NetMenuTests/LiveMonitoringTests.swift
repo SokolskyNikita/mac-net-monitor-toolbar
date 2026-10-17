@@ -8,7 +8,7 @@ import Testing
         defer { gate.signal() }
         let target = LocalRouter(interface: "en0", address: "192.0.2.1")
         let transport = LiveProbes.Transport(ping: { _, _ in .reply(.init(ms: 20, hops: 12)) },
-            website: { _ in .init(outcome: .ok, seconds: 0) }, portal: { .internet }, fallback: { 30 },
+            website: { _, _ in .init(outcome: .ok, seconds: 0) }, portal: { .internet }, fallback: { _ in 30 },
             local: { router, epoch in
                 #expect(router == target)
                 #expect(epoch == 7)
@@ -187,14 +187,14 @@ import Testing
         let transport = LiveProbes.Transport(ping: { host, _ in
             if host == slowHost { _ = gate.wait(timeout: .now() + 5) }
             return .reply(.init(ms: 20, hops: 12))
-        }, website: { _ in
+        }, website: { _, _ in
             _ = gate.wait(timeout: .now() + 5)
             return .init(outcome: .ok, seconds: 0)
-        }, portal: { .internet }, fallback: { 30 })
+        }, portal: { .internet }, fallback: { _ in 30 })
         let probes = LiveProbes(transport: transport)
         var replies: [(Int, Int)] = []
         probes.receive = { epoch, event in
-            if case .wan(let slot, _, _, _) = event { replies.append((epoch, slot)) }
+            if case .wan(_, let slot, _, _, _) = event { replies.append((epoch, slot)) }
         }
         let identity = Identity(iface: nil, type: NetType.offline, network: nil, bssid: nil,
                                 router: nil, rssi: nil, noise: nil, txRate: nil, channel: nil)
@@ -207,7 +207,7 @@ import Testing
         #expect(replies.count == 4)
         #expect(!replies.contains { $0.1 == 0 })
         probes.poll(identity: identity, epoch: 2, paused: true, now: now + 1)
-        for _ in 0..<3 { gate.signal() }
+        for _ in 0..<5 { gate.signal() }
         try await Task.sleep(for: .milliseconds(100))
         #expect(replies.count == 4) // The old slow ping must not leak into the new network.
     }

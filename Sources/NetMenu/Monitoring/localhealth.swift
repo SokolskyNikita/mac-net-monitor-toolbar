@@ -5,7 +5,8 @@ import Foundation
 struct LocalHealthTracker {
     let config: HealthConfig
     init(config: HealthConfig = Configuration.health) { self.config = config }
-    private var samples: [HealthSample] = []
+    private struct Sample { var health: HealthSample; var method: LocalProbeMethod }
+    private var samples: [Sample] = []
     private var hasAnswered = false
     private(set) var method: LocalProbeMethod = .icmp
     private var settleUntil: TimeInterval?
@@ -18,10 +19,9 @@ struct LocalHealthTracker {
 
     mutating func record(_ outcome: Latency.PingOutcome, method: LocalProbeMethod = .icmp, at: TimeInterval = HealthTracker.now()) {
         if self.method != method {
-            samples.removeAll(); hasAnswered = false
             unavailableReason = nil; self.method = method
         }
-        samples.removeAll { at - $0.at > config.window }
+        samples.removeAll { at - $0.health.at > config.window }
         let ms: Double?
         switch outcome {
         case .unmeasured:
@@ -35,13 +35,21 @@ struct LocalHealthTracker {
             ms = nil
         }
         unavailableReason = hasAnswered ? nil : "router not responding to probes"
-        samples.append(HealthSample(at: at, ms: ms, source: .icmp,
-                                    targets: [ms.map { .wan($0) } ?? .noReply], internet: .unknown))
+        samples.append(Sample(health: HealthSample(at: at, ms: ms, source: .icmp,
+                                    targets: [ms.map { .wan($0) } ?? .noReply], internet: .unknown), method: method))
     }
 
     func report(now: TimeInterval = HealthTracker.now()) -> HealthReport? {
         guard hasAnswered else { return nil }
-        return Health.evaluate(samples.filter { now - $0.at <= config.window && $0.at <= now + 1 }, now: now, config: config)
+        let current = samples.filter { now - $0.health.at <= config.window && $0.health.at <= now + 1 }
+        guard var report = Health.evaluate(current.map(\.health), now: now, config: config) else { return nil }
+        // Loss spans method changes; delay statistics only compare the current protocol.
+        let delays = current.filter { $0.method == method }.map(\.health)
+        report.latencyMs = Health.latencyMs(delays, now: now, config: config)
+        report.jitterMs = Health.jitterMs(delays, now: now, config: config)
+        report.score = Int(Health.rawScore(loss: report.loss, jitterMs: report.jitterMs ?? 0,
+                                           latencyMs: report.latencyMs ?? 0, config: config).rounded())
+        return report
     }
 
     func menuTitle(router: String?, report: HealthReport?) -> String { menuReadout(router: router, report: report).title }

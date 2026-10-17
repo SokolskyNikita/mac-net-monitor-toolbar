@@ -97,6 +97,11 @@ enum Latency {
     // MARK: - Tuning
 
     static let icmpTargets = [Host.cloudflareDNS, Host.cloudflareDNS2, Host.googleDNS, Host.quad9, Host.google]
+    static let icmp6Targets = ["2606:4700:4700::1111", "2606:4700:4700::1001",
+                               "2001:4860:4860::8888", "2620:fe::fe"]
+    static func icmpTargets(for family: IPVersion) -> [String] {
+        family == .ipv4 ? icmpTargets : icmp6Targets
+    }
     /// Satellite RTT is often 600–2000ms; a 1s cap dropped real replies.
     static let icmpTimeoutMs = Configuration.monitoring.icmpTimeoutMs
     static let gatewayTimeoutMs = Configuration.monitoring.localTimeoutMs
@@ -292,14 +297,21 @@ enum Latency {
     }
 
     static func checkInternet(_ site: InternetSite) -> InternetCheck {
+        checkInternet(site, family: nil)
+    }
+
+    static func checkInternet(_ site: InternetSite, family: IPVersion?) -> InternetCheck {
         let t0 = Date()
         let bodyURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("\(tempPrefix)internet-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: bodyURL) }
         // -q disables user curlrc overrides. TLS verification stays enabled; no redirects,
         // cookies, or local cache. The nonce and no-cache header also avoid proxy cache hits.
+        // Family checks go directly to the destination, never via an environment-configured proxy.
         let r = runProcess("/usr/bin/curl", [
-            "-q", "-sS", "--proto", "=https", "--max-time", String(Int(internetWait)),
+            "-q",
+        ] + (family.map { [$0.curlFlag, "--noproxy", "*"] } ?? []) + [
+            "-sS", "--proto", "=https", "--max-time", String(Int(internetWait)),
             "--max-redirs", "0", "--max-filesize", "65536",
             "-H", HTTPHeader.cacheControlArgument, "-H", HTTPHeader.acceptEncodingArgument,
             "-o", bodyURL.path, "-w", "%{http_code}",
@@ -507,6 +519,28 @@ enum Latency {
         return nil
     }
 
+    /// While using IPv6 WAN probes, never wait for an IPv4 trace endpoint first.
+    static func httpProbe(family: IPVersion) -> Double? {
+        guard family == .ipv6 else { return httpProbe() }
+        let bodyURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("\(tempPrefix)trace6-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: bodyURL) }
+        for host in icmp6Targets.prefix(2) {
+            let r = runProcess("/usr/bin/curl", [
+                "-q", "--ipv6", "--noproxy", "*", "-sS", "--proto", "=https",
+                "--max-time", String(Int(httpWait)), "--max-redirs", "0", "--max-filesize", "65536",
+                "-H", HTTPHeader.cacheControlArgument, "-H", HTTPHeader.acceptEncodingArgument,
+                "-o", bodyURL.path, "-w", "%{http_code} %{time_starttransfer}",
+                "https://[\(host)]\(tracePath)?n=\(UUID().uuidString)"
+            ], timeout: httpWait + Configuration.reliability.probeCompletionAllowance)
+            let fields = r.stdout.split(separator: " ")
+            if r.succeeded, fields.count == 2, let status = Int(fields[0]), (200..<300).contains(status),
+               let seconds = Double(fields[1]), let ms = finiteNonNeg(seconds * 1000),
+               isCloudflareTrace(readPrefix(of: bodyURL, bytes: 65536)) { return ms }
+        }
+        return nil
+    }
+
     /// Captive HTML and cached junk will not match.
     static func isCloudflareTrace(_ body: String) -> Bool {
         (body.contains("\nh=") || body.hasPrefix("fl=")) && body.contains("colo=")
@@ -543,7 +577,7 @@ enum Latency {
 
 /// Value shared between probe threads. A probe that finishes after `cycleWait` writes into a
 /// snapshot nobody reads again, so it is dropped rather than published late.
-private final class Locked<T>: @unchecked Sendable {
+final class Locked<T>: @unchecked Sendable {
     private let lock = NSLock()
     private var stored: T
     init(_ value: T) { stored = value }

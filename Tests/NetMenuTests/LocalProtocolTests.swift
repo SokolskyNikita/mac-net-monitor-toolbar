@@ -32,7 +32,8 @@ import Testing
             #expect(calls == [.icmp])
         }
         let changed = session.measure(router, now: 9) { method, _ in method == .tcp443 ? reply() : .lost }
-        #expect(changed.method == .tcp443)
+        #expect(changed.method == .icmp)
+        guard case .lost = changed.outcome else { Issue.record("Recovery must retain the failed active sample"); return }
         for time in [12.0, 15, 18, 21] {
             var calls: [LocalProbeMethod] = []
             _ = session.measure(router, now: time) { method, _ in calls.append(method); return .lost }
@@ -52,17 +53,136 @@ import Testing
         #expect(result.method == .dhcp)
     }
 
-    @Test func protocolSwitchStartsNewWindowWithoutFakeJitterOrLoss() {
+    @Test func protocolSwitchKeepsLossWithoutMixingDelayStatistics() {
         var tracker = LocalHealthTracker()
         for i in 0..<3 { tracker.record(reply(3), at: Double(i)) }
         #expect(tracker.report(now: 2)?.score == 100)
-        tracker.record(reply(100), method: .dns, at: 3)
-        #expect(tracker.report(now: 3) == nil)
+        tracker.record(.lost, at: 3)
         tracker.record(reply(100), method: .dns, at: 4)
         tracker.record(reply(100), method: .dns, at: 5)
         #expect(tracker.report(now: 5)?.jitterMs == 0)
-        #expect(tracker.report(now: 5)?.loss == 0)
+        #expect((tracker.report(now: 5)?.loss ?? 0) > 0)
+        #expect(tracker.report(now: 5)?.latencyMs == 100)
         #expect(tracker.menuTitle(router: "127.0.0.1", report: tracker.report(now: 5)).contains("DNS"))
+        tracker.record(reply(3), at: 6)
+        #expect(tracker.report(now: 6)?.jitterMs == 0)
+        #expect(tracker.report(now: 6)?.latencyMs == 3)
+        #expect((tracker.report(now: 6)?.loss ?? 0) > 0)
+    }
+
+    @Test func preferredProtocolPromotesAfterTwoSecondsWithoutAddingHealthSamples() {
+        let session = LocalProbeSession(jitter: { 0 })
+        var samples: [(Int, LocalProbeResult)] = []
+        var trials: [Int] = []
+        for time in 0...33 {
+            let result = session.poll(router, now: Double(time)) { method, _ in
+                if method == .icmp {
+                    trials.append(time)
+                    return time >= 30 ? reply(2) : .lost
+                }
+                return reply(20)
+            }
+            if let result { samples.append((time, result)) }
+        }
+        #expect(trials == [0, 30, 31, 32, 33])
+        #expect(samples.map { $0.0 } == Array(stride(from: 0, through: 33, by: 3)))
+        #expect(samples.dropLast().allSatisfy { $0.1.method == .dns })
+        #expect(samples.last?.1.method == .icmp)
+    }
+
+    @Test func failedConfirmationBacksOffAndDoesNotPolluteActiveLoss() {
+        let session = LocalProbeSession(jitter: { 0 })
+        var trials: [Int] = []
+        for time in 0...32 {
+            let result = session.poll(router, now: Double(time)) { method, _ in
+                if method == .icmp { trials.append(time); return time == 30 ? reply() : .lost }
+                return reply()
+            }
+            if let result {
+                #expect(result.method == .dns)
+                guard case .reply = result.outcome else { Issue.record("Trial failure must not count as active loss"); return }
+            }
+        }
+        #expect(trials == [0, 30, 31])
+        for time in [90, 91, 210, 211, 510, 511, 810, 811] {
+            _ = session.poll(router, now: Double(time)) { method, _ in
+                if method == .icmp { trials.append(time); return .lost }
+                return reply()
+            }
+        }
+        #expect(trials == [0, 30, 31, 91, 211, 511, 811])
+    }
+
+    @Test func probationRollsBackAfterTwoFailuresAndKeepsBothLosses() {
+        let session = LocalProbeSession(jitter: { 0 })
+        var tracker = LocalHealthTracker()
+        var results: [LocalProbeResult] = []
+        for time in 0...39 {
+            let result = session.poll(router, now: Double(time)) { method, _ in
+                if method == .icmp { return (30...32).contains(time) ? reply(2) : .lost }
+                return reply(20)
+            }
+            if let result {
+                results.append(result)
+                tracker.record(result.outcome, method: result.method, at: Double(time))
+            }
+        }
+        #expect(results.suffix(3).map(\.method) == [.icmp, .icmp, .dns])
+        for result in results.suffix(3).prefix(2) {
+            guard case .lost = result.outcome else { Issue.record("Both probation failures must be retained"); return }
+        }
+        #expect((tracker.report(now: 39)?.loss ?? 0) > 0)
+        #expect(tracker.report(now: 39)?.jitterMs == 0)
+    }
+
+    @Test func successfulProbationExpiresAndRecoveryStillRequiresThreeFailures() {
+        let session = LocalProbeSession(jitter: { 0 })
+        var results: [LocalProbeResult] = []
+        for time in 0...57 {
+            if let result = session.poll(router, now: Double(time), probe: { method, _ in
+                if method == .icmp { return (30..<48).contains(time) ? reply() : .lost }
+                return reply()
+            }) { results.append(result) }
+        }
+        #expect(results.suffix(4).map(\.method) == [.icmp, .icmp, .icmp, .dns])
+    }
+
+    @Test func activeFailureCancelsConfirmationAndEpochChangeDiscardsTrials() {
+        let session = LocalProbeSession(jitter: { 0 })
+        var trials: [Int] = []
+        for time in 0...36 {
+            _ = session.poll(router, now: Double(time)) { method, _ in
+                if method == .icmp {
+                    trials.append(time)
+                    return time >= 30 ? reply() : .lost
+                }
+                return time == 30 ? .lost : reply()
+            }
+        }
+        // An active loss prevents starting the burst at 30; start once stable at 33.
+        #expect(trials == [0, 33, 34, 35, 36])
+        var calls: [LocalProbeMethod] = []
+        let result = session.poll(router, epoch: 1, now: 37) { method, _ in
+            calls.append(method); return method == .dns ? reply() : .lost
+        }
+        #expect(calls == [.icmp, .dns])
+        #expect(result?.method == .dns)
+    }
+
+    @Test func retriesAreIndependentAndAnUnreliablePreferredMethodDoesNotStarveOthers() {
+        let session = LocalProbeSession(jitter: { 0 })
+        var results: [LocalProbeResult] = []
+        var calls: [(Int, LocalProbeMethod)] = []
+        for time in 0...36 {
+            if let result = session.poll(router, now: Double(time), probe: { method, _ in
+                calls.append((time, method))
+                if method == .tcp443 || (method == .dns && time >= 30) { return reply() }
+                return .lost
+            }) { results.append(result) }
+        }
+        #expect(calls.filter { $0.0 >= 30 && $0.1 == .icmp }.map { $0.0 } == [30])
+        #expect(calls.filter { (31...33).contains($0.0) && $0.1 == .dns }.map { $0.0 } == [31, 32, 33])
+        #expect(results.last?.method == .dns)
     }
 
     @Test func dnsDoesNotRecurseAndRejectsUnrelatedOrMalformedReplies() {

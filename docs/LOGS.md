@@ -32,7 +32,7 @@ Each per-minute entry includes:
 | `health_internet_reachable`, `health_websites_failing` | Confirmed-outage reachability and unconfirmed website-failure flags from the current health report; `null` during calibration |
 | `connections` | Latest socket snapshot, or `null` when unavailable or more than 15 seconds old; see [Connection snapshot](#connection-snapshot) |
 | `transport_health`, `local_health_raw` | Unsmoothed WAN transport score (before the website outage override) and local-router score |
-| `health_model`, `health_window_s`, `health_weighting`, `health_weight_half_life_s` | Scoring definition: `delay_budget_v1`, 60-second window, `exponential_age`, 15-second half-life. Older records used `inverse_sqrt_age` and `health_weight_min_age_s`. |
+| `health_model`, `health_window_s`, `health_weighting`, `health_weight_half_life_s` | Scoring definition: `delay_budget_v2` (adds the IPv6-only score divisor), 60-second window, `exponential_age`, 15-second half-life. Older records used `inverse_sqrt_age` and `health_weight_min_age_s`. |
 | `reconnects_5m` | Completed reconnects in the rolling window (five minutes by default), including counts of zero or one hidden by the menu. The legacy field name is retained for readers. |
 | `reconnect_window_s` | Configured reconnect window in seconds, normally 300 |
 | `recent_trouble` | Warning categories active in the last ten seconds: `network loss`, `network latency`, `network jitter`, corresponding `router` categories, and `web access`. An empty array means none. |

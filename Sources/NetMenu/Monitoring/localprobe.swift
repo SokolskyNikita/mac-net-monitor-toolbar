@@ -19,44 +19,145 @@ struct LocalProbeResult {
     var outcome: Latency.PingOutcome
 }
 
-/// Owned by a probe loop. Keep using a proven protocol, including counting its losses.
-/// Discover alternatives only after three failures, at most once every 30 seconds.
-/// Locking also protects against a late result after the WAN phase's outer deadline.
+/// Owns active measurements and preferred-protocol trials. Poll once per second;
+/// active samples retain their three-second cadence and trials never enter health history.
+/// All socket work stays on the caller's worker, with no sleeps or queued bursts.
 final class LocalProbeSession {
     private let config: MonitoringConfig
-    init(config: MonitoringConfig = Configuration.monitoring) { self.config = config }
+    private let jitter: () -> Double
+    init(config: MonitoringConfig = Configuration.monitoring,
+         jitter: @escaping () -> Double = { Double.random(in: -1...1) }) {
+        self.config = config; self.jitter = jitter
+    }
     private let lock = NSLock()
     private var router: LocalRouter?
     private var epoch: Int?
     private var selected: LocalProbeMethod?
     private var failures = 0
     private var nextDiscovery: TimeInterval = 0
+    private var nextMeasurement: TimeInterval = 0
+    private struct Retry {
+        var next: TimeInterval
+        var attempt = 0
+        var replies = 0
+    }
+    private var retries: [LocalProbeMethod: Retry] = [:]
+    private var probation: (previous: LocalProbeMethod, until: TimeInterval)?
 
+    private func prepare(_ router: LocalRouter, epoch: Int) {
+        if self.router != router || self.epoch != epoch {
+            self.router = router; self.epoch = epoch
+            selected = nil; failures = 0; nextDiscovery = 0; nextMeasurement = 0
+            retries.removeAll(); probation = nil
+        }
+    }
+
+    /// The live scheduler calls this on its one-second tick. Only active measurements
+    /// are returned; confirmation probes can run on intervening ticks.
+    func poll(_ router: LocalRouter, epoch: Int = 0, now: TimeInterval = HealthTracker.now(),
+              probe: (LocalProbeMethod, LocalRouter) -> Latency.PingOutcome = LocalProtocols.probe) -> LocalProbeResult? {
+        lock.lock(); defer { lock.unlock() }
+        prepare(router, epoch: epoch)
+        var result: LocalProbeResult?
+        if now >= nextMeasurement {
+            nextMeasurement = now + config.probeInterval
+            result = measureLocked(router, now: now, probe: probe)
+        }
+        retryPreferred(router, now: now, probe: probe)
+        return result
+    }
+
+    /// Explicit single measurements (also useful for diagnostics and deterministic tests).
     func measure(_ router: LocalRouter, epoch: Int = 0, now: TimeInterval = HealthTracker.now(),
                  probe: (LocalProbeMethod, LocalRouter) -> Latency.PingOutcome = LocalProtocols.probe) -> LocalProbeResult {
         lock.lock(); defer { lock.unlock() }
-        if self.router != router || self.epoch != epoch {
-            self.router = router; self.epoch = epoch
-            selected = nil; failures = 0; nextDiscovery = 0
+        prepare(router, epoch: epoch)
+        return measureLocked(router, now: now, probe: probe)
+    }
+
+    private func delay(_ attempt: Int) -> TimeInterval {
+        let delays = config.localRetryDelays
+        let base = delays.isEmpty ? config.localDiscoveryInterval : delays[min(attempt, delays.count - 1)]
+        return base * (1 + config.localRetryJitter * jitter())
+    }
+
+    private func schedulePreferred(before method: LocalProbeMethod, now: TimeInterval) {
+        for candidate in LocalProbeMethod.allCases.prefix(while: { $0 != method }) where retries[candidate] == nil {
+            retries[candidate] = Retry(next: now + delay(0), attempt: 1)
         }
+    }
+
+    private func backoff(_ method: LocalProbeMethod, now: TimeInterval) {
+        var retry = retries[method] ?? Retry(next: now)
+        retry.replies = 0
+        retry.next = now + delay(retry.attempt)
+        retry.attempt += 1
+        retries[method] = retry
+    }
+
+    private func select(_ method: LocalProbeMethod, now: TimeInterval) {
+        selected = method; failures = 0
+        schedulePreferred(before: method, now: now)
+    }
+
+    private func measureLocked(_ router: LocalRouter, now: TimeInterval,
+                               probe: (LocalProbeMethod, LocalRouter) -> Latency.PingOutcome) -> LocalProbeResult {
+        if let p = probation, now >= p.until { probation = nil }
         let method = selected ?? .icmp
         let outcome = probe(method, router)
+        let result = LocalProbeResult(method: method, outcome: outcome)
         if case .reply = outcome {
-            selected = method; failures = 0
-            return .init(method: method, outcome: outcome)
+            select(method, now: now)
+            return result
         }
         failures += 1
+        // Any active failure interrupts a qualification burst. Trials only run while stable.
+        for candidate in Array(retries.keys) where retries[candidate]!.replies > 0 {
+            backoff(candidate, now: now)
+        }
+        if let p = probation, failures >= config.localProbationFailureLimit {
+            probation = nil
+            backoff(method, now: now)
+            select(p.previous, now: now)
+            return result // Keep the second failure in health history, even on rollback.
+        }
         if now >= nextDiscovery, selected == nil || failures >= config.localFailureLimit {
             nextDiscovery = now + config.localDiscoveryInterval
+            let wasSelected = selected != nil
             for candidate in LocalProbeMethod.allCases where candidate != method {
                 let fallback = probe(candidate, router)
                 if case .reply = fallback {
-                    selected = candidate; failures = 0
-                    return .init(method: candidate, outcome: fallback)
+                    probation = nil
+                    select(candidate, now: now)
+                    // Discovery must not replace an established method's failed sample.
+                    return wasSelected ? result : .init(method: candidate, outcome: fallback)
                 }
             }
         }
-        return .init(method: method, outcome: outcome)
+        return result
+    }
+
+    private func retryPreferred(_ router: LocalRouter, now: TimeInterval,
+                                probe: (LocalProbeMethod, LocalRouter) -> Latency.PingOutcome) {
+        guard let active = selected, failures == 0, probation == nil else { return }
+        let preferred = LocalProbeMethod.allCases.prefix(while: { $0 != active })
+        // Finish a successful burst before spending time on another candidate.
+        guard let candidate = preferred.first(where: { (retries[$0]?.replies ?? 0) > 0 })
+            ?? preferred.first(where: { (retries[$0]?.next ?? .infinity) <= now }),
+              var retry = retries[candidate], now >= retry.next else { return }
+        guard case .reply = probe(candidate, router) else {
+            backoff(candidate, now: now)
+            return
+        }
+        retry.replies += 1
+        if retry.replies >= config.localConfirmationCount {
+            retries.removeValue(forKey: candidate)
+            select(candidate, now: now)
+            probation = (active, now + config.localProbationInterval)
+        } else {
+            retry.next = now + config.localConfirmationInterval
+            retries[candidate] = retry
+        }
     }
 }
 

@@ -1,16 +1,20 @@
 import Darwin
 import Foundation
 
-/// One connected datagram socket per IPv6 router probe. The kernel checks the ICMPv6
+/// One connected datagram socket per IPv6 probe. The kernel checks the ICMPv6
 /// checksum and source; a random payload, ID and sequence reject unrelated replies.
 /// Scope IDs keep link-local router traffic on its physical interface, outside the VPN.
 enum IPv6Pinger {
+    // Darwin's RFC3542 constants are gated behind __APPLE_USE_RFC_3542 in in6.h
+    // and are not imported by Swift's default Darwin module.
+    private static let receiveHopLimitOption: Int32 = 37
+    static let hopLimitControlType: Int32 = 47
     static func ping(_ host: String, timeoutMs: Int) -> Latency.PingOutcome {
         var hints = addrinfo()
         hints.ai_family = AF_INET6; hints.ai_socktype = SOCK_DGRAM; hints.ai_flags = AI_NUMERICHOST
         var result: UnsafeMutablePointer<addrinfo>?
         guard getaddrinfo(host, nil, &hints, &result) == 0, let address = result else {
-            return .unmeasured("invalid IPv6 router")
+            return .unmeasured("invalid IPv6 address")
         }
         defer { freeaddrinfo(result) }
         let fd = socket(AF_INET6, SOCK_DGRAM, IPPROTO_ICMPV6)
@@ -19,6 +23,7 @@ enum IPv6Pinger {
         _ = fcntl(fd, F_SETFD, FD_CLOEXEC)
         var on: Int32 = 1
         _ = setsockopt(fd, SOL_SOCKET, SO_TIMESTAMP, &on, socklen_t(MemoryLayout<Int32>.size))
+        _ = setsockopt(fd, IPPROTO_IPV6, receiveHopLimitOption, &on, socklen_t(MemoryLayout<Int32>.size))
         guard connect(fd, address.pointee.ai_addr, address.pointee.ai_addrlen) == 0 else {
             return sendFailure(errno)
         }
@@ -65,8 +70,27 @@ enum IPv6Pinger {
                     + Double(Int(stamp.tv_usec) - Int(wall.tv_usec)) / 1000
                 if kernel >= 0, kernel <= mono + 5 { ms = kernel }
             }
-            return .reply(Latency.EchoReply(ms: ms, hops: nil))
+            let hops = hopLimit(control: control, length: Int(msg.msg_controllen)).map(Latency.inferredHops)
+            return .reply(Latency.EchoReply(ms: ms, hops: hops))
         }
+    }
+
+    /// IPv6 datagram sockets deliver the received hop limit as ancillary data.
+    static func hopLimit(control: [UInt8], length: Int) -> Int? {
+        let end = min(length, control.count), headerSize = MemoryLayout<cmsghdr>.size
+        var offset = 0
+        while offset + headerSize <= end {
+            let header = control.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: offset, as: cmsghdr.self) }
+            let count = Int(header.cmsg_len)
+            guard count >= headerSize, count <= end - offset else { return nil }
+            if header.cmsg_level == IPPROTO_IPV6, header.cmsg_type == hopLimitControlType,
+               count >= headerSize + MemoryLayout<Int32>.size {
+                let value = control.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: offset + headerSize, as: Int32.self) }
+                return (0...255).contains(value) ? Int(value) : nil
+            }
+            offset += (count + 3) & ~3 // Darwin CMSG_ALIGN
+        }
+        return nil
     }
 
     static func matchesReply(_ reply: [UInt8], request: [UInt8]) -> Bool {

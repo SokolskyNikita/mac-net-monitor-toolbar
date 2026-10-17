@@ -9,13 +9,21 @@ struct LiveHealthTracker {
     init(config: HealthConfig = Configuration.health, monitoring: MonitoringConfig = Configuration.monitoring) {
         self.config = config; self.monitoring = monitoring
     }
+    private(set) var wanFamily = IPVersion.ipv4
     private var rounds: [TimeInterval: HealthSample] = [:]
     private var fallbackSamples: [HealthSample] = []
     private var web: [(at: TimeInterval, reachable: Bool)] = []
+    private var ipChecks: [(at: TimeInterval, ipv4: InternetStatus, ipv6: InternetStatus)] = []
     private var portalAt: TimeInterval?
     private var settleUntil: TimeInterval?
 
     mutating func reset() { self = Self(config: config, monitoring: monitoring) }
+    /// Website evidence survives a transport switch; RTT, jitter and loss must not cross families.
+    mutating func selectWANFamily(_ family: IPVersion) {
+        guard family != wanFamily else { return }
+        wanFamily = family
+        rounds.removeAll(); fallbackSamples.removeAll()
+    }
     mutating func settle(at now: TimeInterval = HealthTracker.now()) { settleUntil = now + config.settleLimit }
     private mutating func accept(success: Bool, at now: TimeInterval) -> Bool {
         if let until = settleUntil {
@@ -36,7 +44,7 @@ struct LiveHealthTracker {
         if case .wan = verdict { success = true } else { success = false }
         guard accept(success: success, at: now) else { return false }
         var sample = rounds[started] ?? HealthSample(at: started, ms: nil, source: nil,
-            targets: Array(repeating: .unmeasured, count: Latency.icmpTargets.count), internet: .unknown)
+            targets: Array(repeating: .unmeasured, count: Latency.icmpTargets(for: wanFamily).count), internet: .unknown)
         sample.targets[slot] = verdict
         let replies = sample.targets.compactMap { v -> Double? in if case .wan(let ms) = v { return ms }; return nil }
         sample.ms = replies.min(); sample.source = sample.ms == nil ? nil : .icmp
@@ -54,6 +62,14 @@ struct LiveHealthTracker {
         let reachable = checks.values.contains(true)
         guard accept(success: reachable, at: now) else { return }
         web.append((now, reachable))
+    }
+
+    mutating func recordIPWeb(_ checks: IPWebsiteChecks, at now: TimeInterval = HealthTracker.now()) {
+        let ipv4 = checks.status(for: .ipv4), ipv6 = checks.status(for: .ipv6)
+        guard accept(success: ipv4 == .reachable || ipv6 == .reachable, at: now) else { return }
+        ipChecks.removeAll { now - $0.at > monitoring.websiteFreshFor }
+        ipChecks.append((now, ipv4, ipv6))
+        recordWeb(checks.combined, at: now)
     }
 
     mutating func recordPortal(_ captive: Bool, at now: TimeInterval = HealthTracker.now()) {
@@ -89,6 +105,22 @@ struct LiveHealthTracker {
                 if result == nil { result = HealthReport(score: 0, loss: 0, jitterMs: nil, latencyMs: nil) }
                 result?.score = 0; result?.internetReachable = false
             } else { result?.websitesFailing = true }
+        }
+        let freshIP = ipChecks.filter { now - $0.at <= monitoring.websiteFreshFor }
+        if let last = freshIP.last {
+            let ipv4Unavailable = last.ipv4 == .unreachable && freshIP.dropLast().last?.ipv4 == .unreachable
+            if ipv4Unavailable && result == nil {
+                // Successful IPv6 websites establish partial access before RTT calibration.
+                result = HealthReport(score: last.ipv6 == .reachable ? 100 : 0, loss: 0, jitterMs: nil, latencyMs: nil)
+            }
+            result?.ipv4Unavailable = ipv4Unavailable
+            result?.ipv6Reachable = last.ipv6 == .reachable
+            if ipv4Unavailable, let score = result?.score {
+                // Keep working IPv6 visibly distinct from a complete outage, even if the
+                // transport score rounds to zero while IPv4 pings are failing.
+                result?.score = last.ipv6 == .reachable
+                    ? max(1, Int((Double(score) / config.ipv6OnlyScoreDivisor).rounded())) : 0
+            }
         }
         return result
     }

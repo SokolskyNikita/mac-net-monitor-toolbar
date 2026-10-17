@@ -47,6 +47,9 @@ struct HealthReport: Equatable {
     var internetReachable: Bool = true
     /// The latest website checks failed but the outage is not confirmed yet.
     var websitesFailing: Bool = false
+    /// Two complete IPv4 website rounds failed; IPv6 success cannot mask this critical failure.
+    var ipv4Unavailable: Bool = false
+    var ipv6Reachable: Bool = false
     /// Sources contributing to the displayed RTT, including a smoothed source transition.
     var latencySources: Set<LatencySource> = []
 }
@@ -295,7 +298,9 @@ struct HealthDisplay {
     mutating func add(_ report: HealthReport?) {
         guard let report else { return }
         // Do not average a confirmed outage with an earlier healthy score (or vice versa).
-        if !report.internetReachable || pending.last?.internetReachable != report.internetReachable {
+        if !report.internetReachable || report.ipv4Unavailable
+            || pending.last?.internetReachable != report.internetReachable
+            || pending.last?.ipv4Unavailable != report.ipv4Unavailable {
             pending.removeAll(keepingCapacity: true)
         }
         pending.append(report)
@@ -305,7 +310,9 @@ struct HealthDisplay {
     mutating func publish(now: TimeInterval = HealthTracker.now()) -> Bool {
         guard !pending.isEmpty else { return false }
         let accessChanged = pending.last?.internetReachable != shown?.internetReachable
-        if !accessChanged, pending.last?.internetReachable != false,
+            || pending.last?.ipv4Unavailable != shown?.ipv4Unavailable
+            || (pending.last?.ipv4Unavailable == true && pending.last?.ipv6Reachable != shown?.ipv6Reachable)
+        if !accessChanged, pending.last?.internetReachable != false, pending.last?.ipv4Unavailable != true,
            let at = publishedAt, now - at < config.displayInterval { return false }
         let next = Self.mean(pending)
         pending.removeAll(keepingCapacity: true)
@@ -328,6 +335,8 @@ struct HealthDisplay {
                             latencyMs: avg(reports.compactMap(\.latencyMs)),
                             internetReachable: reports.last?.internetReachable ?? false,
                             websitesFailing: reports.last?.websitesFailing ?? false,
+                            ipv4Unavailable: reports.last?.ipv4Unavailable ?? false,
+                            ipv6Reachable: reports.last?.ipv6Reachable ?? false,
                             latencySources: reports.reduce(into: Set<LatencySource>()) { $0.formUnion($1.latencySources) })
     }
 }

@@ -91,9 +91,13 @@ enum CLI {
         let session = LocalProbeSession()
         print("Router: \(target.address) on \(target.interface); \(localSampleCount) probes, \(String(format: "%g", Configuration.monitoring.probeInterval)) seconds apart")
         var tracker = LocalHealthTracker()
-        for i in 0..<localSampleCount {
+        var i = 0
+        while i < localSampleCount {
             let start = HealthTracker.now()
-            let result = session.measure(target)
+            guard let result = session.poll(target) else {
+                Thread.sleep(forTimeInterval: Configuration.monitoring.localConfirmationInterval)
+                continue
+            }
             tracker.record(result.outcome, method: result.method)
             print("method: \(result.method.label)")
             switch result.outcome {
@@ -101,7 +105,10 @@ enum CLI {
             case .lost: print("probe \(i + 1): no reply")
             case .unmeasured(let why): print("probe \(i + 1): unavailable (\(why))")
             }
-            if i + 1 < localSampleCount { Thread.sleep(forTimeInterval: max(0, Configuration.monitoring.probeInterval - (HealthTracker.now() - start))) }
+            i += 1
+            if i < localSampleCount {
+                Thread.sleep(forTimeInterval: max(0, Configuration.monitoring.localConfirmationInterval - (HealthTracker.now() - start)))
+            }
         }
         guard router() == target else { print("Local network changed; result discarded"); return 1 }
         print(tracker.menuTitle(router: target.address, report: tracker.report()))

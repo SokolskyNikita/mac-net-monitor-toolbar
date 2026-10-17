@@ -9,7 +9,7 @@ Run the commands below from the repository root.
 1. Edit `Resources/Info.plist`:
    - `CFBundleShortVersionString` — the next marketing version in `X.Y.Z` form
    - `CFBundleVersion` — integer build, increment every release
-2. Run `make test` and `make dist`. The release workflow does not run tests, so validate the intended release locally before tagging.
+2. Run `make test`, `make test-build` and `make dist`. The release workflow does not run tests, so validate the intended release locally before tagging.
 3. Commit the version bump on `main`, then tag that commit (the commands read the version you just set):
 
 ```bash

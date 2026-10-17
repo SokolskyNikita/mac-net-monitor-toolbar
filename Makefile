@@ -1,5 +1,10 @@
+.DEFAULT_GOAL := build
+
 SWIFT_FLAGS ?= -O
 SWIFT_TEST_FLAGS ?=
+SWIFTC ?= swiftc
+SWIFT_JOBS ?= 4
+MACOS_SDK ?= $(shell xcrun --sdk macosx --show-sdk-path)
 SIGN_ID ?= -
 MIN_OS ?= 14.0
 ARCHS ?= arm64 x86_64
@@ -12,7 +17,7 @@ DIST_DIR := dist
 DIST_ZIP := $(DIST_DIR)/NetMenu-$(VERSION).zip
 ICON := Resources/AppIcon.icns
 
-.PHONY: build check test app run dist notarize icon clean
+.PHONY: build check test test-build app run dist notarize icon clean FORCE
 
 # Command Line Tools ship Swift Testing outside the default search path; Xcode finds it on its own.
 # Their _Testing_Foundation overlay lacks module interfaces; these tests need only core Testing.
@@ -25,13 +30,30 @@ TEST_FLAGS := $(if $(wildcard $(TESTING_FW)/Testing.framework),\
 
 SOURCES := $(shell find Sources/NetMenu -type f -name '*.swift' | sort)
 ARCH_BINS = $(foreach a,$(ARCHS),build/NetMenu-$(a))
+ARCH_CONFIGS = $(foreach a,$(ARCHS),build/objects/$(a)/config.json)
+RUN_IF_STALE = python3 scripts/run-if-stale.py $@ $(filter-out FORCE,$^) --
 
-build/NetMenu-%: $(SOURCES) Makefile
-	mkdir -p build
-	swiftc $(SWIFT_FLAGS) -target $*-apple-macos$(MIN_OS) $(SOURCES) -o $@
+# These recipes check configuration on every invocation, but only change the
+# prerequisite timestamps when inputs change. Unchanged builds never run swiftc.
+FORCE:
 
-build/NetMenu: $(ARCH_BINS)
-	lipo -create -output $@ $(ARCH_BINS)
+$(ARCH_CONFIGS): build/objects/%/config.json: FORCE scripts/prepare-swift-build.py
+	@python3 scripts/prepare-swift-build.py --cache $(@D) --compiler "$(SWIFTC)" \
+		--sdk "$(MACOS_SDK)" --target "$*-apple-macos$(MIN_OS)" --jobs $(SWIFT_JOBS) -- $(SWIFT_FLAGS)
+
+build/NetMenu-%: $(SOURCES) build/objects/%/config.json Makefile scripts/prepare-swift-build.py scripts/run-if-stale.py FORCE
+	@$(RUN_IF_STALE) $(SWIFTC) $(SWIFT_FLAGS) -incremental -enable-batch-mode -j $(SWIFT_JOBS) \
+		-module-name NetMenu -sdk "$(MACOS_SDK)" -target $*-apple-macos$(MIN_OS) \
+		-output-file-map build/objects/$*/output-file-map.json $(SOURCES) -o $@
+
+# Switching ARCHS must rebuild the fat binary even when its inputs are older.
+build/architectures: FORCE
+	@mkdir -p build
+	@printf '%s\n' "$(ARCHS)" > $@.tmp
+	@cmp -s $@.tmp $@ && rm $@.tmp || mv $@.tmp $@
+
+build/NetMenu: $(ARCH_BINS) build/architectures scripts/run-if-stale.py FORCE
+	@$(RUN_IF_STALE) lipo -create -output $@ $(ARCH_BINS)
 
 build: build/NetMenu
 
@@ -39,6 +61,9 @@ check: build/NetMenu
 	./build/NetMenu --sample > /tmp/netmenu_check.txt
 	cat /tmp/netmenu_check.txt
 	tail -n 1 /tmp/netmenu_check.txt | /usr/bin/env python3 -m json.tool > /dev/null
+
+test-build:
+	python3 -B -m unittest discover -s scripts/tests -v
 
 test:
 	swift test $(SWIFT_TEST_FLAGS) $(TEST_FLAGS)
@@ -62,17 +87,33 @@ $(ICON): scripts/generate-icon.swift
 
 icon: $(ICON)
 
-app: build/NetMenu $(ICON)
-	rm -rf NetMenu.app
-	mkdir -p NetMenu.app/Contents/MacOS NetMenu.app/Contents/Resources
-	cp build/NetMenu NetMenu.app/Contents/MacOS/NetMenu
-	cp $(PLIST) NetMenu.app/Contents/
-	cp $(ICON) NetMenu.app/Contents/Resources/AppIcon.icns
-	@if [ "$(SIGN_ID)" = "-" ]; then \
+BUNDLE_BINARY := NetMenu.app/Contents/MacOS/NetMenu
+BUNDLE_PLIST := NetMenu.app/Contents/Info.plist
+BUNDLE_ICON := NetMenu.app/Contents/Resources/AppIcon.icns
+BUNDLE_SIGNATURE := NetMenu.app/Contents/_CodeSignature/CodeResources
+
+build/sign-identity: FORCE
+	@mkdir -p build
+	@printf '%s\n' "$(SIGN_ID)" > $@.tmp
+	@cmp -s $@.tmp $@ && rm $@.tmp || mv $@.tmp $@
+
+$(BUNDLE_BINARY): build/NetMenu scripts/run-if-stale.py FORCE
+	@$(RUN_IF_STALE) sh -ec 'mkdir -p $(@D); cp $< $@.tmp; mv $@.tmp $@'
+
+$(BUNDLE_PLIST): $(PLIST) scripts/run-if-stale.py FORCE
+	@$(RUN_IF_STALE) sh -ec 'mkdir -p $(@D); cp $< $@'
+
+$(BUNDLE_ICON): $(ICON) scripts/run-if-stale.py FORCE
+	@$(RUN_IF_STALE) sh -ec 'mkdir -p $(@D); cp $< $@'
+
+$(BUNDLE_SIGNATURE): $(BUNDLE_BINARY) $(BUNDLE_PLIST) $(BUNDLE_ICON) build/sign-identity Makefile scripts/run-if-stale.py FORCE
+	@$(RUN_IF_STALE) sh -ec 'if [ "$(SIGN_ID)" = "-" ]; then \
 		codesign --force --sign - NetMenu.app; \
 	else \
 		codesign --force --options runtime --timestamp --sign "$(SIGN_ID)" NetMenu.app; \
-	fi
+	fi; touch $@'
+
+app: $(BUNDLE_SIGNATURE)
 
 run: app
 	open NetMenu.app

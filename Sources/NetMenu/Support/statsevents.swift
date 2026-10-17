@@ -60,6 +60,8 @@ struct HealthStatsSnapshot {
             "health_latency_ms": number(report?.latencyMs),
             "health_internet_reachable": number(report?.internetReachable),
             "health_websites_failing": number(report?.websitesFailing),
+            "health_ipv4_unavailable": number(report?.ipv4Unavailable),
+            "health_ipv6_reachable": number(report?.ipv6Reachable),
             "transport_health": number(transport?.score),
             "local_health_raw": number(local?.score),
             "health_window_s": config.window,

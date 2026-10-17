@@ -325,7 +325,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDelegate {
             DiagLog.shared.info("health", "\(h.score)% loss=\(String(format: "%.3f", h.loss))"
                 + " jitter=\(h.jitterMs.map { String(format: "%.1f", $0) } ?? "-")"
                 + " latency=\(h.latencyMs.map { String(format: "%.1f", $0) } ?? "-")"
-                + " outage=\(!h.internetReachable) websites_failing=\(h.websitesFailing)")
+                + " outage=\(!h.internetReachable) websites_failing=\(h.websitesFailing) ipv4_unavailable=\(h.ipv4Unavailable) ipv6_reachable=\(h.ipv6Reachable)")
         }
         return true
     }
@@ -487,7 +487,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDelegate {
         } else { lat = "✕"; displayedLatency = nil }
         let recent = recentTrouble.labels()
         let baseHealth = report.map { "\($0.score)%" } ?? (calibrating ? StatusBarRenderer.calibratingText : "")
-        let hasWarning = !recent.isEmpty
+        let hasWarning = !recent.isEmpty || report?.ipv4Unavailable == true
         let healthText = hasWarning ? "\(baseHealth) ⚠" : baseHealth
         let reconnectCount = reconnects.count()
         reconnectsItem?.isHidden = reconnectCount < Configuration.monitoring.reconnectWarningCount
@@ -517,6 +517,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDelegate {
 
     func healthMenuReadout(_ report: HealthReport?) -> MenuReadout {
         guard let h = report else { return .health(.health) }
+        if h.ipv4Unavailable {
+            return .health(.health, score: h.score, parts: [h.ipv6Reachable
+                ? "⚠ IPv4 unavailable; IPv6 is working"
+                : "⚠ IPv4 internet unavailable"])
+        }
         if !h.internetReachable {
             return .health(.health, score: 0, parts: ["internet sites unreachable"])
         }
@@ -531,6 +536,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDelegate {
         return .health(.health, score: h.score, parts: parts)
     }
 
+    private func selectWANFamily(_ family: IPVersion) {
+        guard health.wanFamily != family else { return }
+        health.selectWANFamily(family); healthDisplay.reset()
+        recentLats.removeAll(); lastLatMs = nil; lastLatAt = nil; lastLatSrc = nil
+        recentTrouble = RecentTrouble()
+        DiagLog.shared.info("probe", "WAN measurements switched to \(family.rawValue)")
+    }
+
     /// All callbacks arrive on the main thread; old-network and speed-test results are discarded.
     func receiveProbe(epoch: Int, event: LiveProbes.Event) {
         guard epoch == snapshotProbeContext().epoch, !speedTestRunning else {
@@ -539,7 +552,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDelegate {
         let now = HealthTracker.now()
         lastCycleAt = now
         switch event {
-        case .wan(let slot, let started, let outcome, let gatewayMs):
+        case .wanFamily(let family):
+            selectWANFamily(family)
+        case .wan(let family, let slot, let started, let outcome, let gatewayMs):
+            selectWANFamily(family)
             let verdict = LiveProbes.verdict(outcome, gatewayMs: gatewayMs)
             let recorded = health.recordTarget(slot: slot, verdict: verdict, started: started, at: now)
             recentTrouble.record(verdict, target: "wan-\(slot)", label: "network", at: now)
@@ -549,7 +565,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDelegate {
             }
             probeStats.recordWAN(verdict)
             Diagnostics.shared.count(.probeCycles)
-            DiagLog.shared.info("probe", "target \(Latency.icmpTargets[slot]) \(outcome) verdict=\(verdict) recorded=\(recorded)")
+            DiagLog.shared.info("probe", "target \(Latency.icmpTargets(for: health.wanFamily)[slot]) \(outcome) verdict=\(verdict) recorded=\(recorded)")
         case .router(let result):
             if localHealth.method != result.method { localHealthDisplay.reset() }
             localHealth.record(result.outcome, method: result.method)
@@ -564,17 +580,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDelegate {
             recentTrouble.record(verdict, target: "router-\(result.method.rawValue)", label: "router", at: now)
             DiagLog.shared.info("probe", "router \(result.method.rawValue) \(verdict)")
         case .websites(let checks):
-            health.recordWeb(checks)
-            if !checks.isEmpty {
-                lastInternetChecks = checks
-                if !checks.values.contains(true) { recentTrouble.websitesFailed(at: now) }
+            health.recordIPWeb(checks)
+            if !checks.combined.isEmpty {
+                lastInternetChecks = checks.combined
+                if !checks.combined.values.contains(true) { recentTrouble.websitesFailed(at: now) }
             }
             DiagLog.shared.info("probe", "websites \(checks)")
         case .portal(let portal):
             health.recordPortal(portal == .portal)
             lastCaptive = portal == .portal
             DiagLog.shared.info("probe", "portal \(portal)")
-        case .fallback(let ms):
+        case .fallback(let family, let ms):
+            selectWANFamily(family)
             health.recordFallback(ms)
             // A fallback that overlapped an ICMP recovery must not replace newer ping latency.
             let freshPing = lastLatSrc == LatencySource.icmp.rawValue
