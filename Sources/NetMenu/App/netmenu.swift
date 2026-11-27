@@ -166,6 +166,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDelegate {
         bandwidth = BandwidthTracker(counters: counters, at: now); probeStats = ProbeStatsWindow(at: now)
         idQ.async { [weak self] in self?.refreshIdentity() }
         let t = Timer(timeInterval: BandwidthTracker.sampleInterval, repeats: true) { [weak self] _ in self?.tick() }
+        // Rates use the measured interval between samples, so the tick may share a wake with others.
+        t.tolerance = BandwidthTracker.sampleInterval / 10
         RunLoop.main.add(t, forMode: .common)
         liveProbes.receive = { [weak self] epoch, event in self?.receiveProbe(epoch: epoch, event: event) }
         // Common modes: keep firing while the menu is open.
@@ -192,6 +194,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDelegate {
         statsQ.sync {}
         let defaults = UserDefaults.standard
         if defaults.integer(forKey: Self.runningPIDKey) == Int(getpid()) { defaults.removeObject(forKey: Self.runningPIDKey) }
+        ProbeLog.shared.flush()
         DiagLog.shared.info("app", "quit after \(String(format: "%.1f", (BandwidthClock.now() - launchedAt) / 3600))h")
         DiagLog.shared.flush()
     }
@@ -243,6 +246,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDelegate {
             DiagLog.shared.info("power", "wake")
             self.lastWakeAt = BandwidthClock.now()
             self.reconnects.wake()
+            RouteCache.shared.invalidate()
             // Wi-Fi takes a few seconds to rejoin; that is not loss on the network we measure.
             self.restartHealth(reason: "wake")
             self.idQ.async { [weak self] in self?.refreshIdentity() }
@@ -266,6 +270,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDelegate {
                 guard let self else { return }
                 self.reconnects.observe(connected: path.status == .satisfied)
                 self.updateTitle()
+                // Every update, not only a changed summary: a quick switch between two networks
+                // can leave the same interfaces and status behind.
+                RouteCache.shared.invalidate()
                 guard summary != self.lastPathSummary else { return }
                 let first = self.lastPathSummary == nil
                 self.lastPathSummary = summary
@@ -285,6 +292,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDelegate {
     /// Wi-Fi names need Location access; re-read them as soon as it changes, not on the next poll.
     func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
         DiagLog.shared.info("network", "location access: \(Self.describe(manager.authorizationStatus))")
+        RouteCache.shared.invalidate()
         idQ.async { [weak self] in self?.refreshIdentity() }
     }
 
@@ -317,17 +325,30 @@ class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDelegate {
     @discardableResult
     func publishHealth() -> Bool {
         let localChanged = localHealthDisplay.publish()
+        // The score and access flags are what the user sees change; loss, jitter and latency
+        // move with every report and go to the summary.
         if localChanged, let h = localHealthDisplay.shown {
-            DiagLog.shared.info("local-health", localHealth.menuTitle(router: identity.localRouter?.address, report: h))
+            let title = localHealth.menuTitle(router: identity.localRouter?.address, report: h)
+            ProbeLog.shared.record("local-health", key: "local-health",
+                                   state: "\(Self.healthBand(h.score)) \(localHealth.method.rawValue)", detail: title, title)
         }
         guard healthDisplay.publish() else { return localChanged }
         if let h = healthDisplay.shown {
-            DiagLog.shared.info("health", "\(h.score)% loss=\(String(format: "%.3f", h.loss))"
+            let flags = "outage=\(!h.internetReachable) websites_failing=\(h.websitesFailing) ipv4_unavailable=\(h.ipv4Unavailable) ipv6_reachable=\(h.ipv6Reachable)"
+            let measures = "loss=\(String(format: "%.3f", h.loss))"
                 + " jitter=\(h.jitterMs.map { String(format: "%.1f", $0) } ?? "-")"
                 + " latency=\(h.latencyMs.map { String(format: "%.1f", $0) } ?? "-")"
-                + " outage=\(!h.internetReachable) websites_failing=\(h.websitesFailing) ipv4_unavailable=\(h.ipv4Unavailable) ipv6_reachable=\(h.ipv6Reachable)")
+            ProbeLog.shared.record("health", key: "health", state: "\(Self.healthBand(h.score)) \(flags)",
+                                   detail: "\(h.score)% \(measures)", "\(h.score)% \(measures) \(flags)")
         }
         return true
+    }
+
+    /// Scores wander by a point or two on a healthy link. The log treats a score as changed
+    /// when it crosses 95, where the menu starts to show a warning colour, or moves to
+    /// another ten below that.
+    static func healthBand(_ score: Int) -> String {
+        score >= 95 ? "95-100%" : "\(score / 10 * 10)-\(min(94, score / 10 * 10 + 9))%"
     }
 
     func setIdentity(_ new: Identity) {
@@ -565,7 +586,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDelegate {
             }
             probeStats.recordWAN(verdict)
             Diagnostics.shared.count(.probeCycles)
-            DiagLog.shared.info("probe", "target \(Latency.icmpTargets(for: health.wanFamily)[slot]) \(outcome) verdict=\(verdict) recorded=\(recorded)")
+            let target = Latency.icmpTargets(for: health.wanFamily)[slot]
+            var state = "lost", replyMs: Double?
+            switch verdict {
+            case .wan(let ms): state = "reply"; replyMs = ms
+            case .onPath: state = "on-path"
+            case .noReply: break
+            case .unmeasured: state = "unmeasured"
+            }
+            ProbeLog.shared.record("probe", key: target, state: recorded ? state : state + " unrecorded", ms: replyMs,
+                                   "target \(target) \(outcome) verdict=\(verdict) recorded=\(recorded)")
         case .router(let result):
             if localHealth.method != result.method { localHealthDisplay.reset() }
             localHealth.record(result.outcome, method: result.method)
@@ -578,18 +608,27 @@ class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDelegate {
             case .unmeasured: verdict = .unmeasured
             }
             recentTrouble.record(verdict, target: "router-\(result.method.rawValue)", label: "router", at: now)
-            DiagLog.shared.info("probe", "router \(result.method.rawValue) \(verdict)")
+            var state = "lost", replyMs: Double?
+            switch verdict {
+            case .wan(let ms): state = "reply"; replyMs = ms
+            case .unmeasured: state = "unmeasured"
+            default: break
+            }
+            ProbeLog.shared.record("probe", key: "router \(result.method.rawValue)", state: state, ms: replyMs,
+                                   "router \(result.method.rawValue) \(verdict)")
         case .websites(let checks):
             health.recordIPWeb(checks)
             if !checks.combined.isEmpty {
                 lastInternetChecks = checks.combined
                 if !checks.combined.values.contains(true) { recentTrouble.websitesFailed(at: now) }
             }
-            DiagLog.shared.info("probe", "websites \(checks)")
+            ProbeLog.shared.record("probe", key: "websites",
+                                   state: "ipv4=\(checks.status(for: .ipv4).rawValue) ipv6=\(checks.status(for: .ipv6).rawValue)",
+                                   "websites \(checks)")
         case .portal(let portal):
             health.recordPortal(portal == .portal)
             lastCaptive = portal == .portal
-            DiagLog.shared.info("probe", "portal \(portal)")
+            ProbeLog.shared.record("probe", key: "portal", state: "\(portal)", "portal \(portal)")
         case .fallback(let family, let ms):
             selectWANFamily(family)
             health.recordFallback(ms)
@@ -600,7 +639,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDelegate {
                 if let ms { noteLatency(ms, src: LatencySource.http.rawValue) }
                 recentTrouble.record(ms.map { .wan($0) } ?? .noReply, target: "http", label: "network", at: now)
             }
-            DiagLog.shared.info("probe", "fallback \(ms.map(String.init(describing:)) ?? "failed")")
+            ProbeLog.shared.notable("probe", "fallback \(ms.map(String.init(describing:)) ?? "failed")")
         }
         healthDisplay.add(health.report())
         publishHealth()

@@ -4,26 +4,23 @@ import Testing
 
 @Suite struct InternetAccessTests {
     @Test func ordinaryPagesAreAccepted() {
-        // Before and after IANA's September 2026 redesign.
-        #expect(Latency.InternetSite.example.accepts(status: 200,
-            body: "<html><title>Example Domain</title><h1>Example Domain</h1>"
-                + "<p>This domain is for use in illustrative examples in documents.</p></html>"))
-        #expect(Latency.InternetSite.example.accepts(status: 200,
-            body: "<!doctype html><html lang=en><head><title>Example Domain</title></head><body>"
-                + "<p>This domain is for use in documentation examples without needing permission.</p></body></html>"))
+        #expect(Latency.InternetSite.fastly.accepts(status: 200,
+            body: "User-agent: *\nDisallow: /ja/*\nDisallow: /labs/*\n"))
+        #expect(Latency.InternetSite.fastly.accepts(status: 200, body: "# rules\nuser-agent: *\ndisallow:\n"))
         #expect(Latency.InternetSite.google.accepts(status: 200,
-            body: "User-agent: *\nUser-agent: Yandex\nDisallow: /search\n"))
+            body: "Google is built by a large team of engineers, designers, researchers, robots, and others.\n"))
     }
 
     @Test(arguments: Latency.InternetSite.allCases)
     func portalAndAllowlistedConnectivityPagesAreRejected(site: Latency.InternetSite) {
         for body in ["", "<html>Sign in to United Wi-Fi</html>",
-                     "<TITLE>Success</TITLE><BODY>Success</BODY>", "fl=123\nh=1.1.1.1\ncolo=ORD\n"] {
+                     "<TITLE>Success</TITLE><BODY>Success</BODY>", "fl=123\nh=1.1.1.1\ncolo=ORD\n",
+                     "<html>User-agent: * Disallow: / Please sign in</html>", "success\n"] {
             #expect(!site.accepts(status: 200, body: body))
         }
         for status in [0, 204, 302, 403, 511] {
             #expect(!site.accepts(status: status,
-                body: "User-agent: *\nDisallow: /search\n<title>Example Domain</title>This domain is for use in"))
+                body: "Google is built by a large team\nUser-agent: *\nDisallow: /\n"))
         }
     }
 

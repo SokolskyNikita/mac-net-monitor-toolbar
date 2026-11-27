@@ -87,13 +87,18 @@ final class MenuReadoutItem: NSMenuItem {
 
     var content: MenuReadout {
         didSet {
+            // Rows are reassigned on every tick and probe result, mostly with the same content.
+            guard content != oldValue else { return }
             readout?.update(content)
             if let toolTip { readout?.toolTip = toolTip }
         }
     }
 
     override var toolTip: String? {
-        didSet { readout?.toolTip = toolTip ?? content.title }
+        didSet {
+            guard toolTip != oldValue else { return }
+            readout?.toolTip = toolTip ?? content.title
+        }
     }
 }
 

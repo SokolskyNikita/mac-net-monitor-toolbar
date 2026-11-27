@@ -16,9 +16,13 @@ final class KeepOpenMenuItem: NSMenuItem {
 
     required init(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
+    /// The title and tooltip are reassigned every second; only a change reaches AppKit.
     override var title: String {
-        didSet {
-            row?.button.title = title
+        get { super.title }
+        set {
+            guard newValue != super.title else { return }
+            super.title = newValue
+            row?.button.title = newValue
             row?.updateAppearance()
         }
     }
@@ -31,7 +35,12 @@ final class KeepOpenMenuItem: NSMenuItem {
     }
 
     override var toolTip: String? {
-        didSet { row?.button.toolTip = toolTip }
+        get { super.toolTip }
+        set {
+            guard newValue != super.toolTip else { return }
+            super.toolTip = newValue
+            row?.button.toolTip = newValue
+        }
     }
 
     @objc private func activate() {

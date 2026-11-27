@@ -1,4 +1,5 @@
 import Darwin
+import Foundation
 import Testing
 @testable import NetMenu
 
@@ -40,6 +41,44 @@ import Testing
         history.capture()
         #expect(history.entries[getpid()]?.parent == getppid())
         #expect(history.entries[getpid()]?.path != nil)
+    }
+
+    @Test func repeatedCaptureAddsProcessesStartedSinceTheLastOne() throws {
+        var history = ProcessAncestry()
+        history.capture()
+        let known = history.entries.count
+        let child = Process()
+        child.executableURL = URL(fileURLWithPath: "/bin/sleep")
+        child.arguments = ["30"]
+        try child.run()
+        defer { child.terminate(); child.waitUntilExit() }
+        history.capture()
+        let entry = try #require(history.entries[child.processIdentifier])
+        #expect(entry.parent == getpid())
+        #expect(entry.path == "/bin/sleep")
+        // Earlier processes are kept, not re-read into something different.
+        #expect(history.entries.count >= known)
+        #expect(history.entries[getpid()]?.path != nil)
+        #expect(!history.reused.contains(getpid()))
+    }
+
+    @Test func aProcessThatExecsIsReadAgain() throws {
+        var history = ProcessAncestry()
+        let child = Process()
+        // Not /bin/sh, which re-executes itself as the system's chosen shell right after launch.
+        child.executableURL = URL(fileURLWithPath: "/bin/bash")
+        child.arguments = ["-c", "sleep 1; exec /bin/sleep 30"]
+        try child.run()
+        defer { child.terminate(); child.waitUntilExit() }
+        history.capture()
+        #expect(history.entries[child.processIdentifier]?.path == "/bin/bash")
+        // Same process, same start time: only its changed name says the path must be re-read.
+        for _ in 0..<50 where history.entries[child.processIdentifier]?.path != "/bin/sleep" {
+            Thread.sleep(forTimeInterval: 0.1)
+            history.capture()
+        }
+        #expect(history.entries[child.processIdentifier]?.path == "/bin/sleep")
+        #expect(!history.reused.contains(child.processIdentifier))
     }
 
     @Test func connectionRankingUsesCallerIdentityDespiteEqualNames() {

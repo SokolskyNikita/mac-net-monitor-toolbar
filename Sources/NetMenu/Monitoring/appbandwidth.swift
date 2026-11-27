@@ -122,23 +122,9 @@ enum AppBandwidthProcessGrouper {
         let runningName = nonEmpty(runningApplicationName)
 
         if let executablePath, !executablePath.isEmpty {
-            let path = URL(fileURLWithPath: executablePath).standardizedFileURL.path
-            if let bundlePath = outermostAppBundle(in: path) {
-                let bundleURL = URL(fileURLWithPath: bundlePath, isDirectory: true)
-                let bundle = Bundle(url: bundleURL)
-                let bundleName = nonEmpty(bundle?.localizedInfoDictionary?["CFBundleDisplayName"] as? String)
-                    ?? nonEmpty(bundle?.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String)
-                    ?? nonEmpty(bundle?.localizedInfoDictionary?["CFBundleName"] as? String)
-                    ?? nonEmpty(bundle?.object(forInfoDictionaryKey: "CFBundleName") as? String)
-                let fallbackName = URL(fileURLWithPath: bundlePath).deletingPathExtension().lastPathComponent
-                return AppBandwidthProcessIdentity(
-                    id: AppBandwidthProcessIdentity.applicationID(path: bundlePath),
-                    // A helper may have a localizedName such as "Codex (Service)". The owning
-                    // outer bundle's own metadata or directory name is the stable display name.
-                    name: AppMenuNames.shortName(bundleID: bundle?.bundleIdentifier,
-                        fallback: bundleName ?? nonEmpty(fallbackName) ?? runningName ?? processName)
-                )
-            }
+            let resolved = resolve(executablePath)
+            if let application = resolved.application { return application }
+            let path = resolved.path
 
             let executableName = URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
             return AppBandwidthProcessIdentity(
@@ -151,6 +137,48 @@ enum AppBandwidthProcessGrouper {
         // Without a path we cannot know whether equal or truncated nettop names belong to the
         // same executable, so keep the pid in the key to avoid merging unrelated processes.
         return AppBandwidthProcessIdentity(id: AppBandwidthProcessIdentity.processID(name: fallback, pid: pid), name: fallback)
+    }
+
+    /// What an executable path alone determines. The same few dozen paths recur in every
+    /// sample, and resolving one stats each path component and loads its bundle.
+    private struct Resolved {
+        let path: String
+        let application: AppBandwidthProcessIdentity?
+    }
+    private static let resolvedLock = NSLock()
+    private static var resolvedPaths: [String: Resolved] = [:]
+    private static let resolvedLimit = 2048
+
+    private static func resolve(_ executablePath: String) -> Resolved {
+        resolvedLock.lock()
+        let known = resolvedPaths[executablePath]
+        resolvedLock.unlock()
+        if let known { return known }
+
+        let path = URL(fileURLWithPath: executablePath).standardizedFileURL.path
+        var application: AppBandwidthProcessIdentity?
+        if let bundlePath = outermostAppBundle(in: path) {
+            let bundleURL = URL(fileURLWithPath: bundlePath, isDirectory: true)
+            let bundle = Bundle(url: bundleURL)
+            let bundleName = nonEmpty(bundle?.localizedInfoDictionary?["CFBundleDisplayName"] as? String)
+                ?? nonEmpty(bundle?.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String)
+                ?? nonEmpty(bundle?.localizedInfoDictionary?["CFBundleName"] as? String)
+                ?? nonEmpty(bundle?.object(forInfoDictionaryKey: "CFBundleName") as? String)
+            // Never empty: the path component matched because it ends in ".app".
+            let directoryName = URL(fileURLWithPath: bundlePath).deletingPathExtension().lastPathComponent
+            application = AppBandwidthProcessIdentity(
+                id: AppBandwidthProcessIdentity.applicationID(path: bundlePath),
+                // A helper may have a localizedName such as "Codex (Service)". The owning
+                // outer bundle's own metadata or directory name is the stable display name.
+                name: AppMenuNames.shortName(bundleID: bundle?.bundleIdentifier,
+                                             fallback: bundleName ?? directoryName))
+        }
+        let resolved = Resolved(path: path, application: application)
+        resolvedLock.lock()
+        if resolvedPaths.count >= resolvedLimit { resolvedPaths.removeAll() }
+        resolvedPaths[executablePath] = resolved
+        resolvedLock.unlock()
+        return resolved
     }
 
     static func aggregate(_ rows: [NetTopProcessCounters],
@@ -325,6 +353,8 @@ final class AppBandwidthMonitor {
         process.standardInput = inputPipe
         process.standardOutput = outputPipe
         process.standardError = errorPipe
+        let exited = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in exited.signal() }
 
         do { try process.run() } catch {
             for pipe in [inputPipe, outputPipe, errorPipe] {
@@ -363,12 +393,10 @@ final class AppBandwidthMonitor {
 
         let startedAt = BandwidthClock.now()
         var timedOut = false
-        var lastProcessCapture = startedAt
-        while process.isRunning {
-            if BandwidthClock.now() - lastProcessCapture >= 1 {
-                captureProcesses()
-                lastProcessCapture = BandwidthClock.now()
-            }
+        // One wake a second to record short-lived processes; nettop's exit ends the wait at
+        // once, including when `reset` or `stop` terminates it.
+        while exited.wait(timeout: .now() + 1) == .timedOut, process.isRunning {
+            captureProcesses()
             if !isCurrent(token) {
                 requestTermination(process)
                 break
@@ -378,7 +406,6 @@ final class AppBandwidthMonitor {
                 requestTermination(process)
                 break
             }
-            Thread.sleep(forTimeInterval: 0.05)
         }
         if process.isRunning { terminateAndWait(process) }
         if !process.isRunning { process.waitUntilExit() }

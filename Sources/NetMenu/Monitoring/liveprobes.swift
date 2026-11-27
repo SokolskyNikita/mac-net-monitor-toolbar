@@ -49,6 +49,7 @@ final class LiveProbes {
     private var wanFamily = IPVersion.ipv4
     private var wanGeneration = 0
     private var router = ProbeLane(), websites = ProbeLane(), portal = ProbeLane()
+    private var websiteRound = 0
     private var fallback: [IPVersion: ProbeLane] = [:]
     private var gateway: (ms: Double, at: TimeInterval, family: IPVersion)?
     private var lastWAN: TimeInterval?
@@ -98,17 +99,33 @@ final class LiveProbes {
         }
         let webInterval: TimeInterval = webHealthy && now >= troubleUntil ? config.healthyWebsiteInterval : config.probeInterval
         if websites.start(at: now, interval: webInterval) {
+            let round = websiteRound
+            websiteRound += 1
+            let headStart = config.websiteHeadStart
             work({
                 let group = DispatchGroup(), results = Locked(IPWebsiteChecks())
-                for family in IPVersion.allCases {
-                    for site in Latency.InternetSite.allCases {
-                        group.enter()
-                        DispatchQueue.global(qos: .utility).async {
+                let sites = Latency.InternetSite.allCases
+                for (offset, family) in IPVersion.allCases.enumerated() {
+                    // Each family leads with a different site, and the lead alternates by round,
+                    // so every site is still fetched every round when both families work.
+                    let lead = (round + offset) % sites.count
+                    let order = Array(sites[lead...] + sites[..<lead])
+                    group.enter()
+                    DispatchQueue.global(qos: .utility).async {
+                        let checks = Self.staggeredChecks(order: order, headStart: headStart) { site in
                             let check = self.transport.website(site, family)
-                            DiagLog.shared.info("probe", "website \(site.rawValue) \(family.rawValue) \(check.summary) epoch=\(epoch)")
-                            results.mutate { $0.record(check, site: site, family: family) }
-                            group.leave()
+                            var state = "ok", ms: Double? = check.seconds * 1000
+                            switch check.outcome {
+                            case .ok: break
+                            case .failed(let why): state = "FAIL(\(why))"; ms = nil
+                            case .unmeasured(let why): state = "unmeasured(\(why.prefix(40)))"; ms = nil
+                            }
+                            ProbeLog.shared.record("probe", key: "website \(site.rawValue) \(family.rawValue)", state: state, ms: ms,
+                                                   "website \(site.rawValue) \(family.rawValue) \(check.summary) epoch=\(epoch)")
+                            return check
                         }
+                        results.mutate { for (site, check) in checks { $0.record(check, site: site, family: family) } }
+                        group.leave()
                     }
                 }
                 group.wait()
@@ -146,6 +163,38 @@ final class LiveProbes {
                 guard self.epoch == epoch, self.wanGeneration == generation else { return }
                 self.receive?(epoch, .fallback(family: family, ms: ms))
             }
+        }
+    }
+
+    /// One success proves a family reachable, so a healthy round needs only the first site.
+    /// The next site starts as soon as one fails, or after `headStart` if none has answered,
+    /// which keeps a hung first site from delaying the verdict by its whole timeout. Returns
+    /// once a site succeeds or all have finished; a failure verdict therefore still rests on
+    /// every site. Results that arrive after a success are dropped.
+    static func staggeredChecks<Site>(order: [Site], headStart: TimeInterval,
+                                      check: @escaping (Site) -> Latency.InternetCheck)
+        -> [(site: Site, check: Latency.InternetCheck)] {
+        let finished = Locked<[(site: Site, check: Latency.InternetCheck)]>([])
+        let completion = DispatchSemaphore(value: 0)
+        var started = 0, completed = 0
+        func start() {
+            let site = order[started]
+            started += 1
+            DispatchQueue.global(qos: .utility).async {
+                let result = autoreleasepool { check(site) }
+                finished.mutate { $0.append((site, result)) }
+                completion.signal()
+            }
+        }
+        guard !order.isEmpty else { return [] }
+        start()
+        while true {
+            let deadline: DispatchTime = started < order.count ? .now() + headStart : .distantFuture
+            if completion.wait(timeout: deadline) == .timedOut { start(); continue }
+            completed += 1
+            let results = finished.value
+            if results.contains(where: { if case .ok = $0.check.outcome { return true } else { return false } }) { return results }
+            if started < order.count { start() } else if completed == started { return results }
         }
     }
 

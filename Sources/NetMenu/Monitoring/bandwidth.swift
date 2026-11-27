@@ -41,7 +41,14 @@ enum BandwidthCounterReader {
                     guard length >= MemoryLayout<if_msghdr2>.size else { break }
                     var header = if_msghdr2()
                     memcpy(&header, base.advanced(by: offset), MemoryLayout<if_msghdr2>.size)
-                    if let name = interfaceName(header.ifm_index), name.hasPrefix("en") {
+                    let record = UnsafeRawBufferPointer(start: base.advanced(by: offset), count: length)
+                    let name: String?
+                    switch embeddedName(in: record, index: header.ifm_index, addresses: header.ifm_addrs) {
+                    case .ethernet(let embedded): name = embedded
+                    case .other: name = nil
+                    case .absent: name = interfaceName(header.ifm_index)
+                    }
+                    if let name, name.hasPrefix("en") {
                         counters.rx[name] = header.ifm_data.ifi_ibytes
                         counters.tx[name] = header.ifm_data.ifi_obytes
                     }
@@ -50,6 +57,29 @@ enum BandwidthCounterReader {
             }
         }
         return counters
+    }
+
+    private enum EmbeddedName {
+        case ethernet(String)
+        /// Named, but not an `en` interface; no string is built for it.
+        case other
+        case absent
+    }
+
+    /// The kernel appends the interface's link-level address, which carries its name, to each
+    /// record. Reading it there avoids `if_indextoname`, which lists every interface per call.
+    private static func embeddedName(in record: UnsafeRawBufferPointer, index: UInt16, addresses: Int32) -> EmbeddedName {
+        // struct sockaddr_dl: sdl_len, sdl_family, sdl_index (2 bytes), sdl_type, sdl_nlen,
+        // sdl_alen, sdl_slen, then the name without a terminator.
+        let address = MemoryLayout<if_msghdr2>.stride, nameOffset = address + 8
+        guard addresses & RTA_IFP != 0, record.count >= nameOffset,
+              record[address + 1] == UInt8(AF_LINK),
+              record.loadUnaligned(fromByteOffset: address + 2, as: UInt16.self) == index else { return .absent }
+        let nameLength = Int(record[address + 5])
+        guard nameLength > 0, nameLength <= Int(IFNAMSIZ), record.count >= nameOffset + nameLength else { return .absent }
+        let name = UnsafeRawBufferPointer(rebasing: record[nameOffset..<nameOffset + nameLength])
+        guard nameLength >= 2, name[0] == UInt8(ascii: "e"), name[1] == UInt8(ascii: "n") else { return .other }
+        return .ethernet(String(decoding: name, as: UTF8.self))
     }
 
     /// Fetches a route dump, retrying when the interface list grows between the size query and

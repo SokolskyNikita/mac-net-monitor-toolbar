@@ -42,6 +42,19 @@ final class StatusBarRenderer {
     private var spinnerTimer: Timer?
     private var spinnerPhase = 0
     private var lastStatus = (lat: "✕", health: "", down: "0B", up: "0B")
+    /// What the status item currently shows, so an identical repaint can be skipped.
+    private struct Painted {
+        struct Appearance: Equatable {
+            var texts: [String]
+            var widest: [String]
+            var calibrating: Bool
+            var phase: Int
+        }
+        var appearance: Appearance
+        var slots: [CGFloat]
+        var width: CGFloat
+    }
+    private var painted: Painted?
 
     init(statusItem: NSStatusItem) {
         self.statusItem = statusItem
@@ -76,11 +89,18 @@ final class StatusBarRenderer {
         var fields = [(lat, "999ms"), (health, hasWarning ? "100% ⚠" : "100%")]
         if showThroughput { fields += [(down + "↓", "999K↓"), (up + "↑", "999K↑")] }
         func width(_ s: String) -> CGFloat { (s as NSString).size(withAttributes: Self.statusAttrs).width }
-        let slots = fields.map { max(width($0.0), width($0.1)) }
-        let content = ceil(slots.reduce(0, +) + Self.statusGap * CGFloat(fields.count - 1))
-        let w = CGFloat(statusWidth.fit(Double(content), now: BandwidthClock.now()))
-        let angle = CGFloat(spinnerPhase % 12) * 30
         let calibrating = self.calibrating
+        let appearance = Painted.Appearance(texts: fields.map(\.0), widest: fields.map(\.1),
+                                            calibrating: calibrating, phase: calibrating ? spinnerPhase % 12 : 0)
+        // This runs several times a second with the same values; measure text only when it changes.
+        let unchanged = painted?.appearance == appearance
+        let slots = unchanged ? painted!.slots : fields.map { max(width($0.0), width($0.1)) }
+        let content = ceil(slots.reduce(0, +) + Self.statusGap * CGFloat(fields.count - 1))
+        // Still called when nothing changed: a pending shrink completes with the passage of time.
+        let w = CGFloat(statusWidth.fit(Double(content), now: BandwidthClock.now()))
+        if unchanged, painted?.width == w, button.image != nil { return }
+        painted = Painted(appearance: appearance, slots: slots, width: w)
+        let angle = CGFloat(appearance.phase) * 30
         let img = NSImage(size: NSSize(width: w, height: 18), flipped: false) { _ in
             var edge = w - content
             for (i, ((s, _), slot)) in zip(fields, slots).enumerated() {

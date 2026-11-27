@@ -212,3 +212,72 @@ import Testing
         #expect(replies.count == 4) // The old slow ping must not leak into the new network.
     }
 }
+
+@Suite struct StaggeredWebsiteCheckTests {
+    private static let ok = Latency.InternetCheck(outcome: .ok, seconds: 0)
+    private static let failed = Latency.InternetCheck(outcome: .failed("curl 7"), seconds: 0)
+    private static func isOK(_ check: Latency.InternetCheck) -> Bool {
+        if case .ok = check.outcome { return true } else { return false }
+    }
+
+    @Test func healthyFirstSiteIsTheOnlyFetch() {
+        let fetched = Locked<[String]>([])
+        let results = LiveProbes.staggeredChecks(order: ["a", "b"], headStart: 5) { site in
+            fetched.mutate { $0.append(site) }
+            return Self.ok
+        }
+        #expect(results.map(\.site) == ["a"])
+        #expect(fetched.value == ["a"])
+    }
+
+    @Test func failedFirstSiteFetchesTheNextAtOnce() {
+        let started = Date()
+        let results = LiveProbes.staggeredChecks(order: ["a", "b"], headStart: 5) { $0 == "a" ? Self.failed : Self.ok }
+        #expect(results.map(\.site) == ["a", "b"])
+        #expect(Self.isOK(results[1].check))
+        #expect(Date().timeIntervalSince(started) < 2)
+    }
+
+    @Test func failureVerdictWaitsForEverySite() {
+        let results = LiveProbes.staggeredChecks(order: ["a", "b", "c"], headStart: 5) { _ in Self.failed }
+        #expect(Set(results.map(\.site)) == ["a", "b", "c"])
+        #expect(!results.contains { Self.isOK($0.check) })
+    }
+
+    @Test func unansweredFirstSiteDoesNotHoldUpTheSecond() {
+        let hung = DispatchSemaphore(value: 0)
+        defer { hung.signal() }
+        let started = Date()
+        let results = LiveProbes.staggeredChecks(order: ["slow", "fast"], headStart: 0.05) { site in
+            if site == "slow" { _ = hung.wait(timeout: .now() + 10); return Self.failed }
+            return Self.ok
+        }
+        #expect(results.map(\.site) == ["fast"])
+        #expect(Date().timeIntervalSince(started) < 2)
+    }
+
+    @Test @MainActor func healthyRoundFetchesOneSitePerFamilyAndAlternates() async throws {
+        let fetched = Locked<[String]>([])
+        let transport = LiveProbes.Transport(ping: { _, _ in .reply(.init(ms: 20, hops: 12)) },
+            website: { site, family in
+                fetched.mutate { $0.append("\(family.rawValue) \(site.rawValue)") }
+                return Self.ok
+            }, portal: { .internet }, fallback: { _ in 30 }, local: { _, _ in nil })
+        let probes = LiveProbes(transport: transport)
+        var rounds = 0
+        probes.receive = { _, event in if case .websites = event { rounds += 1 } }
+        let identity = Identity(iface: "en0", type: NetType.wifi, network: nil, bssid: nil,
+            router: nil, rssi: nil, noise: nil, txRate: nil, channel: nil)
+        func round(at now: TimeInterval, expecting count: Int) async throws {
+            probes.poll(identity: identity, epoch: 1, paused: false, now: now)
+            for _ in 0..<200 where rounds < count { try await Task.sleep(for: .milliseconds(10)) }
+            #expect(rounds == count)
+        }
+        let sites = Latency.InternetSite.allCases.map(\.rawValue)
+        try await round(at: 100, expecting: 1)
+        #expect(Set(fetched.value) == ["ipv4 \(sites[0])", "ipv6 \(sites[1])"])
+        fetched.set([])
+        try await round(at: 1000, expecting: 2)
+        #expect(Set(fetched.value) == ["ipv4 \(sites[1])", "ipv6 \(sites[0])"])
+    }
+}

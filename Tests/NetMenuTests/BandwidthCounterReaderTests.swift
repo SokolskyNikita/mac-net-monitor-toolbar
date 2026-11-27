@@ -13,6 +13,25 @@ private func routeInterfaceMessage(index: UInt16, rx: UInt64, tx: UInt64) -> Dat
     return withUnsafeBytes(of: &header) { Data($0) }
 }
 
+/// A record as the kernel writes it: the header followed by a link-level address holding the name.
+private func namedRouteInterfaceMessage(index: UInt16, name: String, rx: UInt64, tx: UInt64) -> Data {
+    let nameBytes = Array(name.utf8)
+    var link: [UInt8] = [UInt8(8 + nameBytes.count), UInt8(AF_LINK)]
+    withUnsafeBytes(of: index) { link.append(contentsOf: $0) }
+    link += [0, UInt8(nameBytes.count), 0, 0] + nameBytes
+    var header = if_msghdr2()
+    header.ifm_msglen = UInt16(MemoryLayout<if_msghdr2>.stride + link.count)
+    header.ifm_type = UInt8(RTM_IFINFO2)
+    header.ifm_index = index
+    header.ifm_addrs = RTA_IFP
+    header.ifm_data.ifi_ibytes = rx
+    header.ifm_data.ifi_obytes = tx
+    var bytes = withUnsafeBytes(of: &header) { Data($0) }
+    bytes.append(Data(count: MemoryLayout<if_msghdr2>.stride - MemoryLayout<if_msghdr2>.size))
+    bytes.append(contentsOf: link)
+    return bytes
+}
+
 private func shortRouteMessage(type: UInt8) -> Data {
     var length = UInt16(4)
     var bytes = withUnsafeBytes(of: &length) { Data($0) }
@@ -35,6 +54,38 @@ private func shortRouteMessage(type: UInt8) -> Data {
 
         #expect(counters.rx == ["en0": largeRX])
         #expect(counters.tx == ["en0": largeTX])
+    }
+
+    @Test func readsNamesEmbeddedInRecordsWithoutLookingThemUp() {
+        var dump = namedRouteInterfaceMessage(index: 4, name: "en0", rx: 11, tx: 12)
+        dump.append(namedRouteInterfaceMessage(index: 5, name: "utun3", rx: 21, tx: 22))
+        dump.append(namedRouteInterfaceMessage(index: 6, name: "en12", rx: 31, tx: 32))
+        var lookups = 0
+
+        let counters = BandwidthCounterReader.parseRouteDump(dump) { _ in lookups += 1; return "en9" }
+
+        #expect(counters.rx == ["en0": 11, "en12": 31])
+        #expect(counters.tx == ["en0": 12, "en12": 32])
+        #expect(lookups == 0)
+    }
+
+    @Test func liveDumpNamesMatchTheSystemInterfaceList() throws {
+        var expected: Set<String> = []
+        let list = try #require(if_nameindex())
+        defer { if_freenameindex(list) }
+        var entry = list
+        while entry.pointee.if_index != 0 {
+            let name = String(cString: entry.pointee.if_name)
+            if name.hasPrefix("en") { expected.insert(name) }
+            entry += 1
+        }
+        let dump = try #require(BandwidthCounterReader.routeDump())
+        var lookups = 0
+
+        let counters = BandwidthCounterReader.parseRouteDump(dump) { _ in lookups += 1; return nil }
+
+        #expect(Set(counters.rx.keys) == expected)
+        #expect(lookups == 0)
     }
 
     @Test func skipsShortOtherMessagesAndContinuesAtNextRecord() {

@@ -38,7 +38,7 @@ Each per-minute entry includes:
 | `recent_trouble` | Warning categories active in the last ten seconds: `network loss`, `network latency`, `network jitter`, corresponding `router` categories, and `web access`. An empty array means none. |
 | `internet_checks_fresh` | Whether a measured website check exists within the last 30 seconds; distinguishes stale retained results from current evidence |
 | `internet_reachable` | Whether at least one website passed in the latest website check |
-| `internet_checks` | Latest per-site results for `example.com` and `www.google.com`; a site whose check couldn't run is omitted |
+| `internet_checks` | Latest per-site results for `www.fastly.com` and `www.google.com`; a site whose check couldn't run, or that no working address family needed to fetch that round, is omitted |
 | `captive` | Whether Apple's captive check detected a login page in the latest cycle |
 | `down_Bps`, `up_Bps` | Throughput averaged over valid sampled intervals, in bytes per second |
 | `down_peak_Bps`, `up_peak_Bps` | Highest eligible interval rates in this log window, rather than the menu's peak since connecting |
@@ -74,13 +74,13 @@ A network change forces `status` to `failed` and adds `errors.network`. Any reta
 
 `NetMenu.log` is for troubleshooting: when NetMenu shows something unexpected, it has the detail to explain it. Console.app also lists it under Log Reports. It records:
 
-- Independent probe completions: each WAN target's verdict, router protocol and outcome, website results, captive check and HTTPS fallback. Late results from an old network epoch or a speed test are discarded.
-- Every visible health change, with loss, jitter and latency
+- Probe results: each WAN target's verdict, router protocol and outcome, website results, captive check and HTTPS fallback. A result that differs from the previous one of its kind (a lost ping after replies, a failed website, a new health band) gets its own line at once. The individual results from the 30 seconds before it are written just ahead of that line, marked `(recalled)` and carrying their original timestamps, and every result is written individually for the next 30 seconds. Results that repeat the previous state are otherwise counted into one `summary` line a minute, giving each kind's state, count and lowest/median/highest time. Late results from an old network epoch or a speed test are discarded.
+- Every change of access state or health band (95–100%, then each ten points below), with the score, loss, jitter and latency; the latest values also appear in each summary
 - Network changes, Location permission changes, sleep and wake, and helper failures
 - Every speed test with its full breakdown: connections, data used, timing and errors per direction
 - A heartbeat every 5 minutes with uptime, open files, threads, memory, CPU use (NetMenu's own and its helpers') and failure counters
 
-The log rotates at 10 MB and keeps two older files (`NetMenu.1.log`, `NetMenu.2.log`), for roughly 30 MB total. How much time that covers depends on probe activity and errors. Warnings and errors also go to the macOS unified log:
+The log rotates at 10 MB and keeps two older files (`NetMenu.1.log`, `NetMenu.2.log`), for roughly 30 MB total. The per-minute summaries alone come to a little over 1 MB a day, so on a steady network that is about three weeks of history; each change adds a minute or two of full detail, and a network with frequent changes uses the space faster. Warnings and errors also go to the macOS unified log:
 
 ```bash
 log show --last 1d --predicate 'subsystem == "me.sokolsky.netmenu"'

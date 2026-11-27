@@ -102,12 +102,12 @@ import Testing
         let failed = checks(ipv4: false, ipv6: true)
         health.recordIPWeb(failed, at: 7)
         var partial = failed
-        partial.ipv4.removeValue(forKey: Latency.InternetSite.example.rawValue)
+        partial.ipv4.removeValue(forKey: Latency.InternetSite.fastly.rawValue)
         #expect(partial.status(for: .ipv4) == .unknown)
         health.recordIPWeb(partial, at: 10)
         health.recordIPWeb(failed, at: 13)
         #expect(health.report(now: 13)?.score == 100)
-        partial.ipv4[Latency.InternetSite.example.rawValue] = true
+        partial.ipv4[Latency.InternetSite.fastly.rawValue] = true
         #expect(partial.status(for: .ipv4) == .reachable)
         health.recordIPWeb(partial, at: 16)
         #expect(health.report(now: 16)?.score == 100)
@@ -248,6 +248,20 @@ import Testing
         #expect(!replies.contains { $0.1 == 999 })
     }
 
+    @Test func combinedResultsOnlyBlameASiteAWorkingFamilyFailedToReach() {
+        let sites = Latency.InternetSite.allCases.map(\.rawValue)
+        // IPv4 needed only its first site; IPv6 has no access and failed both.
+        var v4Only = IPWebsiteChecks(ipv4: [sites[0]: true], ipv6: [sites[0]: false, sites[1]: false])
+        #expect(v4Only.combined == [sites[0]: true])
+        // The working family tried the other site too, and it failed there.
+        v4Only.ipv4[sites[1]] = false
+        #expect(v4Only.combined == [sites[0]: true, sites[1]: false])
+        // With no working family every failure stands.
+        let down = IPWebsiteChecks(ipv4: [sites[0]: false, sites[1]: false], ipv6: [sites[0]: false])
+        #expect(down.combined == [sites[0]: false, sites[1]: false])
+        #expect(IPWebsiteChecks(ipv4: [sites[0]: true], ipv6: [sites[1]: true]).combined == [sites[0]: true, sites[1]: true])
+    }
+
     @Test @MainActor func ipv6HTTPSFallbackDoesNotWaitForOldIPv4Fallback() async throws {
         let gate = DispatchSemaphore(value: 0)
         defer { gate.signal() }
@@ -262,15 +276,19 @@ import Testing
         let probes = LiveProbes(transport: transport)
         var selected = IPVersion.ipv4
         var results: [(IPVersion, Double?)] = []
+        var websiteRounds = 0
         probes.receive = { _, event in
             if case .wanFamily(let family) = event { selected = family }
             if case .fallback(let family, let ms) = event { results.append((family, ms)) }
+            if case .websites = event { websiteRounds += 1 }
         }
         let identity = Identity(iface: nil, type: NetType.offline, network: nil, bssid: nil,
                                 router: nil, rssi: nil, noise: nil, txRate: nil, channel: nil)
         let now = HealthTracker.now()
         probes.poll(identity: identity, epoch: 1, paused: false, now: now)
-        try await Task.sleep(for: .milliseconds(50))
+        // The next round can only start once this one has reported, however busy the machine is.
+        for _ in 0..<200 where websiteRounds == 0 { try await Task.sleep(for: .milliseconds(10)) }
+        #expect(websiteRounds == 1)
         v6Ready.set(true)
         probes.poll(identity: identity, epoch: 1, paused: false, now: now + 9)
         for _ in 0..<100 {

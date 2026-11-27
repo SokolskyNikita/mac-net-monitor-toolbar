@@ -79,8 +79,8 @@ final class DiagLog: @unchecked Sendable {
     }
 
     /// `throttleKey` limits a repeating message to one line per minute; repeats are counted.
-    func log(_ level: Level, _ category: String, _ message: String, throttleKey: String? = nil) {
-        let now = Date()
+    /// `at` backdates a line that describes an earlier moment (see `ProbeLog`).
+    func log(_ level: Level, _ category: String, _ message: String, throttleKey: String? = nil, at now: Date = Date()) {
         var text = message
         if let key = throttleKey {
             stateLock.lock()

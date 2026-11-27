@@ -20,6 +20,8 @@ struct ProcResult {
     /// First `stderrLimit` bytes, for classifying failures and for the diagnostic log.
     var stderr: String = ""
     static let stderrLimit = 4096
+    /// `stdout` undecoded, for callers that must judge whether a body is valid text.
+    var stdoutData = Data()
 
     var launched: Bool {
         if case .launchFailed = outcome { return false }
@@ -52,6 +54,9 @@ func runProcess(_ path: String, _ args: [String], timeout: TimeInterval = Config
         let outPipe = Pipe(), errPipe = Pipe()
         p.standardOutput = outPipe; p.standardError = errPipe
         p.standardInput = FileHandle.nullDevice
+        // Sleep until the helper exits rather than waking every few milliseconds to ask.
+        let exited = DispatchSemaphore(value: 0)
+        p.terminationHandler = { _ in exited.signal() }
         do { try p.run() } catch {
             for pipe in [outPipe, errPipe] {
                 try? pipe.fileHandleForReading.close()
@@ -82,17 +87,13 @@ func runProcess(_ path: String, _ args: [String], timeout: TimeInterval = Config
             group.leave()
         }
 
-        let t0 = Date()
-        while p.isRunning, Date().timeIntervalSince(t0) < timeout {
-            Thread.sleep(forTimeInterval: 0.03)
-        }
-        let timedOut = p.isRunning
+        let timedOut = exited.wait(timeout: .now() + timeout) == .timedOut && p.isRunning
         if timedOut {
             Diagnostics.shared.count(.processTimeout)
             terminateProcess(p, grace: Configuration.reliability.helperTerminateGrace)
         }
         // Foundation keeps every Process (with its pipes, handles and a dispatch queue) alive until
-        // its exit is reaped by waitUntilExit; polling isRunning alone leaked ~1 KB per helper,
+        // its exit is reaped by waitUntilExit; without it each helper leaked ~1 KB,
         // ~250 MB a month. It returns at once for a process that has already exited.
         if !p.isRunning { p.waitUntilExit() }
         let readersDone = group.wait(timeout: .now() + Configuration.reliability.helperDrainTimeout) == .success
@@ -104,12 +105,13 @@ func runProcess(_ path: String, _ args: [String], timeout: TimeInterval = Config
         let stdout = String(decoding: data, as: UTF8.self)
         let stderr = String(decoding: err, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
         // terminationStatus raises an Objective-C exception while the process is still running.
-        if timedOut || p.isRunning { return ProcResult(outcome: .timedOut, stdout: stdout, stderr: stderr) }
-        if !readersDone { return ProcResult(outcome: .outputIncomplete, stdout: stdout, stderr: stderr) }
-        if p.terminationReason == .uncaughtSignal {
-            return ProcResult(outcome: .signaled(p.terminationStatus), stdout: stdout, stderr: stderr)
+        func result(_ outcome: ProcResult.Outcome) -> ProcResult {
+            ProcResult(outcome: outcome, stdout: stdout, stderr: stderr, stdoutData: data)
         }
-        return ProcResult(outcome: .exited(p.terminationStatus), stdout: stdout, stderr: stderr)
+        if timedOut || p.isRunning { return result(.timedOut) }
+        if !readersDone { return result(.outputIncomplete) }
+        if p.terminationReason == .uncaughtSignal { return result(.signaled(p.terminationStatus)) }
+        return result(.exited(p.terminationStatus))
     }
 }
 

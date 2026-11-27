@@ -25,7 +25,143 @@ struct Identity: Equatable {
     var isUnnamedWiFi: Bool { type == NetType.wifi && bssid == nil && network == PortName.wifi }
 }
 
+/// The answers `route`, `netstat` and `ipconfig` gave for the current default routes. Those
+/// helpers ran on every identity poll although their answers change only when the default
+/// routes do, so each poll now reads the routing table in-process and runs a helper again
+/// only when a default route differs, a network event invalidates the cache, or it expires.
+final class RouteCache: @unchecked Sendable {
+    static let shared = RouteCache()
+
+    private struct Answers {
+        var routes: Data
+        var readAt: TimeInterval
+        var route: (iface: String?, gateway: String?)?
+        var localRouters: [String: LocalRouter?] = [:]
+        var ssids: [String: (name: String?, at: TimeInterval)] = [:]
+    }
+    private let lock = NSLock()
+    private var generation = 0
+    private var answers: Answers?
+    private let lifetime: TimeInterval
+    private let nameLifetime: TimeInterval
+    private let readRoutes: () -> Data?
+
+    init(lifetime: TimeInterval = Configuration.monitoring.routeCacheLifetime,
+         nameLifetime: TimeInterval = Configuration.monitoring.networkNameCacheLifetime,
+         readRoutes: @escaping () -> Data? = RouteCache.defaultRoutes) {
+        self.lifetime = lifetime; self.nameLifetime = nameLifetime; self.readRoutes = readRoutes
+    }
+
+    /// A wake or path change can swap networks and leave identical default routes behind.
+    func invalidate() {
+        lock.lock(); generation &+= 1; answers = nil; lock.unlock()
+    }
+
+    /// A helper's answer and whether it may be reused. A helper that failed to run or timed out
+    /// looks like "nothing there"; keeping that would hold a wrong answer until the cache expires.
+    typealias Asked<T> = (answer: T, reliable: Bool)
+
+    func route(_ ask: () -> Asked<(iface: String?, gateway: String?)>) -> (iface: String?, gateway: String?) {
+        answer(read: { $0.route }, write: { $0.route = $1 }, ask: ask)
+    }
+
+    func localRouter(key: String, _ ask: () -> Asked<LocalRouter?>) -> LocalRouter? {
+        answer(read: { $0.localRouters[key] }, write: { $0.localRouters[key] = .some($1) }, ask: ask)
+    }
+
+    func ssid(interface: String, _ ask: () -> Asked<String?>) -> String? {
+        // The name is the one answer that can change while the routes stay byte-identical.
+        let now = BandwidthClock.now()
+        return answer(read: { answers in answers.ssids[interface].flatMap { now - $0.at < self.nameLifetime ? .some($0.name) : nil } },
+                      write: { $0.ssids[interface] = ($1, now) }, ask: ask)
+    }
+
+    private func answer<T>(read: (Answers) -> T?, write: (inout Answers, T) -> Void, ask: () -> Asked<T>) -> T {
+        // Without a readable routing table nothing is known to be unchanged: always ask.
+        guard let routes = readRoutes() else { return ask().answer }
+        let now = BandwidthClock.now()
+        lock.lock()
+        if let current = answers, current.routes != routes || now - current.readAt >= lifetime { answers = nil }
+        if let known = answers.flatMap(read) { lock.unlock(); return known }
+        let asked = generation
+        lock.unlock()
+
+        let (fresh, reliable) = ask()
+        // Keep the answer only if the helper ran properly and the routes it describes were in
+        // place throughout.
+        guard reliable, readRoutes() == routes else { return fresh }
+        lock.lock(); defer { lock.unlock() }
+        guard generation == asked else { return fresh }
+        if answers?.routes != routes { answers = Answers(routes: routes, readAt: now) }
+        if var current = answers { write(&current, fresh); answers = current }
+        return fresh
+    }
+
+    /// The stable part of every default route: flags, interface and addresses, without the
+    /// traffic counters that change with each packet. Two networks with the same interface and
+    /// gateway address read alike (the gateway's hardware address is not visible to an
+    /// unprivileged process), which is why network events also invalidate the cache and the
+    /// network name is kept for a shorter time.
+    static func defaultRoutes() -> Data? {
+        var mib: [Int32] = [CTL_NET, PF_ROUTE, 0, 0, NET_RT_DUMP2, 0]
+        for _ in 0..<4 {
+            var size = 0
+            guard sysctl(&mib, u_int(mib.count), nil, &size, nil, 0) == 0, size > 0 else { return nil }
+            var bytes = [UInt8](repeating: 0, count: size + 4096)
+            var actualSize = bytes.count
+            let result = bytes.withUnsafeMutableBytes { sysctl(&mib, u_int(mib.count), $0.baseAddress, &actualSize, nil, 0) }
+            if result == 0 { return bytes.withUnsafeBytes { defaultRoutes(in: UnsafeRawBufferPointer(rebasing: $0[..<actualSize])) } }
+            guard errno == ENOMEM else { return nil }
+        }
+        return nil
+    }
+
+    static func defaultRoutes(in dump: UnsafeRawBufferPointer) -> Data {
+        var stable = Data()
+        let header = MemoryLayout<rt_msghdr2>.stride
+        var offset = 0
+        while offset + header <= dump.count {
+            var message = rt_msghdr2()
+            withUnsafeMutableBytes(of: &message) { $0.copyMemory(from: UnsafeRawBufferPointer(rebasing: dump[offset..<offset + header])) }
+            let length = Int(message.rtm_msglen)
+            guard length >= header, offset + length <= dump.count else { break }
+            let addresses = UnsafeRawBufferPointer(rebasing: dump[(offset + header)..<(offset + length)])
+            if message.rtm_flags & (RTF_HOST | RTF_WASCLONED) == 0, message.rtm_addrs & RTA_DST != 0,
+               isUnspecifiedAddress(addresses) {
+                withUnsafeBytes(of: message.rtm_flags) { stable.append(contentsOf: $0) }
+                withUnsafeBytes(of: message.rtm_index) { stable.append(contentsOf: $0) }
+                withUnsafeBytes(of: message.rtm_addrs) { stable.append(contentsOf: $0) }
+                withUnsafeBytes(of: UInt16(addresses.count)) { stable.append(contentsOf: $0) }
+                stable.append(contentsOf: addresses)
+            }
+            offset += length
+        }
+        return stable
+    }
+
+    /// Whether the destination that starts `addresses` is 0.0.0.0 or ::, i.e. a default route.
+    private static func isUnspecifiedAddress(_ addresses: UnsafeRawBufferPointer) -> Bool {
+        guard addresses.count >= 2 else { return false }
+        let length = Int(addresses[0])
+        let range: Range<Int>
+        switch Int32(addresses[1]) {
+        case AF_INET: range = 4..<8
+        case AF_INET6: range = 8..<24
+        default: return false
+        }
+        // The kernel shortens an all-zero address; the bytes it leaves out are zero.
+        guard length <= addresses.count else { return false }
+        return addresses[..<length].dropFirst(range.lowerBound).prefix(range.count).allSatisfy { $0 == 0 }
+    }
+}
+
 func parseRoute() -> (iface: String?, gateway: String?) {
+    RouteCache.shared.route(runRoute)
+}
+
+/// Reliable only if every `route` run it rests on finished by itself. One that timed out or
+/// could not start says nothing, and must not let the IPv6 route stand in for the IPv4 one.
+private func runRoute() -> RouteCache.Asked<(iface: String?, gateway: String?)> {
     func parse(_ out: String) -> (String?, String?) {
         var iface: String?, gw: String?
         for line in out.split(separator: "\n") {
@@ -35,9 +171,14 @@ func parseRoute() -> (iface: String?, gateway: String?) {
         }
         return (iface, gw)
     }
-    if let o = runProc("/sbin/route", ["-n", "get", "default"]), let r = Optional(parse(o)), r.0 != nil { return r }
-    if let o = runProc("/sbin/route", ["-n", "get", "-inet6", "default"]) { return parse(o) }
-    return (nil, nil)
+    func finished(_ result: ProcResult) -> Bool {
+        if case .exited = result.outcome { return true }
+        return false
+    }
+    let v4 = runProcess("/sbin/route", ["-n", "get", "default"])
+    if v4.launched, let route = Optional(parse(v4.stdout)), route.0 != nil { return (route, finished(v4)) }
+    let v6 = runProcess("/sbin/route", ["-n", "get", "-inet6", "default"])
+    return (v6.launched ? parse(v6.stdout) : (nil, nil), finished(v4) && finished(v6))
 }
 
 private let portsLock = NSLock()
@@ -80,12 +221,17 @@ func isRedactedSSID(_ ssid: String) -> Bool {
 }
 
 func ssidIpconfig(_ iface: String) -> String? {
-    guard let out = runProc("/usr/sbin/ipconfig", ["getsummary", iface], timeout: Configuration.monitoring.ipconfigTimeout),
-          let re = ssidRe else { return nil }
+    RouteCache.shared.ssid(interface: iface) { runIpconfig(iface) }
+}
+
+private func runIpconfig(_ iface: String) -> RouteCache.Asked<String?> {
+    let result = runProcess("/usr/sbin/ipconfig", ["getsummary", iface], timeout: Configuration.monitoring.ipconfigTimeout)
+    guard result.launched, let re = ssidRe else { return (nil, false) }
+    let out = result.stdout
     let range = NSRange(out.startIndex..., in: out)
-    guard let m = re.firstMatch(in: out, range: range), let r = Range(m.range(at: 1), in: out) else { return nil }
+    guard let m = re.firstMatch(in: out, range: range), let r = Range(m.range(at: 1), in: out) else { return (nil, result.succeeded) }
     let ssid = String(out[r])
-    return isRedactedSSID(ssid) ? nil : ssid
+    return (isRedactedSSID(ssid) ? nil : ssid, result.succeeded)
 }
 
 /// CoreWLAN is touchy off-main; hop to main briefly for CW* reads only.

@@ -92,7 +92,15 @@ struct LocalRouter: Equatable {
 }
 
 func resolveLocalRouter(preferred: String?, ports: [String: String]) -> LocalRouter? {
-    let v4 = runProc("/usr/sbin/netstat", ["-rn", "-f", "inet"]) ?? ""
-    let v6 = runProc("/usr/sbin/netstat", ["-rn", "-f", "inet6"]) ?? ""
-    return LocalRouter.select(ipv4: v4, ipv6: v6, hardware: Set(ports.keys), preferred: preferred)
+    // The selection depends on the preferred interface and on which interfaces are hardware.
+    let key = (preferred ?? "") + "|" + ports.keys.sorted().joined(separator: ",")
+    return RouteCache.shared.localRouter(key: key) { runNetstat(preferred: preferred, ports: ports) }
+}
+
+private func runNetstat(preferred: String?, ports: [String: String]) -> RouteCache.Asked<LocalRouter?> {
+    let v4 = runProcess("/usr/sbin/netstat", ["-rn", "-f", "inet"])
+    let v6 = runProcess("/usr/sbin/netstat", ["-rn", "-f", "inet6"])
+    let router = LocalRouter.select(ipv4: v4.launched ? v4.stdout : "", ipv6: v6.launched ? v6.stdout : "",
+                                    hardware: Set(ports.keys), preferred: preferred)
+    return (router, v4.succeeded && v6.succeeded)
 }

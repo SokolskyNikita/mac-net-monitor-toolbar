@@ -35,6 +35,8 @@ struct MonitoringConfig {
     var httpTimeout: TimeInterval = 15
     /// Deadline for each ordinary HTTPS website reachability check.
     var websiteTimeout: TimeInterval = 8
+    /// How long a round's first website may go unanswered before the next site is also fetched.
+    var websiteHeadStart: TimeInterval = 2
     /// Extra time beyond the WAN ping deadline for helpers to finish in a batch cycle.
     var cycleCleanupAllowance: TimeInterval = 6
     /// Outer deadline for the parallel portion of a batch probe cycle.
@@ -116,6 +118,11 @@ struct MonitoringConfig {
 
     /// Maximum cache age for interface-to-hardware-port names; unknown interfaces refresh sooner.
     var portsCacheLifetime: TimeInterval = 300
+    /// Longest reuse of route, router and SSID helper answers while the default routes are unchanged.
+    var routeCacheLifetime: TimeInterval = 300
+    /// Shorter reuse for the network name read with ipconfig: a switch between two networks
+    /// with the same gateway can leave the default routes unchanged.
+    var networkNameCacheLifetime: TimeInterval = 60
     /// Process deadline for reading an interface summary with ipconfig.
     var ipconfigTimeout: TimeInterval = 5
 }
@@ -259,6 +266,10 @@ struct LoggingConfig {
     var diagnosticThrottleInterval: TimeInterval = 60
     /// Minimum delay before retrying a failed diagnostic-log open.
     var diagnosticOpenRetryInterval: TimeInterval = 5
+    /// How often unchanged probe results are written to the diagnostic log as one summary line.
+    var probeSummaryInterval: TimeInterval = 60
+    /// Individual probe results kept before, and written after, a result whose state changed.
+    var probeDetailWindow: TimeInterval = 30
     /// Spacing of resource-usage and monitoring-progress summaries in the diagnostic log.
     var heartbeatInterval: TimeInterval = 300
     /// Warn when no probe result arrives for this long while awake.

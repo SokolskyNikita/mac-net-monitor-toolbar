@@ -253,13 +253,19 @@ enum Latency {
     // MARK: - Ordinary internet access
 
     enum InternetSite: String, CaseIterable {
-        case example = "example.com"
+        case fastly = "www.fastly.com"
         case google = "www.google.com"
 
         var url: String {
             switch self {
-            case .example: return "https://example.com/"
-            case .google: return "https://www.google.com/robots.txt"
+            // A different operator from Google, and from Cloudflare, which the ping targets and
+            // the HTTPS fallback already depend on. robots.txt is small and meant for automated
+            // clients; like Google's page it lives on the site's ordinary host.
+            case .fastly: return "https://www.fastly.com/robots.txt"
+            // An ordinary page on the ordinary host, like robots.txt before it but 286 bytes
+            // rather than 12.5 KB. Dedicated connectivity-check hosts are not used here: a
+            // network can allowlist those while blocking everything else.
+            case .google: return "https://www.google.com/humans.txt"
             }
         }
 
@@ -267,11 +273,12 @@ enum Latency {
         func accepts(status: Int, body: String) -> Bool {
             guard status == 200 else { return false }
             switch self {
-            case .example:
-                // IANA dropped the <h1> in Sept 2026; match text both page versions share.
-                return body.contains("<title>Example Domain</title>") && body.contains("This domain is for use in")
+            case .fastly:
+                // The rules change with the site; a robots file has these fields and no markup.
+                return body.range(of: "User-agent:", options: .caseInsensitive) != nil
+                    && body.range(of: "Disallow:", options: .caseInsensitive) != nil && !body.contains("<")
             case .google:
-                return body.hasPrefix("User-agent: *") && body.contains("Disallow: /search")
+                return body.hasPrefix("Google is built by")
             }
         }
     }
@@ -302,9 +309,6 @@ enum Latency {
 
     static func checkInternet(_ site: InternetSite, family: IPVersion?) -> InternetCheck {
         let t0 = Date()
-        let bodyURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("\(tempPrefix)internet-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: bodyURL) }
         // -q disables user curlrc overrides. TLS verification stays enabled; no redirects,
         // cookies, or local cache. The nonce and no-cache header also avoid proxy cache hits.
         // Family checks go directly to the destination, never via an environment-configured proxy.
@@ -314,7 +318,7 @@ enum Latency {
             "-sS", "--proto", "=https", "--max-time", String(Int(internetWait)),
             "--max-redirs", "0", "--max-filesize", "65536",
             "-H", HTTPHeader.cacheControlArgument, "-H", HTTPHeader.acceptEncodingArgument,
-            "-o", bodyURL.path, "-w", "%{http_code}",
+            "-w", curlTrailer("%{http_code}"),
             site.url + "?netmenu=" + UUID().uuidString
         ], timeout: internetWait + Configuration.reliability.probeCompletionAllowance)
         let seconds = Date().timeIntervalSince(t0)
@@ -332,10 +336,11 @@ enum Latency {
             return check(.failed("curl \(code)"))
         case .exited: break
         }
-        guard let status = Int(r.stdout.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+        let reply = splitCurlOutput(r.stdoutData, bodyLimit: 65536)
+        guard let status = Int(reply.trailer.trimmingCharacters(in: .whitespacesAndNewlines)) else {
             return check(.failed("no status"))
         }
-        guard site.accepts(status: status, body: readPrefix(of: bodyURL, bytes: 65536)) else {
+        guard site.accepts(status: status, body: reply.body) else {
             return check(.failed("HTTP \(status) unexpected body"))
         }
         return check(.ok)
@@ -351,8 +356,23 @@ enum Latency {
         return localMessages.contains { stderr.localizedCaseInsensitiveContains($0) }
     }
 
-    /// Prefix of temporary files; stale ones from a crash are removed at launch.
+    /// Prefix of the temporary body files earlier versions wrote; leftovers are removed at launch.
     static let tempPrefix = "netmenu-"
+
+    /// curl writes the body to its output pipe and then this line, so no file is needed.
+    static func curlTrailer(_ format: String) -> String { "\n" + format }
+
+    /// Splits curl's output into the response body and the `-w` line added by `curlTrailer`.
+    /// As with the body files this replaces, at most `bodyLimit` bytes are examined and a
+    /// body that is not valid UTF-8 reads as empty.
+    static func splitCurlOutput(_ output: Data, bodyLimit: Int) -> (body: String, trailer: String) {
+        guard let newline = output.lastIndex(of: 0x0a) else {
+            return ("", String(decoding: output, as: UTF8.self))
+        }
+        let body = output[output.startIndex..<newline].prefix(bodyLimit)
+        return (String(data: body, encoding: .utf8) ?? "",
+                String(decoding: output[output.index(after: newline)...], as: UTF8.self))
+    }
 
     // MARK: - ICMP
 
@@ -454,22 +474,26 @@ enum Latency {
     /// A login wall intercepts this; the open internet returns a tiny Success page.
     private static let captiveURL = "http://captive.apple.com/hotspot-detect.html"
 
+    /// The body is held in memory, and this is plain HTTP that any network can answer.
+    private static let captiveBodyLimit = 65536
+
     /// Redirects are not followed: a 302 to the hotel login page is the wall itself.
     static func detectPortal() -> Captive {
-        let bodyURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("\(tempPrefix)captive-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: bodyURL) }
-        guard let out = runProc("/usr/bin/curl", [
+        let r = runProcess("/usr/bin/curl", [
             "-sS",
             "--max-time", String(Int(captiveWait)),
-            "--max-redirs", "0",
+            "--max-redirs", "0", "--max-filesize", String(captiveBodyLimit),
             "-A", "CaptiveNetworkSupport/1.0 wispr",
-            "-o", bodyURL.path,
-            "-w", "%{http_code}",
+            "-w", curlTrailer("%{http_code}"),
             captiveURL
-        ], timeout: captiveWait + Configuration.reliability.probeCompletionAllowance) else { return .unknown }
-        let status = Int(out.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
-        return classifyPortal(status: status, body: readPrefix(of: bodyURL, bytes: 2048))
+        ], timeout: captiveWait + Configuration.reliability.probeCompletionAllowance)
+        guard r.launched else { return .unknown }
+        let reply = splitCurlOutput(r.stdoutData, bodyLimit: 2048)
+        let status = Int(reply.trailer.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
+        // curl stops at the size limit (exit 63). Apple's page is 69 bytes, so a 200 that large
+        // is a login page, whether or not any of it arrived.
+        if r.outcome == .exited(63), status == 200 { return .portal }
+        return classifyPortal(status: status, body: reply.body)
     }
 
     /// 200 + Success page = internet. 200 with any other body, 511, or a redirect = login wall.
@@ -484,14 +508,6 @@ enum Latency {
         body.utf8.count <= 512
             && body.range(of: "<TITLE>Success</TITLE>", options: .caseInsensitive) != nil
             && body.range(of: "<BODY>Success</BODY>", options: .caseInsensitive) != nil
-    }
-
-    private static func readPrefix(of url: URL, bytes: Int) -> String {
-        guard let fh = try? FileHandle(forReadingFrom: url) else { return "" }
-        defer { try? fh.close() }
-        // The throwing read: readData(ofLength:) raises an uncatchable exception on I/O errors.
-        let data = (try? fh.read(upToCount: bytes)) ?? nil
-        return data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
     }
 
     // MARK: - HTTPS trace fallback
@@ -522,21 +538,19 @@ enum Latency {
     /// While using IPv6 WAN probes, never wait for an IPv4 trace endpoint first.
     static func httpProbe(family: IPVersion) -> Double? {
         guard family == .ipv6 else { return httpProbe() }
-        let bodyURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("\(tempPrefix)trace6-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: bodyURL) }
         for host in icmp6Targets.prefix(2) {
             let r = runProcess("/usr/bin/curl", [
                 "-q", "--ipv6", "--noproxy", "*", "-sS", "--proto", "=https",
                 "--max-time", String(Int(httpWait)), "--max-redirs", "0", "--max-filesize", "65536",
                 "-H", HTTPHeader.cacheControlArgument, "-H", HTTPHeader.acceptEncodingArgument,
-                "-o", bodyURL.path, "-w", "%{http_code} %{time_starttransfer}",
+                "-w", curlTrailer("%{http_code} %{time_starttransfer}"),
                 "https://[\(host)]\(tracePath)?n=\(UUID().uuidString)"
             ], timeout: httpWait + Configuration.reliability.probeCompletionAllowance)
-            let fields = r.stdout.split(separator: " ")
+            let reply = splitCurlOutput(r.stdoutData, bodyLimit: 65536)
+            let fields = reply.trailer.split(separator: " ")
             if r.succeeded, fields.count == 2, let status = Int(fields[0]), (200..<300).contains(status),
                let seconds = Double(fields[1]), let ms = finiteNonNeg(seconds * 1000),
-               isCloudflareTrace(readPrefix(of: bodyURL, bytes: 65536)) { return ms }
+               isCloudflareTrace(reply.body) { return ms }
         }
         return nil
     }
