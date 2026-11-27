@@ -29,21 +29,49 @@ brew tap SokolskyNikita/netmenu https://github.com/SokolskyNikita/mac-net-monito
 brew install --cask sokolskynikita/netmenu/netmenu
 ```
 
-Then open **NetMenu** from Applications. macOS blocks the first launch because releases aren't currently notarized; see [First launch](docs/SETUP.md#first-launch) for the one-time step that allows it.
+Then open **NetMenu** from Applications.
 
 ### Manual download
 
 Download `NetMenu-<version>.zip` from the [latest release](https://github.com/SokolskyNikita/mac-net-monitor-toolbar/releases/latest), unzip it and move `NetMenu.app` to `/Applications`.
 
-macOS blocks the first launch here too; see [First launch](docs/SETUP.md#first-launch).
+### First launch
+
+Releases aren't currently notarized by Apple, so macOS blocks NetMenu the first time you open it, and again after every update. To allow it, try to open the app once, then click **Open Anyway** in **System Settings → Privacy & Security**. Or run:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/NetMenu.app
+```
+
+macOS may also ask for two optional permissions:
+
+| Permission | Used only for | If denied |
+| --- | --- | --- |
+| Location | Reading the Wi‑Fi network name and access point | The network shows under a generic label such as Wi-Fi |
+| Local Network (macOS 15+) | Checking your router’s health and latency | Local router health may be unavailable |
 
 ## Getting started
 
 The menu bar shows latency and connection health, such as `9ms │ 100%`. Click it for router health, bandwidth usage, top apps, and **Run speed test**.
 
+## Update or uninstall
+
+```bash
+brew update && brew upgrade --cask netmenu      # update
+brew uninstall --cask netmenu                   # uninstall
+rm -rf ~/Library/Application\ Support/NetMenu   # optional: delete stats history
+rm -rf ~/Library/Logs/NetMenu                   # optional: delete diagnostic logs
+```
+
+After an update:
+
+1. Allow the new version to open, as in [First launch](#first-launch).
+2. Quit NetMenu from its menu and open it again. Until then the menu bar keeps running the previous version.
+
+Without Homebrew, update by replacing `/Applications/NetMenu.app` with the app from the latest release, and uninstall by moving it to the Trash. Uninstalling keeps your history and logs unless you run the two `rm` commands.
+
 ## Documentation
 
-- [Setup](docs/SETUP.md): first launch, permissions, updates, and uninstalling
 - [User guide](docs/USER-GUIDE.md): reading the menu, speed tests, and your data
 - [How it works](docs/HOW-IT-WORKS.md): probes, scoring, and measurement details
 - [Logs](docs/LOGS.md): local history and troubleshooting

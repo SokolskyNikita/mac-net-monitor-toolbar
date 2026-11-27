@@ -1,6 +1,6 @@
 # Using NetMenu
 
-Open NetMenu from Applications, then click its menu-bar readout to see connection details and controls. For installation and permissions, see [Setup](SETUP.md).
+Open NetMenu from Applications, then click its menu-bar readout to see connection details and controls. For installation and permissions, see the [README](../README.md#install).
 
 ## What you see
 
