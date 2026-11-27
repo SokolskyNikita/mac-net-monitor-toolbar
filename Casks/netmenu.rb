@@ -1,6 +1,6 @@
 cask "netmenu" do
-  version "1.7.0"
-  sha256 "e12d229cd86987a53912ce56f1cc2ad84620f667a4623cf1c4a6d991dfc1fb35"
+  version "1.8.0"
+  sha256 "8a342805acccd3dea0de25b905e0aac42be462bc740cb5dca506537d4b64b948"
 
   url "https://github.com/SokolskyNikita/mac-net-monitor-toolbar/releases/download/v#{version}/NetMenu-#{version}.zip"
   name "NetMenu"
