@@ -102,9 +102,9 @@ import Testing
         app.showAppBandwidth(nil, at: 6)
         #expect(app.topAppsItem?.content.title == "Top apps (~100%): Browser")
         app.resetAppBandwidth(at: 10)
-        #expect(app.topAppsItem?.content.title == "Top apps (last sample) (~100%): Browser")
+        #expect(app.topAppsItem?.content.title == "Top apps (stale) (~100%): Browser")
         app.showAppBandwidth(snapshot, at: 15)
-        #expect(app.topAppsItem?.content.title == "Top apps (last sample) (~100%): Browser")
+        #expect(app.topAppsItem?.content.title == "Top apps (stale) (~100%): Browser")
         app.tick(counters: nil, at: 20)
         #expect(app.topAppsItem?.content.title == "Top apps (~100%): Browser")
         #expect(app.topAppsItem?.toolTip == nil)
@@ -117,7 +117,7 @@ import Testing
         app.topAppsItem = MenuReadoutItem(readout: .row(.topApps, value: ""))
         app.showAppBandwidth(AppBandwidthSnapshot(apps: [], totalBytes: 0, seconds: 5), at: 0)
         app.tick(counters: nil, at: 16)
-        #expect(app.topAppsItem?.content.title == "Top apps (last sample): no traffic")
+        #expect(app.topAppsItem?.content.title == "Top apps (stale): no traffic")
         app.tick(counters: nil, at: 61)
         #expect(app.topAppsItem?.content.title == "Top apps: unavailable")
     }
@@ -145,11 +145,16 @@ import Testing
         var display = AppBandwidthDisplay()
         display.record(active, at: 0)
         #expect(display.title(at: 0) == "Top apps (~100%): curl")
+        let live = display.readout(at: 0)
+        #expect(live.heading == "Top apps (~100%)")
         for second in [6.0, 12, 18, 30, 60] {
             display.record(nil, at: second)
             _ = display.title(at: second)
         }
-        #expect(display.title(at: 60) == "Top apps (last sample) (~100%): curl")
+        #expect(display.title(at: 60) == "Top apps (stale) (~100%): curl")
+        // The visible heading says so too, not only the tooltip.
+        let stale = display.readout(at: 60)
+        #expect(stale.heading == "Top apps (stale)")
         #expect(display.title(at: 61) == "Top apps: unavailable")
     }
 
@@ -157,9 +162,9 @@ import Testing
         var display = AppBandwidthDisplay()
         display.record(active, at: 0)
         display.record(AppBandwidthSnapshot(apps: [], totalBytes: 100, seconds: 5), at: 5)
-        #expect(display.title(at: 5) == "Top apps (last sample) (~100%): curl")
+        #expect(display.title(at: 5) == "Top apps (stale) (~100%): curl")
         display.record(AppBandwidthSnapshot(apps: [], totalBytes: 0, seconds: 5), at: 10)
-        #expect(display.title(at: 10) == "Top apps (last sample) (~100%): curl")
+        #expect(display.title(at: 10) == "Top apps (stale) (~100%): curl")
         #expect(display.title(at: 15) == "Top apps: no traffic")
     }
 

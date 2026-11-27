@@ -46,6 +46,9 @@ final class LiveProbes {
     private var epoch: Int?
     private var epochStarted: TimeInterval = 0
     private var wan: [String: ProbeLane] = [:]
+    /// WAN targets start together on this clock. Health groups replies into rounds by start
+    /// time; a target restarting by itself after a timeout would form rounds of its own.
+    private var wanNextStart: TimeInterval = 0
     private var wanFamily = IPVersion.ipv4
     private var wanGeneration = 0
     private var router = ProbeLane(), websites = ProbeLane(), portal = ProbeLane()
@@ -61,6 +64,7 @@ final class LiveProbes {
         if self.epoch != epoch {
             self.epoch = epoch; epochStarted = now
             for host in Array(wan.keys) { wan[host]?.resetSchedule() }
+            wanNextStart = 0
             selectWANFamily(.ipv4, epoch: epoch, now: now)
             router.resetSchedule(); websites.resetSchedule(); portal.resetSchedule()
             for family in IPVersion.allCases { fallback[family]?.resetSchedule() }
@@ -79,8 +83,13 @@ final class LiveProbes {
         }
         // Switching families gives IPv6 its own lanes; old IPv4 timeouts cannot hold it up.
         let family = wanFamily, generation = wanGeneration
-        for (slot, host) in Latency.icmpTargets(for: family).enumerated()
-            where wan[host, default: ProbeLane()].start(at: now, interval: config.probeInterval) {
+        // A round starts once the interval has passed and some target is free. A target still
+        // waiting out a timeout misses rounds and joins the next one that starts after it finishes.
+        let targets = Latency.icmpTargets(for: family)
+        let roundDue = now >= wanNextStart && targets.contains { wan[$0]?.busy != true }
+        if roundDue { wanNextStart = now + config.probeInterval }
+        for (slot, host) in targets.enumerated()
+            where roundDue && wan[host, default: ProbeLane()].start(at: now, interval: config.probeInterval) {
             let gw = gateway.flatMap { $0.family == family && now - $0.at <= self.config.gatewayFreshFor ? $0.ms : nil }
             work({ self.transport.ping(host, self.config.icmpTimeoutMs) }) { result in
                 self.wan[host]?.finish()
@@ -203,6 +212,7 @@ final class LiveProbes {
         wanFamily = family; wanGeneration &+= 1
         lastWAN = nil; epochStarted = now
         for host in Latency.icmpTargets(for: family) { wan[host]?.resetSchedule() }
+        wanNextStart = 0
         fallback[family]?.resetSchedule()
         receive?(epoch, .wanFamily(family))
     }

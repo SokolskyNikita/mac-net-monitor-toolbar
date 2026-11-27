@@ -58,7 +58,7 @@ struct TopBandwidthApps {
     var title: String { readout().title }
 
     func readout(stale: Bool = false) -> MenuReadout {
-        let context = stale ? " (last sample)" : ""
+        let context = stale ? " (stale)" : ""
         guard !apps.isEmpty else {
             return .row(.topApps, value: totalBytes > 0 ? "no attributed traffic" : "no traffic", context: context)
         }

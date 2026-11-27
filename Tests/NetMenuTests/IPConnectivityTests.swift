@@ -113,6 +113,36 @@ import Testing
         #expect(health.report(now: 16)?.score == 100)
     }
 
+    @Test func anUnmeasuredRoundDoesNotClearAConfirmedIPv4Failure() {
+        var health = LiveHealthTracker()
+        let failed = checks(ipv4: false, ipv6: true)
+        var unmeasured = failed
+        unmeasured.ipv4.removeAll()
+        #expect(unmeasured.status(for: .ipv4) == .unknown)
+        health.recordIPWeb(failed, at: 0)
+        health.recordIPWeb(failed, at: 3)
+        #expect(health.report(now: 3)?.ipv4Unavailable == true)
+        // curl could not run this round: that is no evidence IPv4 came back.
+        health.recordIPWeb(unmeasured, at: 6)
+        #expect(health.report(now: 6)?.ipv4Unavailable == true)
+        #expect(health.report(now: 6)?.score == 33)
+        health.recordIPWeb(failed, at: 9)
+        #expect(health.report(now: 9)?.ipv4Unavailable == true)
+        // Neither family could be measured: the IPv6 half of the verdict stands too.
+        health.recordIPWeb(IPWebsiteChecks(), at: 12)
+        #expect(health.report(now: 12)?.ipv4Unavailable == true)
+        #expect(health.report(now: 12)?.ipv6Reachable == true)
+        #expect(health.report(now: 12)?.score == 33)
+        // The failures still expire, so unmeasured rounds alone cannot hold the warning.
+        health.recordIPWeb(unmeasured, at: 34)
+        #expect(health.report(now: 34)?.ipv4Unavailable != true)
+        // A reachable round clears it at once.
+        health.recordIPWeb(failed, at: 40)
+        health.recordIPWeb(failed, at: 43)
+        health.recordIPWeb(checks(ipv4: true, ipv6: true), at: 46)
+        #expect(health.report(now: 46)?.ipv4Unavailable != true)
+    }
+
     @Test func settlingSuppressesFailuresUntilConnectivityReturns() {
         var health = LiveHealthTracker()
         health.settle(at: 0)
@@ -333,6 +363,17 @@ import Testing
         let shownOutage = display.publish(now: 6)
         #expect(shownOutage)
         #expect(display.shown?.dnsFailing == false)
+
+        // IPv6 reaches a site in a round where the IPv4 check could not run: names resolve.
+        var recovering = health
+        var v6Only = IPWebsiteChecks()
+        v6Only.record(.init(outcome: .ok, seconds: 0.1), site: .google, family: .ipv6)
+        recovering.recordTarget(slot: 0, verdict: .wan(20), started: 7, at: 7)
+        recovering.recordIPWeb(v6Only, at: 8)
+        let partly = try #require(recovering.report(now: 8))
+        #expect(partly.ipv4Unavailable)
+        #expect(partly.ipv6Reachable)
+        #expect(!partly.dnsFailing)
 
         // During a DNS fault the upstream dies too: once replies stop, so does the diagnosis.
         health.recordIPWeb(unresolvedChecks(), at: 16)

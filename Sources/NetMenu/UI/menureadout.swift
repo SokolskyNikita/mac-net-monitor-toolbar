@@ -41,8 +41,11 @@ struct MenuReadout: Equatable {
     var score: Int? = nil
     var title: String
 
+    /// `context` marks a row that is not current, such as a retained sample. The heading column
+    /// has no room for both, so the context is shown there in place of the qualifier; the full
+    /// title keeps both.
     static func row(_ kind: MenuReadoutKind, value: String, qualifier: String = "", context: String = "") -> Self {
-        Self(kind: kind, heading: kind.heading + qualifier, value: value,
+        Self(kind: kind, heading: kind.heading + (context.isEmpty ? qualifier : context), value: value,
              title: kind.label + context + qualifier + ": " + value)
     }
 

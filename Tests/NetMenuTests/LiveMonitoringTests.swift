@@ -180,6 +180,46 @@ import Testing
         #expect(newEpochStarted)
     }
 
+    @Test @MainActor func aTargetThatTimedOutRejoinsTheOthersInsteadOfFormingItsOwnRounds() async throws {
+        let gate = DispatchSemaphore(value: 0)
+        defer { gate.signal() }
+        let slowHost = Latency.icmpTargets[0]
+        let firstSlowPing = Locked(true)
+        let transport = LiveProbes.Transport(ping: { host, _ in
+            var wait = false
+            if host == slowHost { firstSlowPing.mutate { wait = $0; $0 = false } }
+            if wait { _ = gate.wait(timeout: .now() + 5); return .lost }
+            return .reply(.init(ms: 20, hops: 12))
+        }, website: { _, _ in .init(outcome: .ok, seconds: 0) }, portal: { .internet }, fallback: { _ in 30 })
+        let probes = LiveProbes(transport: transport)
+        var starts: [(slot: Int, started: TimeInterval)] = []
+        probes.receive = { _, event in
+            if case .wan(_, let slot, let started, _, _) = event { starts.append((slot, started)) }
+        }
+        let identity = Identity(iface: nil, type: NetType.offline, network: nil, bssid: nil,
+                                router: nil, rssi: nil, noise: nil, txRate: nil, channel: nil)
+        let now = HealthTracker.now(), count = Latency.icmpTargets.count
+        func poll(at offset: TimeInterval, expecting total: Int) async throws {
+            probes.poll(identity: identity, epoch: 1, paused: false, now: now + offset)
+            for _ in 0..<200 where starts.count < total { try await Task.sleep(for: .milliseconds(10)) }
+            #expect(starts.count == total)
+        }
+        // Round one: the slow target is still waiting; round two starts without it.
+        try await poll(at: 0, expecting: count - 1)
+        try await poll(at: 3, expecting: 2 * (count - 1))
+        // Its ping times out between rounds. It must not start a round of its own.
+        gate.signal()
+        try await poll(at: 4, expecting: 2 * (count - 1) + 1)
+        #expect(starts.last?.slot == 0)
+        #expect(starts.last?.started == now)
+        try await poll(at: 5, expecting: 2 * (count - 1) + 1)
+        // The next round has every target, all with the same start time.
+        try await poll(at: 6, expecting: 3 * (count - 1) + 2)
+        let third = starts.filter { $0.started == now + 6 }
+        #expect(Set(third.map(\.slot)) == Set(0..<count))
+        #expect(Set(starts.map(\.started)) == [now, now + 3, now + 6])
+    }
+
     @Test @MainActor func blockedWebAndOneWANDoNotBlockOtherWANRepliesAndOldEpochsAreDiscarded() async throws {
         let gate = DispatchSemaphore(value: 0)
         defer { for _ in 0..<10 { gate.signal() } }

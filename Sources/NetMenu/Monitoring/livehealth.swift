@@ -108,24 +108,39 @@ struct LiveHealthTracker {
         }
         let freshIP = ipChecks.filter { now - $0.at <= monitoring.websiteFreshFor }
         if let last = freshIP.last {
-            let ipv4Unavailable = last.ipv4 == .unreachable && freshIP.dropLast().last?.ipv4 == .unreachable
+            // Two consecutive failed rounds confirm it. A round that could not be measured cannot
+            // help confirm it, and once it is confirmed such a round does not clear it either.
+            let failedRounds = freshIP.reduce(0) { count, check in
+                switch check.ipv4 {
+                case .unreachable: return count + 1
+                case .reachable: return 0
+                case .unknown: return count >= 2 ? count : 0
+                }
+            }
+            let ipv4Unavailable = failedRounds >= 2
+            // A round that could not be measured says nothing about the other half of the
+            // verdict either: take IPv6 and DNS from the last round that measured them.
+            let ipv6 = (freshIP.last { $0.ipv6 != .unknown } ?? last).ipv6
+            let lookups = freshIP.last { $0.ipv4 != .unknown } ?? last
             if ipv4Unavailable && result == nil {
                 // Successful IPv6 websites establish partial access before RTT calibration.
-                result = HealthReport(score: last.ipv6 == .reachable ? 100 : 0, loss: 0, jitterMs: nil, latencyMs: nil)
+                result = HealthReport(score: ipv6 == .reachable ? 100 : 0, loss: 0, jitterMs: nil, latencyMs: nil)
             }
             result?.ipv4Unavailable = ipv4Unavailable
-            result?.ipv6Reachable = last.ipv6 == .reachable
+            result?.ipv6Reachable = ipv6 == .reachable
             if ipv4Unavailable, let score = result?.score {
                 // Keep working IPv6 visibly distinct from a complete outage, even if the
                 // transport score rounds to zero while IPv4 pings are failing.
-                result?.score = last.ipv6 == .reachable
+                result?.score = ipv6 == .reachable
                     ? max(1, Int((Double(score) / config.ipv6OnlyScoreDivisor).rounded())) : 0
             }
             // Offline, names fail to resolve too; only a ping that still answers singles out DNS.
             // The ping must have been sent after lookups began to fail: a lost ping is not known
             // to be lost for its whole timeout, so a reply from just before an outage proves nothing.
-            if last.dns {
-                let failingSince = freshIP.reversed().prefix { $0.dns }.last?.at ?? last.at
+            // A site reached over IPv6 since then means names resolve again.
+            if lookups.dns, ipv6 != .reachable {
+                let measured = freshIP.filter { $0.ipv4 != .unknown }
+                let failingSince = measured.reversed().prefix { $0.dns }.last?.at ?? lookups.at
                 result?.dnsFailing = samples.contains {
                     $0.ms != nil && $0.at >= failingSince && now - $0.at <= monitoring.wanFreshFor
                 }

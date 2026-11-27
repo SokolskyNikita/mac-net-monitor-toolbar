@@ -1,6 +1,6 @@
 import Foundation
 
-/// Established TCP connections plus interface-bound UDP sockets; directions overlap.
+/// Established TCP connections plus interface-bound UDP and QUIC sockets; directions overlap.
 struct ConnectionCounts: Equatable {
     var open = 0
     var receiving = 0
