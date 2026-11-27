@@ -41,13 +41,13 @@ struct ConnectionCounts: Equatable {
             if fields.last == "" { fields.removeLast() }
             guard fields.count >= columns.count + 1 else { continue }
             let label = fields.dropLast(columns.count).joined(separator: ",")
-            guard NettopFormat.socketPrefixes.contains(where: label.hasPrefix) else {
+            guard NettopFormat.isSocketRow(label) else {
                 owner = label.split(separator: ".").last.flatMap { Int32($0) }
                 continue
             }
             let tail = Array(fields.suffix(columns.count))
             guard !tail[0].isEmpty, tail[0] != NettopFormat.loopbackInterface,
-                  NettopFormat.udpPrefixes.contains(where: label.hasPrefix) || tail[1] == NettopFormat.established else { continue }
+                  !NettopFormat.hasConnectionState(label) || tail[1] == NettopFormat.established else { continue }
             func number(_ name: String) -> Int? {
                 guard let index = columns.firstIndex(of: name), let value = Int(tail[index]), value >= 0 else { return nil }
                 return value

@@ -70,7 +70,9 @@ enum AppBandwidthParser {
     }
 
     private static func parseRow(_ line: String, columns: [String]) -> NetTopProcessCounters? {
-        guard !NettopFormat.socketPrefixes.contains(where: line.hasPrefix) else { return nil }
+        // A connection row read as a process would be listed as an app named after its
+        // addresses, with the remote port as its pid, and its bytes counted twice.
+        guard !NettopFormat.isSocketRow(line) else { return nil }
         var fields = line.split(separator: ",", omittingEmptySubsequences: false)
         // nettop emits a trailing delimiter after each data row.
         if fields.last?.isEmpty == true { fields.removeLast() }

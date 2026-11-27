@@ -21,6 +21,24 @@ import Testing
         #expect(apps.first?.pid == 123)
         #expect(apps.first?.bytesIn == 30)
     }
+    @Test func quicAndUnknownProtocolRowsAreConnectionsNotApps() throws {
+        // As nettop prints them: address.port on each side, and no state column for QUIC.
+        let output = header + "Browser.123,,,999,9999,999,9999,\n" + header + """
+        Browser.123,,,9,2896,6,4756,
+        tcp6 2001:db8::1.50000<->2001:db8::2.443,en0,Established,5,400,2,400,
+        quic6 2001:db8::1.54620<->2001:db8::2.443,en0,,4,2496,4,4356,
+        quic4 192.0.2.1.54621<->198.51.100.2.443,en0,,0,0,0,0,
+        sctp6 2001:db8::1.9<->2001:db8::2.443,en0,,0,0,0,0,
+        """
+        let apps = try #require(AppBandwidthParser.parse(output))
+        #expect(apps == [NetTopProcessCounters(processName: "Browser", pid: 123, bytesIn: 2896, bytesOut: 4756)])
+        let counts = try #require(ConnectionCounts.parse(output))
+        #expect(counts.open == 4)
+        #expect(counts.processCounts == [123: 4])
+        #expect(counts.packetsReceived == 9)
+        #expect(counts.packetsSent == 6)
+    }
+
     @Test func consumersGroupNamesAndUseTheSharedCoveragePolicy() {
         let counts = ConnectionCounts(apps: [
             .init(name: "Browser", sent: 35), .init(name: "browser", sent: 30),

@@ -68,7 +68,19 @@ enum NettopFormat {
     static let headerPrefix = ",\(interface),\(state),"
     static let tcpPrefixes = ["tcp4 ", "tcp6 "]
     static let udpPrefixes = ["udp4 ", "udp6 "]
-    static let socketPrefixes = tcpPrefixes + udpPrefixes
+    /// QUIC (HTTP/3) connections get rows of their own on current macOS.
+    static let quicPrefixes = ["quic4 ", "quic6 "]
+    static let socketPrefixes = tcpPrefixes + udpPrefixes + quicPrefixes
+    private static let endpointSeparator = "<->"
+
+    /// Whether a row describes one connection rather than a process. Connection labels are
+    /// "protocol local<->remote"; the separator also catches protocols added after these.
+    static func isSocketRow(_ label: String) -> Bool {
+        socketPrefixes.contains(where: label.hasPrefix) || label.contains(endpointSeparator)
+    }
+
+    /// Only TCP rows carry a connection state; everything else counts while it is listed.
+    static func hasConnectionState(_ label: String) -> Bool { tcpPrefixes.contains(where: label.hasPrefix) }
     static let established = "Established"
     static let loopbackInterface = "lo0"
 }
