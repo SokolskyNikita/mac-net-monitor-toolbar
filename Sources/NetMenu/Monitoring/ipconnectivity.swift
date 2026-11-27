@@ -9,6 +9,17 @@ enum IPVersion: String, CaseIterable {
 struct IPWebsiteChecks {
     var ipv4: [String: Bool] = [:]
     var ipv6: [String: Bool] = [:]
+    /// IPv4 sites whose failure was a name that did not resolve.
+    var unresolved: Set<String> = []
+    /// An IPv6 check got past the name lookup and a route before failing, so names resolve.
+    var ipv6FailedPastLookup = false
+
+    /// Every site failed over IPv4 at the name lookup, and IPv6 reached nothing either. With
+    /// pings to addresses still answering, that is a DNS fault and not a dead connection.
+    var dnsFailed: Bool {
+        status(for: .ipv4) == .unreachable && status(for: .ipv6) != .reachable
+            && ipv4.keys.allSatisfy(unresolved.contains) && !ipv6FailedPastLookup
+    }
 
     /// Per-site results across families. A family that reached one site does not fetch the
     /// others, so a site is only reported failed if a working family failed to reach it; a
@@ -35,7 +46,15 @@ struct IPWebsiteChecks {
         case .failed: success = false
         case .unmeasured: return
         }
-        if family == .ipv4 { ipv4[site.rawValue] = success }
-        else { ipv6[site.rawValue] = success }
+        if family == .ipv4 {
+            ipv4[site.rawValue] = success
+            if check.unresolved { unresolved.insert(site.rawValue) } else { unresolved.remove(site.rawValue) }
+        }
+        else {
+            ipv6[site.rawValue] = success
+            if case .failed(let why) = check.outcome, !check.unresolved, why != Latency.noIPv6RouteReason {
+                ipv6FailedPastLookup = true
+            }
+        }
     }
 }

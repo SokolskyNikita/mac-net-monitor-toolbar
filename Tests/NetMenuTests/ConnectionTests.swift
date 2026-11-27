@@ -54,6 +54,23 @@ import Testing
         #expect(TopConnectionApps(unattributed).title.contains("~30%"))
     }
 
+    @Test func statsLineAddsTogetherProcessesThatShareAName() throws {
+        let counts = ConnectionCounts(apps: [
+            .init(id: "app:/Applications/Browser.app", name: "Browser", open: 2, received: 5, sent: 1),
+            .init(id: "app:/Applications/Browser.app", name: "Browser", open: 3, received: 0, sent: 4),
+            .init(id: "exec:/usr/bin/curl", name: "curl", open: 1),
+            .init(id: "exec:/opt/bin/curl", name: "curl", open: 1, received: 2)])
+        #expect(counts.appsByName == [
+            AppConnectionUsage(name: "Browser", open: 5, received: 5, sent: 5),
+            AppConnectionUsage(name: "curl", open: 2, received: 2)])
+        let apps = try #require(counts.json["apps"] as? [[String: Any]])
+        #expect(apps.map { $0["name"] as? String } == ["Browser", "curl"])
+        #expect(apps.first?["open"] as? Int == 5)
+        #expect(apps.first?["packets_sent"] as? Int == 5)
+        // The menu keeps ranking by resolved identity.
+        #expect(counts.apps.count == 4)
+    }
+
     @Test func missingSamplesDoNotBecomeZeroAndStaleCountsExpire() {
         #expect(ConnectionCounts.parse(header) == nil)
         #expect(ConnectionCounts.parse(header + header) == ConnectionCounts())

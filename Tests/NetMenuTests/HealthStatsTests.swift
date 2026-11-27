@@ -64,6 +64,7 @@ import Testing
         #expect(obj["health_weight_min_age_s"] == nil)
         #expect(obj["recent_trouble"] as? [String] == ["network loss"])
         #expect(obj["internet_checks_fresh"] as? Bool == true)
+        #expect(obj["health_dns_failing"] as? Bool == false)
     }
 
     @Test func unavailableEvidenceIsNullNotZero() throws {

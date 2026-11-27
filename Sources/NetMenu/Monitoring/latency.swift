@@ -96,9 +96,13 @@ enum Latency {
 
     // MARK: - Tuning
 
-    static let icmpTargets = [Host.cloudflareDNS, Host.cloudflareDNS2, Host.googleDNS, Host.quad9, Host.google]
-    static let icmp6Targets = ["2606:4700:4700::1111", "2606:4700:4700::1001",
+    /// One address per operator (Cloudflare, OpenDNS, Google, Quad9), so one operator's trouble
+    /// is one lost target, plus a name that only answers when DNS works.
+    static let icmpTargets = [Host.cloudflareDNS, Host.openDNS, Host.googleDNS, Host.quad9, Host.google]
+    static let icmp6Targets = ["2606:4700:4700::1111", "2620:119:35::35",
                                "2001:4860:4860::8888", "2620:fe::fe"]
+    /// Cloudflare addresses that serve the trace page over IPv6.
+    static let trace6Hosts = ["2606:4700:4700::1111", "2606:4700:4700::1001"]
     static func icmpTargets(for family: IPVersion) -> [String] {
         family == .ipv4 ? icmpTargets : icmp6Targets
     }
@@ -292,6 +296,8 @@ enum Latency {
         }
         var outcome: Outcome
         var seconds: TimeInterval
+        /// The failure was the site's name not resolving, which points at DNS, not the path.
+        var unresolved = false
 
         var summary: String {
             let t = String(format: "%.2fs", seconds)
@@ -307,7 +313,13 @@ enum Latency {
         checkInternet(site, family: nil)
     }
 
-    static func checkInternet(_ site: InternetSite, family: IPVersion?) -> InternetCheck {
+    static func checkInternet(_ site: InternetSite, family: IPVersion?,
+                              hasIPv6Route: () -> Bool = Latency.hasIPv6Route) -> InternetCheck {
+        // Without an IPv6 route curl can only fail to connect; say so without launching it.
+        // The family is still recorded as failed, so the verdicts are the ones curl gave.
+        if family == .ipv6, !hasIPv6Route() {
+            return InternetCheck(outcome: .failed(noIPv6RouteReason), seconds: 0)
+        }
         let t0 = Date()
         // -q disables user curlrc overrides. TLS verification stays enabled; no redirects,
         // cookies, or local cache. The nonce and no-cache header also avoid proxy cache hits.
@@ -333,6 +345,8 @@ enum Latency {
             if isLocalCurlFailure(code: code, stderr: r.stderr) {
                 return check(.unmeasured("curl \(code) local: \(r.stderr.prefix(120))"))
             }
+            // curl(1): 6 = could not resolve host.
+            if code == 6 { return InternetCheck(outcome: .failed("curl 6 unresolved"), seconds: seconds, unresolved: true) }
             return check(.failed("curl \(code)"))
         case .exited: break
         }
@@ -344,6 +358,31 @@ enum Latency {
             return check(.failed("HTTP \(status) unexpected body"))
         }
         return check(.ok)
+    }
+
+    static let noIPv6RouteReason = "no IPv6 route"
+    /// A public address that is only looked up in the routing table, never sent to.
+    private static let routeProbe6 = "2001:4860:4860::8888"
+
+    /// Whether the routing table has a way to the public IPv6 internet. Connecting a UDP socket
+    /// sends nothing; it asks the kernel for the route a real connection would use. Only a plain
+    /// "no route" answer counts as none, so any other error still lets the real check run.
+    static func hasIPv6Route() -> Bool {
+        let fd = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP)
+        guard fd >= 0 else { return true }
+        defer { close(fd) }
+        var address = sockaddr_in6()
+        address.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+        address.sin6_family = sa_family_t(AF_INET6)
+        address.sin6_port = in_port_t(443).bigEndian
+        guard inet_pton(AF_INET6, routeProbe6, &address.sin6_addr) == 1 else { return true }
+        let result = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in6>.size))
+            }
+        }
+        let failure = result == 0 ? 0 : errno
+        return failure != ENETUNREACH && failure != EHOSTUNREACH
     }
 
     /// curl failures caused by this Mac rather than the network: it could not start up, write the
@@ -538,7 +577,7 @@ enum Latency {
     /// While using IPv6 WAN probes, never wait for an IPv4 trace endpoint first.
     static func httpProbe(family: IPVersion) -> Double? {
         guard family == .ipv6 else { return httpProbe() }
-        for host in icmp6Targets.prefix(2) {
+        for host in trace6Hosts {
             let r = runProcess("/usr/bin/curl", [
                 "-q", "--ipv6", "--noproxy", "*", "-sS", "--proto", "=https",
                 "--max-time", String(Int(httpWait)), "--max-redirs", "0", "--max-filesize", "65536",

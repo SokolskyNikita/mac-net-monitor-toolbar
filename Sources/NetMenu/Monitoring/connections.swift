@@ -19,7 +19,19 @@ struct ConnectionCounts: Equatable {
         ["open": open, "receiving": receiving, "sending": sending,
          "window_s": AppBandwidthMonitor.sampleInterval,
          "packets_received": packetsReceived, "packets_sent": packetsSent, "ranking_basis": "packets",
-         "apps": apps.map { ["name": $0.name, "open": $0.open, "packets_received": $0.received, "packets_sent": $0.sent] as [String: Any] }]
+         "apps": appsByName.map { ["name": $0.name, "open": $0.open, "packets_received": $0.received, "packets_sent": $0.sent] as [String: Any] }]
+    }
+
+    /// `apps` has an entry per process. The log identifies an app by name alone, so entries
+    /// that share a name are added together there; the menu still ranks by resolved identity.
+    var appsByName: [AppConnectionUsage] {
+        var merged: [String: AppConnectionUsage] = [:]
+        for app in apps {
+            var total = merged[app.name] ?? AppConnectionUsage(name: app.name)
+            total.open += app.open; total.received += app.received; total.sent += app.sent
+            merged[app.name] = total
+        }
+        return merged.values.sorted { $0.name < $1.name }
     }
 
     static func parse(_ output: String) -> Self? {

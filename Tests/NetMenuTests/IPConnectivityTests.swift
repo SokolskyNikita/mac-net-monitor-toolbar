@@ -262,6 +262,113 @@ import Testing
         #expect(IPWebsiteChecks(ipv4: [sites[0]: true], ipv6: [sites[1]: true]).combined == [sites[0]: true, sites[1]: true])
     }
 
+    private func unresolvedChecks() -> IPWebsiteChecks {
+        var checks = IPWebsiteChecks()
+        for site in Latency.InternetSite.allCases {
+            checks.record(.init(outcome: .failed("curl 6 unresolved"), seconds: 0, unresolved: true), site: site, family: .ipv4)
+            checks.record(.init(outcome: .failed(Latency.noIPv6RouteReason), seconds: 0), site: site, family: .ipv6)
+        }
+        return checks
+    }
+
+    @Test func aRoundIsADNSFailureOnlyWhenEveryIPv4SiteFailedToResolve() {
+        var checks = unresolvedChecks()
+        #expect(checks.dnsFailed)
+        // IPv6 reaching a site means names resolve.
+        var reached = checks
+        reached.record(.init(outcome: .ok, seconds: 0.1), site: .google, family: .ipv6)
+        #expect(!reached.dnsFailed)
+        // One site resolved and then failed to connect: not a DNS fault.
+        checks.record(.init(outcome: .failed("curl 7"), seconds: 0), site: .google, family: .ipv4)
+        #expect(!checks.dnsFailed)
+        // IPv6 resolved a name and then failed to connect: names resolve.
+        var connected = unresolvedChecks()
+        connected.record(.init(outcome: .failed("curl 7"), seconds: 0), site: .google, family: .ipv6)
+        #expect(!connected.dnsFailed)
+        // A site that was never measured leaves the round undecided.
+        var partial = IPWebsiteChecks()
+        partial.record(.init(outcome: .failed("curl 6 unresolved"), seconds: 0, unresolved: true), site: .google, family: .ipv4)
+        #expect(!partial.dnsFailed)
+    }
+
+    @Test func unresolvedNamesAreDiagnosedAsDNSOnlyWhilePingsAnswer() throws {
+        var health = LiveHealthTracker()
+        health.recordTarget(slot: 0, verdict: .wan(20), started: 1, at: 1)
+        health.recordIPWeb(unresolvedChecks(), at: 2)
+        #expect(health.report(now: 2)?.ipv4Unavailable != true)
+        // The reply so far predates the failed lookups.
+        #expect(health.report(now: 2)?.dnsFailing != true)
+        health.recordTarget(slot: 0, verdict: .wan(20), started: 4, at: 4)
+        health.recordIPWeb(unresolvedChecks(), at: 5)
+        let report = try #require(health.report(now: 5))
+        #expect(report.dnsFailing)
+        #expect(report.ipv4Unavailable)
+        #expect(report.score == 0)
+
+        // With nothing answering, unresolved names are a symptom of the outage.
+        var offline = LiveHealthTracker()
+        offline.recordIPWeb(unresolvedChecks(), at: 2)
+        offline.recordIPWeb(unresolvedChecks(), at: 5)
+        let down = try #require(offline.report(now: 5))
+        #expect(!down.dnsFailing)
+        #expect(down.ipv4Unavailable)
+
+        // An outage starting: the last reply came just before it, and the pings sent since are
+        // still waiting out their timeout, so no loss has been recorded yet.
+        var dying = LiveHealthTracker()
+        dying.recordTarget(slot: 0, verdict: .wan(20), started: 1, at: 1)
+        dying.recordIPWeb(unresolvedChecks(), at: 2)
+        dying.recordIPWeb(unresolvedChecks(), at: 6)
+        let dead = try #require(dying.report(now: 6))
+        #expect(dead.ipv4Unavailable)
+        #expect(!dead.dnsFailing)
+
+        // The flag reaches what the menu shows, and leaves it.
+        var display = HealthDisplay()
+        display.add(report)
+        let shownDNS = display.publish(now: 5)
+        #expect(shownDNS)
+        #expect(display.shown?.dnsFailing == true)
+        display.add(dead)
+        let shownOutage = display.publish(now: 6)
+        #expect(shownOutage)
+        #expect(display.shown?.dnsFailing == false)
+
+        // During a DNS fault the upstream dies too: once replies stop, so does the diagnosis.
+        health.recordIPWeb(unresolvedChecks(), at: 16)
+        #expect(health.report(now: 16)?.dnsFailing == false)
+
+        // Names resolving again clears it.
+        health.recordIPWeb(checks(ipv4: true, ipv6: false), at: 18)
+        #expect(health.report(now: 18)?.dnsFailing != true)
+    }
+
+    @Test func ipv6WebsiteCheckWithoutARouteFailsWithoutRunningCurl() {
+        var checks = IPWebsiteChecks()
+        for site in Latency.InternetSite.allCases {
+            let check = Latency.checkInternet(site, family: .ipv6, hasIPv6Route: { false })
+            guard case .failed(let why) = check.outcome else { Issue.record("Expected a failure: \(check.summary)"); return }
+            #expect(why == Latency.noIPv6RouteReason)
+            #expect(check.seconds == 0)
+            #expect(!check.unresolved)
+            checks.record(check, site: site, family: .ipv6)
+        }
+        // The family is unreachable exactly as when curl failed to connect.
+        #expect(checks.status(for: .ipv6) == .unreachable)
+        #expect(checks.status(for: .ipv4) == .unknown)
+        // The lookup itself sends nothing and must answer on any network.
+        _ = Latency.hasIPv6Route()
+    }
+
+    @Test func pingTargetsUseOneAddressPerOperator() {
+        #expect(Latency.icmpTargets.count == 5)
+        #expect(Set(Latency.icmpTargets).count == 5)
+        #expect(!Latency.icmpTargets.contains("1.0.0.1"))
+        #expect(!Latency.icmp6Targets.contains("2606:4700:4700::1001"))
+        // The IPv6 HTTPS fallback still needs Cloudflare hosts, whatever the ping targets are.
+        #expect(Latency.trace6Hosts.allSatisfy { $0.hasPrefix("2606:4700:4700:") })
+    }
+
     @Test @MainActor func ipv6HTTPSFallbackDoesNotWaitForOldIPv4Fallback() async throws {
         let gate = DispatchSemaphore(value: 0)
         defer { gate.signal() }
@@ -346,5 +453,12 @@ import Testing
         report.ipv4Unavailable = false
         report.score = 100
         #expect(!app.healthMenuReadout(report).detail.contains("⚠"))
+        report.websitesFailing = true
+        #expect(app.healthMenuReadout(report).detail.contains("websites failed"))
+        report.dnsFailing = true
+        #expect(app.healthMenuReadout(report).detail.contains("DNS lookups failed"))
+        let dns = HealthReport(score: 0, loss: 0, jitterMs: nil, latencyMs: nil, internetReachable: false,
+                               ipv4Unavailable: true, dnsFailing: true)
+        #expect(app.healthMenuReadout(dns).detail == "⚠ DNS not resolving names; pings still answer")
     }
 }

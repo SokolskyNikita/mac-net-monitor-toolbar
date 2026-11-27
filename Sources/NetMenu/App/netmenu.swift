@@ -334,7 +334,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDelegate {
         }
         guard healthDisplay.publish() else { return localChanged }
         if let h = healthDisplay.shown {
-            let flags = "outage=\(!h.internetReachable) websites_failing=\(h.websitesFailing) ipv4_unavailable=\(h.ipv4Unavailable) ipv6_reachable=\(h.ipv6Reachable)"
+            let flags = "outage=\(!h.internetReachable) websites_failing=\(h.websitesFailing) ipv4_unavailable=\(h.ipv4Unavailable) ipv6_reachable=\(h.ipv6Reachable) dns_failing=\(h.dnsFailing)"
             let measures = "loss=\(String(format: "%.3f", h.loss))"
                 + " jitter=\(h.jitterMs.map { String(format: "%.1f", $0) } ?? "-")"
                 + " latency=\(h.latencyMs.map { String(format: "%.1f", $0) } ?? "-")"
@@ -538,6 +538,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDelegate {
 
     func healthMenuReadout(_ report: HealthReport?) -> MenuReadout {
         guard let h = report else { return .health(.health) }
+        if h.dnsFailing, h.ipv4Unavailable || !h.internetReachable {
+            return .health(.health, score: h.score, parts: ["⚠ DNS not resolving names; pings still answer"])
+        }
         if h.ipv4Unavailable {
             return .health(.health, score: h.score, parts: [h.ipv6Reachable
                 ? "⚠ IPv4 unavailable; IPv6 is working"
@@ -553,7 +556,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, CLLocationManagerDelegate {
         parts.append(String(format: "loss %.0f%%", h.loss * 100))
         if let j = h.jitterMs { parts.append(String(format: "jitter %.0fms", j)) }
         if let l = h.latencyMs { parts.append(String(format: "latency %.0fms", l)) }
-        if h.websitesFailing { parts.append("websites failed, rechecking") }
+        if h.websitesFailing { parts.append(h.dnsFailing ? "DNS lookups failed, rechecking" : "websites failed, rechecking") }
         return .health(.health, score: h.score, parts: parts)
     }
 

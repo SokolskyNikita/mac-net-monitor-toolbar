@@ -2,7 +2,8 @@
 
 enum Host {
     static let cloudflareDNS = "1.1.1.1"
-    static let cloudflareDNS2 = "1.0.0.1"
+    /// A fourth operator: a second Cloudflare address would fail together with the first.
+    static let openDNS = "208.67.222.222"
     static let googleDNS = "8.8.8.8"
     static let quad9 = "9.9.9.9"
     static let cloudflare = "one.one.one.one"

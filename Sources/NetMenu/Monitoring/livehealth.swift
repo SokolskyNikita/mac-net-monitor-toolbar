@@ -13,7 +13,7 @@ struct LiveHealthTracker {
     private var rounds: [TimeInterval: HealthSample] = [:]
     private var fallbackSamples: [HealthSample] = []
     private var web: [(at: TimeInterval, reachable: Bool)] = []
-    private var ipChecks: [(at: TimeInterval, ipv4: InternetStatus, ipv6: InternetStatus)] = []
+    private var ipChecks: [(at: TimeInterval, ipv4: InternetStatus, ipv6: InternetStatus, dns: Bool)] = []
     private var portalAt: TimeInterval?
     private var settleUntil: TimeInterval?
 
@@ -68,7 +68,7 @@ struct LiveHealthTracker {
         let ipv4 = checks.status(for: .ipv4), ipv6 = checks.status(for: .ipv6)
         guard accept(success: ipv4 == .reachable || ipv6 == .reachable, at: now) else { return }
         ipChecks.removeAll { now - $0.at > monitoring.websiteFreshFor }
-        ipChecks.append((now, ipv4, ipv6))
+        ipChecks.append((now, ipv4, ipv6, checks.dnsFailed))
         recordWeb(checks.combined, at: now)
     }
 
@@ -120,6 +120,15 @@ struct LiveHealthTracker {
                 // transport score rounds to zero while IPv4 pings are failing.
                 result?.score = last.ipv6 == .reachable
                     ? max(1, Int((Double(score) / config.ipv6OnlyScoreDivisor).rounded())) : 0
+            }
+            // Offline, names fail to resolve too; only a ping that still answers singles out DNS.
+            // The ping must have been sent after lookups began to fail: a lost ping is not known
+            // to be lost for its whole timeout, so a reply from just before an outage proves nothing.
+            if last.dns {
+                let failingSince = freshIP.reversed().prefix { $0.dns }.last?.at ?? last.at
+                result?.dnsFailing = samples.contains {
+                    $0.ms != nil && $0.at >= failingSince && now - $0.at <= monitoring.wanFreshFor
+                }
             }
         }
         return result

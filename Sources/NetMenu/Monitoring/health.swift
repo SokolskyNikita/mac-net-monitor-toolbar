@@ -50,6 +50,8 @@ struct HealthReport: Equatable {
     /// Two complete IPv4 website rounds failed; IPv6 success cannot mask this critical failure.
     var ipv4Unavailable: Bool = false
     var ipv6Reachable: Bool = false
+    /// Website names are not resolving while pings to addresses still answer.
+    var dnsFailing: Bool = false
     /// Sources contributing to the displayed RTT, including a smoothed source transition.
     var latencySources: Set<LatencySource> = []
 }
@@ -337,6 +339,7 @@ struct HealthDisplay {
                             websitesFailing: reports.last?.websitesFailing ?? false,
                             ipv4Unavailable: reports.last?.ipv4Unavailable ?? false,
                             ipv6Reachable: reports.last?.ipv6Reachable ?? false,
+                            dnsFailing: reports.last?.dnsFailing ?? false,
                             latencySources: reports.reduce(into: Set<LatencySource>()) { $0.formUnion($1.latencySources) })
     }
 }
