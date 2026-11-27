@@ -23,10 +23,15 @@ ICON := Resources/AppIcon.icns
 # Their _Testing_Foundation overlay lacks module interfaces; these tests need only core Testing.
 TESTING_FW := $(shell xcode-select -p)/Library/Developer/Frameworks
 TESTING_LIB := $(shell xcode-select -p)/Library/Developer/usr/lib
+# Newer Command Line Tools keep the #expect/#require macro plugin in a directory the compiler
+# does not search; without it every test fails to compile with "TestingMacros not found".
+TESTING_PLUGINS := $(shell xcode-select -p)/usr/lib/swift/host/plugins/testing
 TEST_FLAGS := $(if $(wildcard $(TESTING_FW)/Testing.framework),\
 	-Xswiftc -Xfrontend -Xswiftc -disable-cross-import-overlays \
 	-Xswiftc -F -Xswiftc $(TESTING_FW) -Xlinker -F -Xlinker $(TESTING_FW) \
-	-Xlinker -rpath -Xlinker $(TESTING_FW) -Xlinker -rpath -Xlinker $(TESTING_LIB))
+	-Xlinker -rpath -Xlinker $(TESTING_FW) -Xlinker -rpath -Xlinker $(TESTING_LIB) \
+	$(if $(wildcard $(TESTING_PLUGINS)/libTestingMacros.dylib),\
+	-Xswiftc -plugin-path -Xswiftc $(TESTING_PLUGINS)))
 
 SOURCES := $(shell find Sources/NetMenu -type f -name '*.swift' | sort)
 ARCH_BINS = $(foreach a,$(ARCHS),build/NetMenu-$(a))

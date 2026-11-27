@@ -128,7 +128,7 @@ Extract strings when they express a shared contract, not merely because the spel
 
 No test needs a working internet connection or runs a real Cloudflare speed test. The ICMP timeout test sends a probe to the documentation address `192.0.2.1`, which may leave the Mac through its default route.
 
-If a newer Command Line Tools release reports missing `TestingMacros` with the default Swift Build engine, run `make test SWIFT_TEST_FLAGS="--build-system native"`. The tests need local socket and process access; run them outside a restrictive sandbox.
+Newer Command Line Tools keep the Swift Testing macro plugin where the compiler does not look for it; `make test` passes that directory itself when it exists. If a release still reports missing `TestingMacros`, try `make test SWIFT_TEST_FLAGS="--build-system native"`. The tests need local socket and process access; run them outside a restrictive sandbox.
 
 ## Code signing
 
