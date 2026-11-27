@@ -35,7 +35,7 @@ Build steps check input timestamps with nanosecond precision through `scripts/ru
 
 For a local-only build, `make app ARCHS=arm64` or `make app ARCHS=x86_64` builds just that architecture. Run ordinary `make app` afterward to restore the default universal app. Keep the default architectures for `make dist` and releases. `make clean` removes the incremental caches as well as the generated artifacts; it is unnecessary for ordinary edits or configuration changes.
 
-On the development Mac, with the SDK cache already warm, an optimized universal rebuild went from 38.4 seconds to 14.8 seconds. A one-line UI implementation edit took 1.9 seconds and rebuilt only that file for each architecture; an unchanged build took 0.5 seconds. These are illustrative local timings, not CI guarantees. First-time SDK imports and edits to widely used declarations can take longer.
+An unchanged build skips compilation entirely, and a one-file edit rebuilds only that file for each architecture. First-time SDK imports and edits to widely used declarations take longer.
 
 ## Command-line modes
 
@@ -67,7 +67,7 @@ Tries ICMP, nonrecursive DNS, TCP 443/80 and IPv4 DHCP INFORM once each against 
 
 CLI results are printed to standard output; these modes do not append sample or speed-test records to `stats.jsonl`.
 
-`App/CLI.swift` owns argument parsing and command execution; `main.swift` only dispatches the selected command or starts the GUI. Existing flag handling is preserved: if multiple commands are supplied, priority is `--sample`, `--local-probe`, `--local-sample`, then `--speedtest`, regardless of argument order. `--low-data` modifies speed tests only. Unrecognized arguments are ignored; without a recognized command, the GUI starts.
+`App/CLI.swift` owns argument parsing and command execution; `main.swift` only dispatches the selected command or starts the GUI. If multiple commands are supplied, priority is `--sample`, `--local-probe`, `--local-sample`, then `--speedtest`, regardless of argument order. `--low-data` modifies speed tests only. Unrecognized arguments are ignored; without a recognized command, the GUI starts.
 
 ## Project layout
 
@@ -87,7 +87,7 @@ Casks/          Homebrew cask
 
 The Makefile and Swift package pick up any Swift file under `Sources/NetMenu/` automatically. The monitoring and support files open with comments explaining their design; [How NetMenu works](HOW-IT-WORKS.md) covers the same ground for readers.
 
-See [Architecture and SOLID](ARCHITECTURE.md) for component responsibilities, dependency boundaries and deliberate tradeoffs for a small native app.
+See [Architecture](ARCHITECTURE.md) for component responsibilities and deliberate tradeoffs.
 
 ## Configuration
 
@@ -113,9 +113,7 @@ var tracker = LocalHealthTracker(config: config)
 
 Resetting a tracker preserves its configuration. Low-level OS adapters use the compiled defaults; scheduler tests replace their I/O through transport closures. Keep custom health metadata consistent by passing the same configuration to `HealthStatsSnapshot`. Scoring calibration changes should also update the model identifier and the explanation in [How NetMenu works](HOW-IT-WORKS.md).
 
-UI layout/font values, wire-format constants, unit conversions and defensive buffer bounds stay beside their implementations. User choices remain in `UserDefaults`; `Makefile`, `Package.swift` and `Resources/Info.plist` retain their build, test and bundle responsibilities. There is no runtime JSON/plist settings loader.
-
-Extract strings when they express a shared contract, not merely because the spelling repeats. Shared parser/header vocabulary belongs in `Support/constants.swift`; single-component protocol strings belong in private constants near their owner. Use typed enums for state and `MenuReadout` for structured menu content. One-off messages and JSON keys already owned by `statsevents.swift` can stay inline.
+UI layout and font values, wire-format constants and unit conversions stay beside their implementations. User choices remain in `UserDefaults`. There is no runtime settings file.
 
 ## Testing
 

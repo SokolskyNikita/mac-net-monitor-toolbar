@@ -29,13 +29,13 @@ brew tap SokolskyNikita/netmenu https://github.com/SokolskyNikita/mac-net-monito
 brew install --cask sokolskynikita/netmenu/netmenu
 ```
 
-Then open **NetMenu** from Applications.
+Then open **NetMenu** from Applications. macOS blocks the first launch because releases aren't currently notarized; see [First launch](docs/SETUP.md#first-launch) for the one-time step that allows it.
 
 ### Manual download
 
 Download `NetMenu-<version>.zip` from the [latest release](https://github.com/SokolskyNikita/mac-net-monitor-toolbar/releases/latest), unzip it and move `NetMenu.app` to `/Applications`.
 
-If macOS blocks the first launch, see [Setup and permissions](docs/SETUP.md#first-launch).
+macOS blocks the first launch here too; see [First launch](docs/SETUP.md#first-launch).
 
 ## Getting started
 

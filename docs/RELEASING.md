@@ -35,7 +35,7 @@ The tag must be `v` + `CFBundleShortVersionString` or the workflow fails.
 
 The workflow requests `contents: write`; repository rules must allow its token to create a release and push the cask commit to `main`. A failed cask push can leave a published release with the tap still pointing at the previous version.
 
-Coworkers then `brew update && brew upgrade --cask netmenu`.
+Coworkers then `brew update && brew upgrade --cask netmenu`, allow the new version to open and restart NetMenu (see [Update or uninstall](SETUP.md#update-or-uninstall)).
 
 ## Optional Apple secrets
 
@@ -49,7 +49,7 @@ Repository **Settings → Secrets and variables → Actions**:
 | `APPLE_NOTARY_KEY_ID` | Key ID |
 | `APPLE_NOTARY_ISSUER_ID` | Issuer UUID |
 
-Without a certificate, CI ships an ad-hoc–signed zip. With only the certificate, it ships a Developer ID–signed but unnotarized zip. First launch of an unnotarized build may need **Open Anyway** (see [First launch](SETUP.md#first-launch)).
+Without a certificate, CI ships an ad-hoc–signed zip. With only the certificate, it ships a Developer ID–signed but unnotarized zip. macOS blocks the first launch of an unnotarized build, after installing and after every update, until the user allows it (see [First launch](SETUP.md#first-launch)).
 
 Local notarization:
 

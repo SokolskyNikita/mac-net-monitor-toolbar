@@ -12,7 +12,17 @@ The menu bar shows **latency** and **connection health**, for example `9ms │ 1
 | `~180ms` | Ping is blocked on this network, so this is the time to load a small web page instead. |
 | `✕` | No trustworthy latency measurement is available yet, or the last one is over a minute old. |
 
-**Connection health** estimates interactive usability over the last minute, with newer measurements weighted more heavily (a 15-second half-life). It combines latency and jitter into an estimated delay budget, then applies a packet-loss penalty. For example, 20ms latency with 50ms jitter and no loss scores 100%; 5% loss on that connection scores 50%. This is a network-health heuristic, not a measured Zoom call-quality rating. A spinner shows for the first few seconds while it calibrates. A confirmed website outage drops health to **0%** and the menu says **internet sites unreachable**, even if ping still works. If the cause is that names don't resolve while pings to addresses still answer, it says **DNS not resolving names; pings still answer** instead. If IPv4 website checks fail twice but IPv6 still works, health is divided by **3** (100% becomes 33%), with a minimum of 1%. Latency and health measurements switch to the working IPv6 path. A persistent warning says **IPv4 unavailable; IPv6 is working**. If IPv6 is also unavailable, health drops to **0%**. Working IPv4 without IPv6 is fine and does not trigger this warning.
+**Connection health** estimates how usable the connection is for calls and other interactive work over the last minute, weighting newer measurements more heavily. It combines latency and jitter, then applies a packet-loss penalty: 20ms latency with 50ms jitter and no loss scores 100%, and 5% loss on that connection scores 50%. It is a network-health heuristic, not a measured call-quality rating. A spinner shows for the first few seconds while it calibrates.
+
+When websites don't load, the score drops and the menu says why:
+
+| Message | Meaning | Health |
+| --- | --- | --- |
+| **internet sites unreachable** or **IPv4 internet unavailable** | Website checks failed on IPv4 and IPv6, even if ping still works | 0% |
+| **DNS not resolving names; pings still answer** | Names don't resolve, but addresses still answer | 0% |
+| **IPv4 unavailable; IPv6 is working** | IPv4 website checks failed twice while IPv6 works. Latency and health switch to the IPv6 path. | Divided by 3, minimum 1% |
+
+Working IPv4 without IPv6 is fine and triggers no warning.
 
 The menu adds:
 

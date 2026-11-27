@@ -30,6 +30,7 @@ Each per-minute entry includes:
 | `health` | Health score (0–100) at the end of the minute, or `null` without enough fresh data; 0 during a confirmed outage |
 | `health_raw`, `health_loss`, `health_jitter_ms`, `health_latency_ms` | Current unsmoothed health score and recency-weighted inputs; distinct from the minute's unweighted `loss` and `lat_ms` |
 | `health_internet_reachable`, `health_websites_failing` | Confirmed-outage reachability and unconfirmed website-failure flags from the current health report; `null` during calibration |
+| `health_ipv4_unavailable`, `health_ipv6_reachable` | Whether two consecutive website rounds failed on every IPv4 site, and whether the latest round reached a site over IPv6; `null` during calibration |
 | `health_dns_failing` | Whether the latest website failure was every IPv4 name failing to resolve while a ping still answered; `null` during calibration |
 | `connections` | Latest socket snapshot, or `null` when unavailable or more than 15 seconds old; see [Connection snapshot](#connection-snapshot) |
 | `transport_health`, `local_health_raw` | Unsmoothed WAN transport score (before the website outage override) and local-router score |
@@ -49,7 +50,7 @@ Each per-minute entry includes:
 
 ### Connection snapshot
 
-The `connections` object covers established TCP connections and interface-bound UDP sockets observed by `nettop` on Wi-Fi/wired interfaces, excluding loopback. `open` counts sockets at the snapshot; `receiving` and `sending` count sockets with incoming or outgoing bytes during the collection window. One socket can count in both directions.
+The `connections` object covers established TCP connections and interface-bound UDP and QUIC sockets observed by `nettop` on Wi-Fi/wired interfaces, excluding loopback. `open` counts sockets at the snapshot; `receiving` and `sending` count sockets with incoming or outgoing bytes during the collection window. One socket can count in both directions.
 
 `packets_received` and `packets_sent` are packet deltas over `window_s` (10 seconds). Each object in `apps` contains `name`, `open`, `packets_received` and `packets_sent`, with one object per app name: processes and callers that share a name are added together. Entries written by 1.8.1 and earlier had one object per process, so a name could repeat. `ranking_basis` is `packets`; the menu's **Top apps** row instead ranks by bytes. These snapshots are not a complete connection history and do not store remote addresses or payloads.
 
